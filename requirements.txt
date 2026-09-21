@@ -1,0 +1,13 @@
+# 钉死版本,不留浮动范围。
+# 2026-08-31 的教训:全部浮动时 CI 抓到 fastapi 0.141.1 / starlette 1.6.0,
+# 本机是 fastapi 0.139.0 / starlette 1.0.0 —— 两台机器跑的根本不是同一份代码,
+# 而且 starlette 1.6 把 TestClient 的依赖从 httpx 换成了 httpx2,套件直接收集失败。
+# 上游发一版就能把构建打红而本仓一行没改,这种红会教人不看 CI。
+# 升版本请单独一个 commit,让 CI 单独为它作证。
+fastapi==0.139.0
+uvicorn==0.46.0
+python-socketio[client]==5.16.1
+PyJWT==2.10.1
+email-validator==2.1.1
+httpx==0.28.1
+tiktoken==0.12.0

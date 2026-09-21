@@ -1,0 +1,5 @@
+# 跑测试要的额外依赖。httpx 已是社区登录的运行时依赖，也供
+# FastAPI TestClient 使用，版本统一由 requirements.txt 钉死。
+-r requirements.txt
+pytest==9.0.2
+vulture==2.16

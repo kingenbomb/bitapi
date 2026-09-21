@@ -1,0 +1,39 @@
+# systemd 单元样板。裸机部署:代码在 /opt/bit-api,虚拟环境在 /opt/bit-api/.venv,
+# 环境变量在 /opt/bit-api/.env(抄 .env.example)。
+#
+#   useradd --system --home /opt/bit-api bitapi
+#   python3 -m venv /opt/bit-api/.venv && /opt/bit-api/.venv/bin/pip install -r requirements.txt
+#   cp deploy/bit-api.service /etc/systemd/system/ && systemctl enable --now bit-api
+#   journalctl -u bit-api -f
+[Unit]
+Description=bit-api LLM gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bitapi
+Group=bitapi
+WorkingDirectory=/opt/bit-api
+EnvironmentFile=/opt/bit-api/.env
+# 生产只监听回环,TLS 与对外由 nginx 做(deploy/nginx.conf.example)
+Environment=BITAPI_HOST=127.0.0.1
+Environment=BITAPI_PORT=8080
+ExecStart=/opt/bit-api/.venv/bin/python main.py
+Restart=always
+RestartSec=3
+# 2026-09-05 的事故:fd 撞 1024 把站点打死。每条流式请求两个 fd 起步,别用默认值。
+LimitNOFILE=65536
+# 日志走 journald;stdout 是唯一的日志出口
+StandardOutput=journal
+StandardError=journal
+
+# 收紧:只能写自己的目录(库、备份、价目表都在这)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bit-api
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

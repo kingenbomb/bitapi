@@ -1,0 +1,31 @@
+{
+  "_comment": "内置价目表种子(Token 模型单位为美元/1M token)。初始值取上游官方公开定价,见 _sources;管理员可在管理台改,存库后覆盖本文件。仓库自带的 grok 渠道在列;自建渠道(数据渠道)的价由管理员自行配置。",
+  "_checked_at": "2026-09-02",
+  "_sources": {
+    "xai": "https://docs.x.ai/developers/pricing"
+  },
+  "pricing": [
+    {
+      "model_pattern": "grok-4.6",
+      "billing_mode": "token",
+      "input_price": 2,
+      "output_price": 6,
+      "cache_read_price": 0.5,
+      "long_threshold": 199999,
+      "long_input_price": 4,
+      "long_output_price": 12,
+      "long_cache_read_price": 1
+    },
+    {
+      "model_pattern": "grok-4.5",
+      "billing_mode": "token",
+      "input_price": 2,
+      "output_price": 6,
+      "cache_read_price": 0.3,
+      "long_threshold": 199999,
+      "long_input_price": 4,
+      "long_output_price": 12,
+      "long_cache_read_price": 0.6
+    }
+  ]
+}
