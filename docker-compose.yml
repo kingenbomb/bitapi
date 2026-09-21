@@ -1,0 +1,21 @@
+# 单机部署:一个容器 + 本地目录当数据卷。TLS 与反代放在宿主机的 nginx
+# (见 deploy/nginx.conf.example),所以端口只绑 127.0.0.1。
+#
+#   cp .env.example .env   # 填密钥、SMTP、告警地址
+#   docker compose up -d
+#   docker compose logs -f
+services:
+  bit-api:
+    build: .
+    image: bit-api:local
+    container_name: bit-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # 库、备份(backups/)、价目表都在这一个目录里;备份它就是备份全部
+      - ./data:/data
+    # 单 worker 是前提(限流、渠道开关、告警去重都是进程内状态),不要 scale
+    deploy:
+      replicas: 1

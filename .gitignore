@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+
+# 数据库(含用户表与 API key 明文)。bitapi.db 是 config.py 的当前默认库名,
+# poolgate.db 是改名前的旧库 —— 两个都不能进仓库。
+bitapi.db
+bitapi.db-*
+poolgate.db
+poolgate.db-*
+pool.db
+pool.db-*
+
+# 凭据(样板 .env.example 例外,它不含真值)
+.env
+.env.*
+!.env.example
+
+*.log
+
+# 运行时产物(启动时会自己重新拉/重建)
+.pytest_cache/
+.playwright-mcp/
+data/litellm_pricing.json
+
+# 生成媒体的缓存(core/media_cache.py 产物:把上游出图 URL 的字节抓下来按 token
+# 存盘,由 housekeeping 按 BITAPI_MEDIA_TTL 清理)。是短期分发,不是仓库内容。
+media/
+
+# 库备份(core/backup.py 产物,与库同级的 backups/)
+backups/

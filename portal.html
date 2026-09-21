@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>bit-api · 控制台</title>
+<!-- 每次图标内容变化都换文件名，绕过浏览器独立维护的 favicon 强缓存。
+     引降采样产物而不是 1254×1254 的母版：favicon 只画 16/32 px，
+     挂母版等于每次打开都下 946 KB。产物由 scripts/make_icons.py 生成。 -->
+<link rel="icon" type="image/png" sizes="32x32" href="/static/bit-api-icon-32.png">
+<link rel="apple-touch-icon" href="/static/bit-api-icon-180.png">
+<script>
+  /* 首屏渲染前定主题,避免深色用户看到白闪。取值与 portal-shared.js 的 dark ref 同键。 */
+  (function () {
+    try {
+      var t = localStorage.getItem("bitapi_theme");
+      if (t === "dark") document.documentElement.classList.add("dark");
+    } catch (e) {}
+  })();
+</script>
+<style>
+  html,body { margin:0; height:100%; }
+  #app { height:100%; }
+  /* Vue 挂载前的一帧也给深色底,配合上面的前置脚本消掉白闪。 */
+  html.dark body { background:#101014; }
+  .brand { display:flex; align-items:center; gap:9px; padding:16px 18px 14px;
+           font-size:16px; font-weight:750; letter-spacing:-.02em; }
+  .brandmark { display:block; width:30px; height:30px; flex:0 0 auto;
+    border-radius:9px; object-fit:cover; }
+  /* 右侧那组(铃铛/主题/余额/账号)贴顶对齐,不跟着标题+副标题两行的中线走 ——
+     居中会把它压到标题下方去,离页面上边太远。 */
+  .pagehead { display:flex; align-items:flex-start; justify-content:space-between;
+    flex-wrap:wrap; gap:12px; margin-bottom:18px; }
+  .pagehead h2 { margin:0; font-size:21px; letter-spacing:-.02em; }
+  .headright { margin-top:-3px; }
+  .sub { display:flex; flex-wrap:wrap; align-items:center; gap:7px;
+    margin:7px 0 0; font-size:13px; opacity:.72; }
+  /* 顶栏账号入口:整块可点,悬浮才描边,避免和右侧留白抢注意力。
+     等宽字体栈用变量给 JS 内联样式复用(Naive 的 --n-font-family-mono
+     在普通元素上取不到)。 */
+  :root { --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .usertrig { display:flex; align-items:center; gap:8px; cursor:pointer;
+    padding:4px 8px 4px 4px; border-radius:999px; user-select:none;
+    border:1px solid transparent; transition:background .15s,border-color .15s; }
+  .usertrig:hover { background:rgba(127,127,127,.1);
+    border-color:rgba(127,127,127,.22); }
+  .uava { display:grid; place-items:center; width:28px; height:28px;
+    border-radius:50%; flex:0 0 auto; font-size:12.5px; font-weight:700;
+    color:#fff; line-height:1;
+    background:#a8613c; }
+  .uinfo { line-height:1.2; }
+  .uname { font-size:12.5px; font-weight:600; }
+  .urole { font-size:10.5px; opacity:.55; margin-top:1px; }
+  /* 环形图图例:整行可悬浮出明细,所以要有 hover 反馈,否则看不出能交互。 */
+  .legrow { display:flex; align-items:center; gap:7px; font-size:11.5px;
+    padding:2px 5px; margin:0 -5px; border-radius:6px; cursor:default;
+    transition:background .12s; }
+  .legrow:hover { background:rgba(127,127,127,.1); }
+  /* 色点描边:供应商色里有 Moonshot 的 #0f172a 这种近黑色,深色主题下
+     纯色圆点会糊进背景。半透明白描边在两套主题下都能把边界拉出来。 */
+  .legdot { width:8px; height:8px; border-radius:50%; flex:0 0 auto;
+    box-shadow:0 0 0 1px rgba(127,127,127,.45); }
+  /* 个人资料页的身份横幅:一层中性淡底。原先是品牌色三段渐变,那是纯装饰 ——
+     横幅要表达的是「这块归你」,一层比页面深一点的底就够,不需要色相。 */
+  .hero { background-color:rgba(127,127,127,.06); }
+  html.dark .hero { background-color:rgba(255,255,255,.045); }
+  .herorow { display:flex; align-items:center; gap:18px; }
+  .heroname { font-size:20px; font-weight:750; letter-spacing:-.02em; }
+  .herosub { font-size:12.5px; opacity:.6; margin-top:2px;
+    font-family:var(--mono); }
+  /* 指标格用半透明白底:压在横幅的淡灰上仍能拉出一层,不必再写一个实色。 */
+  .herocell { padding:10px 13px; border-radius:11px;
+    background:rgba(255,255,255,.55); border:1px solid rgba(127,127,127,.13); }
+  html.dark .herocell { background:rgba(255,255,255,.05); }
+  .herok { font-size:11.5px; opacity:.55; }
+  .herov { font-size:19px; font-weight:700; letter-spacing:-.02em;
+    line-height:1.25; margin-top:2px; }
+  .herou { font-size:11.5px; font-weight:500; opacity:.55; }
+  /* 分节内的子面板:比卡片浅一层的容器,用来把「头像」「表单」两组分开。 */
+  .subpanel { height:100%; padding:16px; border-radius:12px;
+    background:rgba(127,127,127,.05); border:1px solid rgba(127,127,127,.11); }
+  .bindrow { display:flex; align-items:flex-start; gap:12px; padding:14px;
+    border-radius:12px; border:1px solid rgba(127,127,127,.14); }
+  .bindicon { display:grid; place-items:center; width:36px; height:36px;
+    border-radius:10px; flex:0 0 auto; }
+  .bindsub { font-size:11.5px; opacity:.55; margin-top:3px; }
+  /* 套餐卡:和 .subpanel 同族的浅容器,多一个「当前生效」的选中态。
+     选中用品牌色描边 + 一层同色淡底,两套主题下都够分辨,不必写 dark 变体。 */
+  .plan { position:relative; height:100%; box-sizing:border-box; padding:14px;
+    border-radius:12px; border:1px solid rgba(127,127,127,.16);
+    background:rgba(127,127,127,.04);
+    display:flex; flex-direction:column; gap:9px; }
+  .plan.on { border-color:#a8613c; background:rgba(168,97,60,.07); }
+  .planname { font-size:14.5px; font-weight:700; letter-spacing:-.01em; }
+  .planprice { font-size:23px; font-weight:750; letter-spacing:-.02em;
+    line-height:1.1; font-family:var(--mono);
+    font-variant-numeric:tabular-nums; }
+  .planunit { font-size:12px; font-weight:500; opacity:.55; }
+  .plannote { font-size:12px; opacity:.72; line-height:1.55; }
+  /* 规格键值:键固定宽度,值换行时对齐在同一列上。 */
+  .planrow { display:flex; gap:8px; font-size:11.5px; line-height:1.75; }
+  .plank { opacity:.5; flex:0 0 30px; }
+  .planv { flex:1; min-width:0; }
+  /* 按钮压在卡片底部,几张卡的高度不同时按钮仍成一行。 */
+  .planfoot { margin-top:auto; padding-top:3px; }
+  .n-data-table tr.row-err > td { background:rgba(185,28,28,.06) !important; }
+  .dtl { cursor:pointer; text-decoration:underline; text-decoration-style:dotted;
+    text-underline-offset:3px; text-decoration-color:rgba(127,127,127,.42);
+    transition:color .15s,opacity .15s,text-decoration-color .15s; }
+  .dtl:hover { opacity:1 !important; color:#a8613c;
+    text-decoration-style:solid; text-decoration-color:#a8613c; }
+  /* 用 100vh 而非 100%:中间隔着 n-config-provider 那层无高度的 div,
+     百分比高度传不下来,登录卡会贴顶。 */
+  .authwrap { display:grid; place-items:center; min-height:100vh;
+    padding:32px 20px; box-sizing:border-box; }
+  .authcard { width:100%; max-width:392px;
+    box-shadow:0 24px 60px -30px rgba(15,23,42,.38); }
+  .authbrand { display:flex; align-items:center; gap:12px; margin-bottom:22px; }
+  .authname { font-size:17px; font-weight:750; letter-spacing:-.02em; }
+  .authsub { font-size:12.5px; opacity:.6; margin-top:2px; }
+  .authswitch { text-align:center; font-size:12.5px; opacity:.72; }
+  /* 顶栏两个浮层自带 8px 14px 内边距,会把面板自己的分隔线和滚动条挤离圆角。
+     用 content-class 去掉,而不是 raw 模式 —— raw 会连底色和圆角一起丢掉。 */
+  .n-popover.n-popover-shared > .flushpop { padding:0; }
+  /* 顶栏公告面板 */
+  .annpanel { width:330px; }
+  .annhead { display:flex; align-items:center; justify-content:space-between;
+    padding:11px 14px 9px; font-size:13px; font-weight:650;
+    border-bottom:1px solid rgba(127,127,127,.14); }
+  .annempty { padding:26px 14px; text-align:center; }
+  .annitem { padding:10px 14px; border-bottom:1px solid rgba(127,127,127,.1);
+    cursor:pointer; transition:background .12s; }
+  .annitem:hover { background:rgba(127,127,127,.06); }
+  .annitem:last-child { border-bottom:none; }
+  /* 未读用左侧色条标记而不是整块底色:公告条目本身已有等级 tag 带颜色,
+     再加底色两种颜色会打架。 */
+  .annnew { box-shadow:inset 2px 0 0 #a8613c; }
+  /* 标题右侧的小圆点是「这条还没读」的持久标记(色条只在本次打开时高亮)。 */
+  .anndot { width:6px; height:6px; border-radius:50%; flex:0 0 auto;
+    background:#a8613c; }
+  /* 额度胶囊上的三个点:日/周/月各一个,颜色按各自用量。 */
+  .qdot { width:6px; height:6px; border-radius:50%; display:inline-block; }
+  .annrow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .anntitle { font-size:12.5px; font-weight:600; }
+  .annbody { font-size:12px; opacity:.72; line-height:1.5; margin:4px 0 3px;
+    white-space:pre-wrap; word-break:break-word; }
+  /* 额度面板:参考图那种「键值三行 + 分隔线」的紧凑浮层。 */
+  .crpanel { width:224px; padding:12px 14px 13px; }
+  .crtitle { font-size:12.5px; font-weight:650; margin-bottom:9px; }
+  .crrow { display:flex; align-items:baseline; justify-content:space-between;
+    gap:14px; font-size:12.5px; line-height:1.9; }
+  .crk { opacity:.62; white-space:nowrap; }
+  .crv { font-family:var(--mono); font-weight:650;
+    font-variant-numeric:tabular-nums; text-align:right; }
+  .crdim { font-weight:500; opacity:.55; }
+  .crtop { border-top:1px solid rgba(127,127,127,.16); margin-top:6px;
+    padding-top:6px; }
+  .crpanel-wide { width:250px; }
+
+  /* ---- 窄屏(手机) ----
+     这个控制台原先一条 media query 都没有,是照桌面画的。手机上最要命的是
+     n-layout 的侧栏占位:234px 压在 390px 的屏上只剩 150 多给正文,标题、
+     筛选器、正文全被挤成竖条。侧栏改抽屉在 portal-app.js 里做,这里收拾
+     剩下那些写死宽度的浮层和顶栏。断点与那边的 matchMedia 保持 860px。 */
+  .headleft { display:flex; align-items:flex-start; gap:8px; min-width:0; }
+  .headtitle { min-width:0; }
+  .hamb { margin-top:1px; flex:0 0 auto; }
+  .sidermask { position:fixed; inset:0; z-index:2;
+    background:rgba(0,0,0,.42); -webkit-tap-highlight-color:transparent; }
+
+  @media (max-width:860px) {
+    .pagehead { gap:8px; margin-bottom:14px; }
+    .pagehead h2 { font-size:18px; }
+    .sub { font-size:12px; gap:6px; margin-top:5px; }
+    .headright { margin-top:0; }
+    /* 顶栏那一排(铃铛/主题/额度/余额/账号)在 390px 上放不下,让它靠右换行。 */
+    .pagehead .headright { width:100%; }
+    .pagehead .headright > .n-space { justify-content:flex-end; }
+    /* 账号入口只留头像:名字 + 角色两行在窄屏上把整排挤出屏幕。 */
+    .usertrig { padding:3px; gap:0; }
+    .uinfo, .usertrig svg { display:none; }
+    /* 写死宽度的三个浮层:330 / 250 / 224 在 390px 上会顶到屏幕边。 */
+    .annpanel, .crpanel, .crpanel-wide { width:auto;
+      max-width:calc(100vw - 34px); }
+    .authwrap { padding:20px 14px; }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<!-- /portal 从根路径提供,资源必须写绝对路径:相对路径会被解析成 /portal/... 而 404。 -->
+<script src="/static/vue.global.prod.js"></script>
+<script src="/static/naive-ui.prod.js"></script>
+<script src="/static/portal-shared.js"></script>
+<script src="/static/portal-pages.js"></script>
+<script src="/static/portal-admin.js"></script>
+<script src="/portal-app.js"></script>
+</body>
+</html>

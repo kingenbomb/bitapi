@@ -1,0 +1,41 @@
+# nginx 反代样板:TLS 终止 + 转到 127.0.0.1:8080。
+# 几处不是装饰,漏了会出具体的事故:
+#   proxy_buffering off      —— SSE 不缓冲。缓冲了流式就变成「等完再一次吐」,首字延迟 = 总时长
+#   proxy_read_timeout 600   —— 生图能到 300 秒、长思考几分钟;默认 60 秒会掐断正常请求
+#   X-Forwarded-For          —— 限速与密钥 IP 白名单读它。不传的话全站共享 127.0.0.1 一个桶,
+#                               一个人撞库全站登不上(BITAPI_TRUST_PROXY_HEADERS 默认开)
+#   client_max_body_size     —— 带图的请求 base64 后轻松几 MB,默认 1m 会 413
+#   /pay/notify/             —— 支付回调必须能从公网打进来,别被别的规则挡掉
+server {
+    listen 80;
+    server_name your-domain.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 32m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        # 让 nginx 立刻把每个 SSE 帧刷给客户端
+        gzip off;
+    }
+}

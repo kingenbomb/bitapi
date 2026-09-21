@@ -1,0 +1,10 @@
+<!-- 站点图标:跟控制台里的 .brandmark 同一套(圆角方块 + 白色 b)。
+     字母用路径画而不是 <text>:favicon 由浏览器按系统字体栅格化,
+     换台机器字体不同,同一个图标会长得不一样。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect width="32" height="32" rx="7.5" fill="#a8613c"/>
+  <path d="M10.4 6.2v19.6" stroke="#fff" stroke-width="3.3"
+        stroke-linecap="round"/>
+  <circle cx="18.2" cy="19.4" r="5.3" fill="none" stroke="#fff"
+          stroke-width="3.3"/>
+</svg>
