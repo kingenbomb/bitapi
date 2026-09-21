@@ -134,7 +134,7 @@
 <div class="modal" id="modal">
   <div class="modal-box">
     <h3>导入 Grok 账号</h3>
-    <p class="dim">粘贴 xAI OAuth 号 JSON:单个 <code>{"email":...,"access_token":...}</code>、数组 <code>[...]</code>,或 <code>{"accounts":[...]}</code>。会写入 CPA auths 目录并入库。</p>
+    <p class="dim">粘贴 xAI OAuth 凭据 JSON:单个 <code>{"email":...,"refresh_token":...}</code>、数组 <code>[...]</code>,或 <code>{"accounts":[...]}</code>。<code>refresh_token</code> 必须有,否则号几小时后就失效。</p>
     <textarea id="modal-ta" placeholder='{"email":"...","access_token":"...","refresh_token":"...","expired":"2026-..."}'></textarea>
     <div class="modal-acts">
       <button onclick="closeModal()">取消</button>
@@ -300,7 +300,7 @@ function pager(name, total){
 
 async function delAccount(channel, idEnc){
   const identity = decodeURIComponent(idEnc);
-  if(!confirm(`确认删除账号【${identity}】?${channel==='grok'?'\n(会同时删除 CPA auths 里的号文件)':''}`)) return;
+  if(!confirm(`确认删除账号【${identity}】?`)) return;
   msg('删除 ' + identity + '…');
   try {
     const r = await fetch(`${BASE}/admin/account/delete?channel=${encodeURIComponent(channel)}&identity=${idEnc}`, { method:'POST', headers: hdr() });

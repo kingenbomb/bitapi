@@ -17,6 +17,7 @@ os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 import config  # noqa: E402
 from adapters.grok import GrokAdapter, GrokError  # noqa: E402
+from core import db as dbmod  # noqa: E402
 from core.pool import classify_failure  # noqa: E402
 
 
@@ -197,6 +198,53 @@ class FailureClassifyTest(unittest.TestCase):
                          "transient")
 
 
+class ImportAccountTest(unittest.TestCase):
+    """导入号的门禁。
+
+    这条路径断过一次:面板「导入号」按钮打的 `/admin/grok/import` 直接调
+    `adapter.import_account()`,而渠道换过一版实现后那个方法没了 —— 端点照样注册、
+    面板照样渲染,只有点下去才 500。
+    """
+
+    def setUp(self):
+        self.ad = GrokAdapter()
+        # 生产里 server.py 传进来的就是 core.db.DB(见 core/pool_state.py 的 DB 单例)
+        self.db = dbmod.DB(os.path.join(_TMP, f"imp{id(self)}.db"))
+
+    def test_imports_and_lands_in_pool(self):
+        action, identity = self.ad.import_account(self.db, {
+            "email": "a@example.com", "access_token": "tok",
+            "refresh_token": "rt",
+            "base_url": "https://cli-chat-proxy.grok.com/v1"})
+        self.assertEqual((action, identity), ("imported", "a@example.com"))
+        acct = self.db.get_by_identity("grok", "a@example.com")
+        self.assertEqual(acct["status"], "active")
+        # 凭据必须真的落进 secret —— 只记个账号名,取号时照样刷不出 token
+        sec = acct["secret"]
+        if isinstance(sec, str):        # 不同 DB 层有的给字符串、有的给 dict
+            sec = json.loads(sec)
+        self.assertEqual(sec["refresh_token"], "rt")
+        self.assertEqual(acct["token"], "tok")
+
+    def test_reimport_is_skipped_not_duplicated(self):
+        item = {"email": "b@example.com", "refresh_token": "rt"}
+        self.ad.import_account(self.db, item)
+        action, _ = self.ad.import_account(self.db, item)
+        self.assertEqual(action, "skipped")
+        self.assertEqual(len(self.db.list_accounts(channel="grok", limit=100)), 1)
+
+    def test_refresh_token_is_required(self):
+        """只有 access_token 的号几小时后就失效,而本渠道没有别的续期途径 ——
+        放进来只会让取号一直失败,不如在门口拒掉。"""
+        with self.assertRaises(ValueError):
+            self.ad.import_account(self.db, {"email": "c@example.com",
+                                             "access_token": "tok"})
+
+    def test_identity_is_required(self):
+        with self.assertRaises(ValueError):
+            self.ad.import_account(self.db, {"refresh_token": "rt"})
+
+
 class RegistryTest(unittest.TestCase):
     def test_registered_models_route_to_grok(self):
         """声明出去的模型必须都能路由回本渠道 —— 挂上去却路由不到的模型,
@@ -206,6 +254,19 @@ class RegistryTest(unittest.TestCase):
         self.assertTrue(GrokAdapter.models)
         for name in GrokAdapter.models:
             self.assertEqual(m.get(name), "grok")
+
+    def test_import_endpoint_has_a_method_to_call(self):
+        """`/admin/grok/import` 调的是 adapter.import_account。
+
+        单独钉一条:断掉的那次两端都「看着正常」—— 方法没了,端点照样注册、
+        面板照样渲染,只有点下去才知道是 500。
+        """
+        import inspect
+        import server
+        self.assertIn("import_account",
+                      inspect.getsource(server.admin_grok_import))
+        self.assertTrue(hasattr(GrokAdapter(), "import_account"),
+                        "端点调 import_account,渠道就必须有这个方法")
 
 
 if __name__ == "__main__":
