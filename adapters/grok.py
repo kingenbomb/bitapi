@@ -280,6 +280,52 @@ class GrokAdapter(Adapter):
         exp = int(time.time()) + int(got.get("expires_in") or 21600)
         return {"token": token, "token_exp": exp, "secret": new_secret}
 
+    # ---- 导入 ----
+
+    def import_account(self, db, item):
+        """导入一个号 → 返回 (action, identity),action ∈ {"imported", "skipped"}。
+
+        接受 xAI OAuth 凭据(CPA 导出的 auths JSON 同形状):
+          {"email"|"sub", "access_token"|"token", "refresh_token",
+           "expired"|"token_exp", "base_url", "token_endpoint"}
+
+        **refresh_token 是必须的**:只有 access_token 的号几小时后就失效,而本渠道
+        没有别的续期途径,号会一直卡在取号失败上。凭据存 accounts.secret,
+        库是唯一真源 —— 导入之后不再读任何外部文件。
+        """
+        if not isinstance(item, dict):
+            raise ValueError("account must be a JSON object")
+        # 兼容两种写法:整个对象就是凭据,或凭据包在 secret 里
+        sec = item.get("secret") if isinstance(item.get("secret"), dict) else item
+        refresh = str(sec.get("refresh_token") or "").strip()
+        if not refresh:
+            raise ValueError("refresh_token is required")
+        identity = str(item.get("identity") or sec.get("email")
+                       or sec.get("sub") or "").strip()
+        if not identity:
+            raise ValueError("email / identity is required")
+
+        secret = {"refresh_token": refresh,
+                  "client_id": sec.get("client_id") or config.GROK_CLIENT_ID}
+        for k in ("base_url", "token_endpoint"):
+            if sec.get(k):
+                secret[k] = sec[k]
+        token = str(sec.get("access_token") or sec.get("token") or "").strip()
+        exp = _iso_to_unix(sec.get("expired")) or int(sec.get("token_exp") or 0)
+
+        from core import db as dbmod
+        existed = db.get_by_identity(self.name, identity) is not None
+        acct_id = db.upsert_account(self.name, identity, secret=secret,
+                                    status=dbmod.ST_ACTIVE)
+        upd = {}
+        if token:
+            upd["token"] = token
+        if exp:
+            upd["token_exp"] = exp
+        if upd:
+            db.update_account(acct_id, **upd)
+        return ("skipped" if existed else "imported"), identity
+
     def health(self, acct):
         """只读 user 端点。只有 userBlockedReason 才是账号级封禁;
         hasGrokCodeAccess 是权限位不是额度,不能拿来判死号。"""
