@@ -63,7 +63,7 @@ python main.py    # 或 uvicorn server:app --host 0.0.0.0 --port 8080
 
 | 入口 | 用途 |
 |---|---|
-| `/` | 站点首页（公开落地页：定位、在册厂商、接入示例、计费口径，读数实时取自 `/api/models`） |
+| `/` | 公开落地页：立体主视觉、实时模型目录、能力介绍、可复制端点与三种接入示例；适配手机和深色模式，端点自动使用当前部署域名，模型与价格取自 `/api/models` |
 | `/portal` | 用户控制台 + 管理控制台 |
 | `/admin/ui` | 号池监控面板（账号池状态、巡检、导入） |
 | `/v1/*` | OpenAI / Anthropic 兼容 API |
@@ -150,7 +150,7 @@ payments/           各支付渠道实现（epay/mock）
 plugins/            策略插件（返佣示例三个 + alert_webhook 告警）
 routers/portal.py   用户与管理 REST API
 server.py           FastAPI 应用：/v1 网关 + /admin 号池 + 页面
-home.html           站点首页（单文件，零依赖零构建）
+home.html           公开落地页（零依赖、无构建，样式与交互见 static/landing.css、landing.js）
 portal.html         用户控制台（原生 JS，无构建）
 dashboard.html      号池监控面板
 static/model-icons/ 厂商官方图标（挑自 @lobehub/icons-static-svg，MIT，自托管不走 CDN）
@@ -168,6 +168,8 @@ data/pricing_seed.json  定价种子（可一键导入）
 **定价快照。** 每条 usage_log 冻结一份当次生效的单价、档位、倍率。改价之后历史账单仍可精确复算。
 
 ## 测试
+
+本开源仓库当前未配置 CI；提交前由本次改动的开发者运行相关测试，界面改动还需本地浏览器回放。首页回归使用 `python -m pytest tests/test_portal.py::PortalAssetCacheTest tests/test_portal.py::PortalPlazaTest::test_guest_sees_default_group_view -q`，另执行 `node --check static/landing.js` 检查脚本语法（Node 只用于开发校验，不是服务运行依赖）。
 
 ```bash
 pip install -r requirements-dev.txt   # httpx 是 TestClient 的依赖，不是运行时依赖

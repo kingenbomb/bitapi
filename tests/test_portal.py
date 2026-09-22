@@ -1107,11 +1107,51 @@ class PortalAssetCacheTest(unittest.TestCase):
                        for p in glob.glob(os.path.join(root, "static", "portal-*.js")))
         # 空 glob 说明资源被改名了,不能静默通过 —— 那样这条门禁就白装了
         self.assertTrue(names, "static/portal-*.js 一个都没匹配到")
-        for path in ["/", "/portal", "/portal-app.js"] + [f"/static/{n}" for n in names]:
+        landing_assets = ["/static/landing.css", "/static/landing.js",
+                          "/static/landing-orbit.png"]
+        for path in ["/", "/portal", "/portal-app.js"] + landing_assets + [f"/static/{n}" for n in names]:
             with self.subTest(path=path):
                 r = self.client.get(path)
                 self.assertEqual(r.status_code, 200, path)
                 self.assertEqual(r.headers.get("cache-control"), "no-cache", path)
+
+    def test_landing_preserves_public_entries_and_self_hosted_assets(self):
+        from html.parser import HTMLParser
+
+        class Page(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.refs = set()
+                self.ids = set()
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                self.refs.update(v for k, v in attrs.items()
+                                 if k in ("src", "href") and v)
+                if attrs.get("id"):
+                    self.ids.add(attrs["id"])
+
+        page = Page()
+        html = self.client.get("/").text
+        page.feed(html)
+        self.assertNotIn("ai.baipiao.co", html)
+        script = self.client.get("/static/landing.js").text
+        self.assertNotIn("ai.baipiao.co", script)
+        for link in ("/portal", "/portal#/register", "/portal#/plaza", "/portal#/keys"):
+            self.assertIn(link, page.refs)
+        for target in ("n-models", "n-ch", "n-price", "statnote", "vendrow",
+                       "code", "copybtn", "endpoint-copy", "api-endpoint", "themebtn", "copy-status"):
+            self.assertIn(target, page.ids)
+        for path, mime in (("/static/landing.css", "text/css"),
+                           ("/static/landing.js", "application/javascript"),
+                           ("/static/landing-orbit.png", "image/png"),
+                           ("/static/bit-api-icon-32.png", "image/png"),
+                           ("/static/bit-api-icon-180.png", "image/png")):
+            with self.subTest(path=path):
+                self.assertIn(path, page.refs)
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.headers["content-type"].startswith(mime))
 
 
 class PortalPlazaTest(unittest.TestCase):
