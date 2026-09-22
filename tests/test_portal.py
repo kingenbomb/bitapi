@@ -1123,17 +1123,29 @@ class PortalAssetCacheTest(unittest.TestCase):
                 super().__init__()
                 self.refs = set()
                 self.ids = set()
+                self.header_links = set()
+                self.in_header = False
 
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
+                if tag == "header":
+                    self.in_header = True
+                if self.in_header and tag == "a" and attrs.get("href"):
+                    self.header_links.add(attrs["href"])
                 self.refs.update(v for k, v in attrs.items()
                                  if k in ("src", "href") and v)
                 if attrs.get("id"):
                     self.ids.add(attrs["id"])
 
+            def handle_endtag(self, tag):
+                if tag == "header":
+                    self.in_header = False
+
         page = Page()
         html = self.client.get("/").text
         page.feed(html)
+        self.assertIn("/portal#/plaza", page.header_links)
+        self.assertIn("#models", page.header_links)
         self.assertNotIn("ai.baipiao.co", html)
         script = self.client.get("/static/landing.js").text
         self.assertNotIn("ai.baipiao.co", script)
