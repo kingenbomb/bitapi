@@ -106,6 +106,8 @@ def client_ip(request):
 LOGIN_IP = SlidingWindow(config.AUTH_LOGIN_FAILS_PER_IP, config.AUTH_LOGIN_WINDOW)
 LOGIN_EMAIL = SlidingWindow(config.AUTH_LOGIN_FAILS_PER_EMAIL, config.AUTH_LOGIN_WINDOW)
 REGISTER_IP = SlidingWindow(config.AUTH_REGISTER_PER_IP, config.AUTH_REGISTER_WINDOW)
+REGISTER_MAIL_IP = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_IP, 3600)
+REGISTER_MAIL_EMAIL = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_EMAIL, 3600)
 RESET_EMAIL = SlidingWindow(config.AUTH_RESET_PER_EMAIL, config.AUTH_RESET_WINDOW)
 RESET_IP = SlidingWindow(config.AUTH_RESET_PER_IP, config.AUTH_RESET_WINDOW)
 
@@ -126,5 +128,5 @@ def check(*pairs):
 
 def reset_all():
     """测试用:清空全部限速器。"""
-    for lim in (LOGIN_IP, LOGIN_EMAIL, REGISTER_IP, RESET_EMAIL, RESET_IP):
+    for lim in (LOGIN_IP, LOGIN_EMAIL, REGISTER_IP, REGISTER_MAIL_IP, REGISTER_MAIL_EMAIL, RESET_EMAIL, RESET_IP):
         lim.reset()

@@ -11,6 +11,7 @@
   → (ledger_row, created)  created=False 表示该 idem_key 已记账过,本次为空操作
 
 写入成功后 emit("balance.changed")。
+注册邀请奖励在建号事务内复用 UserDB.apply_credit，提交后调用 publish_balance_change。
 """
 from core.hooks import emit
 
@@ -45,9 +46,14 @@ def credit(user_id, amount, reason, idem_key, meta=None):
         raise ValueError("idem_key is required for idempotency")
     row, created = _DB.apply_credit(user_id, float(amount), reason, idem_key, meta)
     if created and amount:
-        emit("balance.changed", user_id=user_id, delta=float(amount),
-             reason=reason, balance_after=row.get("balance_after"), ledger=row)
+        publish_balance_change(row)
     return row, created
+
+
+def publish_balance_change(row):
+    """入账提交后广播；注册事务中的邀请奖励也复用此通知。"""
+    emit("balance.changed", user_id=row["user_id"], delta=float(row["amount"]),
+         reason=row["reason"], balance_after=row.get("balance_after"), ledger=row)
 
 
 def balance_of(user_id):

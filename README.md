@@ -35,6 +35,8 @@ bit-api 将多个上游模型服务统一为兼容 OpenAI 与 Anthropic 常用�
 | 模型与体验 | 公开模型广场、价格筛选、对话 Playground、可复制端点和接入示例；Playground 与 API 共用计费路径。 |
 | 定价与账务 | 按分组选择余额、配额或免费策略；支持模型通配、分组专属价、长上下文阶梯价、用量记录和余额流水。 |
 | 运营工具 | 每日签到与可配置赠额区间、站内公告、订阅时长卡、兑换码、易支付充值、返佣插件及日志导出。 |
+| Token 消耗榜 | 登录后查看累计、近 7 天或近 30 天的输入与输出 Token 排名；用户名脱敏，可查看自己的排名。缓存另列，不计入排名。 |
+| 邀请奖励 | 后台设置有效注册奖励金额、开关和每位邀请人的奖励人数上限；注册与发奖同一事务，重复注册或回调不重复发奖。 |
 | 日常维护 | 上游号池巡检、SQLite 在线备份、SMTP 邮件、Webhook 告警、用户及全站运营看板。 |
 
 模型广场展示的是配置允许的模型与价格，不是上游可用性承诺；实际调用还取决于账号状态、密钥权限、余额、额度和上游服务。
@@ -83,19 +85,34 @@ $env:BITAPI_HOST = "127.0.0.1"
 .\.venv\Scripts\python.exe main.py
 ```
 
-打开 [本地控制台](http://127.0.0.1:8080/portal)。以上命令不启用支付、邮件或社区登录，不需要先配置这些可选服务。
+打开 [本地控制台](http://127.0.0.1:8080/portal)。浏览公开页面和模型广场不需要配置支付或社区登录；**邮箱注册（包括首个管理员）需要先配置 SMTP**，示例见下方。
 
 > 本地示例明确绑定回环地址，仅用于开发体验。`python main.py` **不会自动读取 `.env`**；直接运行时请通过当前进程的环境变量配置。Docker Compose 和 systemd 分别通过 `env_file`、`EnvironmentFile` 加载配置文件。
 
 ### 3. 完成首次配置
 
-1. **注册管理员。** 打开 `/portal#/register`；第一个通过邮箱注册的用户免邀请码并成为管理员。请在向公网开放前完成这一步。
+首次注册前，将 [`.env.example`](.env.example) 中的 SMTP 示例替换为自己的发信服务配置。以下为虚构的 Bash 示例；PowerShell 用 `$env:变量名 = "值"` 设置相同变量，然后重新启动服务。
+
+```bash
+export BITAPI_SMTP_HOST='smtp.example.com'
+export BITAPI_SMTP_PORT='587'
+export BITAPI_SMTP_SECURITY='starttls'
+export BITAPI_SMTP_USER='no-reply@example.com'
+export BITAPI_SMTP_PASS='<YOUR_SMTP_AUTH_CODE>'
+export BITAPI_SMTP_FROM='no-reply@example.com'
+```
+
+Docker Compose 或 systemd 部署可在 `.env` 填写；直接运行 `main.py` 时必须设置进程环境变量，不能只编辑 `.env`。未配置 SMTP 时，发送注册验证码返回 `503`，不会建立未验证账号。
+
+1. **注册管理员。** 打开 `/portal#/register`，发送并填写邮件中的 6 位验证码；第一个验证成功的用户免邀请码并成为管理员。验证码 15 分钟有效、60 秒后可重发、最多允许 5 次错误。请在向公网开放前完成这一步。
 2. **接入上游。** 进入「管理控制台 → 渠道」，添加 OpenAI 兼容渠道，填写上游地址、模型清单和必要映射，导入自己的 API Key，再执行渠道测试。Grok 等专用 Adapter 的凭据格式见 [渠道开发文档](docs/adapters.md)。
 3. **确认分组与价格。** 检查默认分组允许哪些模型、采用哪种计费策略，并配置模型价格。首次初始化的默认分组采用 **免费策略**；仅填写价格并不会自动开启余额扣费。
 4. **创建用户密钥。** 在「API 密钥」创建调用密钥，按需设置有效期、额度和模型范围。面向应用分发用户密钥，不分发内部主密钥或管理密钥。
 5. **发起一次请求。** 从「模型广场」复制准确模型名，按下一节调用，再到「使用记录」核对结果与用量。
 
 后续邮箱注册默认需要一次性邀请码，管理员可以调整注册策略。个人返佣码用于记录邀请关系，不能代替强制邀请制下的注册邀请码。
+
+邀请奖励默认关闭。管理员在「站点设置 → 注册邀请奖励」填写每人美元金额（最多四位小数）和每位邀请人的奖励人数上限（`0` 表示不限），通过预览确认后保存。规则只适用于后续有效注册，不补发历史邀请；达到上限后仍绑定邀请关系，但不再发奖。已配置 `affiliate_fixed` 的旧部署会沿用原规则，保存后台规则后替代该插件的邀请奖励和新用户见面礼，其他返佣插件不受影响。
 
 ### 常用入口
 
@@ -104,6 +121,8 @@ $env:BITAPI_HOST = "127.0.0.1"
 | `/` | 公开落地页、端点与接入示例 | 无需登录；顶部可直达模型广场。 |
 | `/portal#/plaza` | 模型广场 | 访客按默认分组查看目录与价格。 |
 | `/portal` | 用户控制台与管理控制台 | 页面公开，用户及管理数据按身份鉴权。 |
+| `/portal#/leaderboard` | Token 消耗榜 | 需要登录；所有启用账号参与，无调用账号位于末尾。 |
+| `/portal#/invite` | 邀请链接、当前奖励规则与入账 | 需要登录；不公开被邀请人的邮箱和名单。 |
 | `/admin/ui` | 上游账号池面板 | 页面外壳公开，管理操作需要授权。 |
 | `/v1/*` | 模型调用接口 | 使用用户 API Key 或内部网关主密钥。 |
 | `/health` | 服务健康检查 | 无需鉴权；不执行上游模型探测。 |
@@ -187,6 +206,8 @@ curl --fail-with-body --no-buffer "$BITAPI_BASE_URL/v1/chat/completions" \
 
 核心负责鉴权、路由、计量与账务约束；Adapter 负责上游差异；插件负责返佣、活动和通知等策略。扩展时应通过 `credit()` 修改余额，而不是直接修改 `users.balance`。插件事件不是持久消息队列，也不提供自动重试承诺。示例与事件载荷见 [插件文档](docs/plugins.md)。
 
+注册验证码只在 `registration_codes` 保存加盐哈希。验证、占用邀请码、创建用户与注册邀请奖励在同一 SQLite 写事务提交；提交后再通知余额事件和注册插件。社区授权流程在 `community_auth_flows.referral_code` 保存邀请来源，保留现有注册资格要求；已有账号登录或绑定不会重新归因。`GET /api/leaderboard` 在同一查询中统计启用账号、排名、分页和本人位置，只返回脱敏用户名与用量；`GET /api/invite` 返回当前奖励规则，管理员通过 `PATCH /api/admin/settings` 的 `invite_rewards` 保存整组规则。
+
 ## 配置说明
 
 完整样板见 [`.env.example`](.env.example)，配置读取规则见 [`config.py`](config.py)。新部署使用 `BITAPI_*` 前缀；部分站点设置、支付、邮件与渠道选项支持管理台存库覆盖环境默认值，不能假定修改环境变量就会覆盖已有配置。
@@ -219,7 +240,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 <summary>可选服务：社区登录、邮件、支付与告警</summary>
 
 - **社区登录：**需自行部署支持 `community-connect` 的 Flarum 社区，设置 `BITAPI_COMMUNITY_BASE_URL`、`BITAPI_COMMUNITY_CLIENT_ID`、`BITAPI_COMMUNITY_CLIENT_SECRET` 和完全匹配的 `BITAPI_COMMUNITY_REDIRECT_URI`。并非任意 Flarum 站点都能直接接入。首次通过社区创建本站账号始终需要一次性注册邀请码；已有用户在「个人资料 → 登录方式绑定」操作，不按同邮箱自动合并。
-- **邮件：**在管理台「邮件设置」配置 SMTP 并发送测试邮件，用于密码找回与邮箱验证。未配置时相关发信功能不可用。
+- **邮件：**SMTP 用于注册验证码、密码找回与邮箱验证。首个管理员注册前先按 [`.env.example`](.env.example) 配置进程环境变量；之后可在管理台「邮件设置」修改并发送测试邮件。未配置时相关发信功能不可用。
 - **支付：**配置易支付商户信息、站点回调地址与启用渠道；`mock` 会将打开支付链接视为付款成功，只允许用于隔离测试环境。详见 [支付接入](docs/payments.md)。
 - **告警：**启用 `BITAPI_PLUGINS=alert_webhook` 并设置 `BITAPI_ALERT_WEBHOOK_URL`，可对接 Telegram、Bark 或普通 Webhook。详见 [运维手册](docs/operations.md)。
 

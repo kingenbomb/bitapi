@@ -179,6 +179,22 @@ def checkin_max():
     return number("checkin_max")
 
 
+def invite_reward_defaults():
+    """未配置时关闭；已启用固定邀请插件的部署保留原规则。"""
+    if "affiliate_fixed" in config.PLUGINS:
+        from plugins.affiliate_fixed import CONFIG
+        return {"enabled": CONFIG["inviter_bonus"] > 0, "amount": CONFIG["inviter_bonus"],
+                "max_invitees": CONFIG["max_invitees"]}
+    return {"enabled": False, "amount": 0.0, "max_invitees": 0}
+
+
+def invite_rewards(*, stored=_MISSING):
+    value = _raw("invite_rewards") if stored is _MISSING else stored
+    if value is _MISSING:
+        value = invite_reward_defaults()
+    return validate("invite_rewards", value)
+
+
 def smtp_host():
     return text("smtp_host")
 
@@ -276,6 +292,21 @@ def validate(key, value, known_providers=(), known_channels=()):
                 raise SettingError(f"{n} 的优先级需在 -1000~1000、权重需在 0~1000")
             out[n] = {"priority": pr, "weight": wt}
         return out
+
+    if key == "invite_rewards":
+        if not isinstance(value, dict) or set(value) != {"enabled", "amount", "max_invitees"}:
+            raise SettingError("邀请奖励需包含 enabled、amount、max_invitees")
+        if not isinstance(value["enabled"], bool):
+            raise SettingError("邀请奖励开关必须是布尔值")
+        amount = _as_finite(value["amount"], "每人邀请奖励")
+        if isinstance(value["amount"], bool) or amount < 0 or round(amount, 4) != amount:
+            raise SettingError("每人邀请奖励须为非负金额，最多四位小数")
+        limit = value["max_invitees"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise SettingError("奖励人数上限须为非负整数，0 表示不限")
+        if value["enabled"] and amount <= 0:
+            raise SettingError("开启邀请奖励前，请设置大于 0 的每人奖励")
+        return {"enabled": value["enabled"], "amount": amount, "max_invitees": limit}
 
     if key == "min_topup":
         f = _as_finite(value, "单笔最低充值")

@@ -30,7 +30,7 @@ from core.billing import Billing  # noqa: E402
 from core.credit import credit  # noqa: E402
 from core.user_db import UserDB  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+from tests.registration_fixture import TestClient  # noqa: E402
 from plugins import alert_webhook as plugin  # noqa: E402
 
 

@@ -23,7 +23,7 @@ import routers.portal as portal_routes  # noqa: E402
 from core import auth, preflight  # noqa: E402
 from core.billing import Billing  # noqa: E402
 from core.user_db import UserDB  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+from tests.registration_fixture import TestClient  # noqa: E402
 
 
 class PreflightTest(unittest.TestCase):

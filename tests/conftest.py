@@ -15,6 +15,7 @@ def _disable_auth_throttle():
     tests/test_auth_throttle.py,那里显式设阈值再恢复。"""
     from core import throttle
     limiters = (throttle.LOGIN_IP, throttle.LOGIN_EMAIL, throttle.REGISTER_IP,
+                throttle.REGISTER_MAIL_IP, throttle.REGISTER_MAIL_EMAIL,
                 throttle.RESET_EMAIL, throttle.RESET_IP)
     saved = [lim.limit for lim in limiters]
     for lim in limiters:

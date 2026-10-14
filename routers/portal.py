@@ -16,7 +16,7 @@ import threading
 import time
 from datetime import date as _date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 
@@ -31,7 +31,7 @@ from core import orders as orders_mod
 from core import pricing_catalog
 from core import throttle
 from core import totp
-from core.credit import (REASON_ADMIN, REASON_CHECKIN, REASON_PLAN,
+from core.credit import (publish_balance_change, REASON_ADMIN, REASON_CHECKIN, REASON_PLAN,
                          REASON_SIGNUP, credit)
 from core.hooks import emit
 from core import site_settings as S
@@ -42,7 +42,8 @@ from core.redeem import (TYPE_BALANCE, TYPE_INVITATION, RedeemError,
                          generate_codes, redeem)
 from core.user_db import (CommunityAffCodeConflict, CommunityEmailConflict,
                           CommunityFlowError, CommunityIdentityConflict,
-                          CommunityInviteError, CommunityUserDisabled)
+                          CommunityInviteError, CommunityUserDisabled,
+                          RegistrationCodeError, RegistrationCodeCooldown)
 
 router = APIRouter(prefix="/api")
 
@@ -87,6 +88,12 @@ class RegisterReq(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     invite_code: str = ""
+    verification_code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class RegistrationCodeReq(BaseModel):
+    email: EmailStr
+
 
 
 class LoginReq(BaseModel):
@@ -96,6 +103,8 @@ class LoginReq(BaseModel):
 
 class CommunityStartReq(BaseModel):
     purpose: str = Field(pattern="^(login|bind)$")
+    referral_code: str = Field(default="", max_length=64)
+
 
 
 class CommunityFinishReq(BaseModel):
@@ -156,19 +165,11 @@ def _alloc_aff_code():
     raise HTTPException(status_code=500, detail="failed to allocate invite code")
 
 
-def _claim_invite_code(code):
-    """占用一张管理台发的一次性邀请码;抢到返回 True。
+def _publish_registered_invite_reward(user_id):
+    row = USER_DB.get_ledger_by_idem(f"aff:invite:{user_id}")
+    if row and row["amount"]:
+        publish_balance_change(row)
 
-    先占用再建号,不是先建号再占用:反过来的话并发的两个注册都能通过校验,
-    一张一次性码进两个人。代价是占用那一刻还没有 user_id,建号之后回填
-    (bind_code_user)。过期在这里判 —— claim_code 只看 status。
-    """
-    rec = USER_DB.get_code(code)
-    if not rec or rec["type"] != TYPE_INVITATION:
-        return False
-    if rec.get("expires_at") and rec["expires_at"] < int(time.time()):
-        return False
-    return USER_DB.claim_code(code, None)
 
 
 def _throttled(e):
@@ -183,9 +184,39 @@ def _throttled(e):
         headers={"Retry-After": str(e.retry_after)})
 
 
+@router.post("/register/code")
+def registration_code(req: RegistrationCodeReq, request: Request):
+    email = str(req.email).strip().lower()
+    if USER_DB.get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="该邮箱已注册，请直接登录")
+    if not mailer.configured():
+        raise HTTPException(status_code=503, detail="站点未配置邮件服务，请联系站长")
+    ip = throttle.client_ip(request)
+    for limiter, key, scope in ((throttle.REGISTER_MAIL_IP, ip, "registration_mail_ip"),
+                                (throttle.REGISTER_MAIL_EMAIL, email, "registration_mail_email")):
+        if key and limiter.hit(key):
+            raise _throttled(throttle.AuthThrottled(scope, limiter.retry_after(key), key))
+    code = auth.generate_email_code()
+    code_hash = auth.hash_password(code)
+    try:
+        USER_DB.reserve_registration_code(email, code_hash)
+    except RegistrationCodeCooldown as e:
+        raise HTTPException(status_code=429, detail=str(e),
+                            headers={"Retry-After": str(e.retry_after)}) from e
+    subject, text, html = mailer.verify_email_mail(S.site_name(), code, 15)
+    try:
+        mailer.send(email, subject, text, html)
+    except mailer.MailError as e:
+        USER_DB.finish_registration_mail(email, code_hash, False)
+        raise HTTPException(status_code=502, detail="验证码邮件发送失败，请稍后重试") from e
+    USER_DB.finish_registration_mail(email, code_hash, True)
+    return {"ok": True, "sent": True, "retry_after": 60, "expires_in": 900}
+
+
+
 @router.post("/register")
 def register(req: RegisterReq, request: Request = None):
-    email = req.email.lower().strip()
+    email = str(req.email).strip().lower()
     ip = throttle.client_ip(request)
     try:
         throttle.check((throttle.REGISTER_IP, ip, "register"))
@@ -194,52 +225,25 @@ def register(req: RegisterReq, request: Request = None):
     if USER_DB.get_user_by_email(email):
         raise HTTPException(status_code=409, detail="email already registered")
 
-    is_first = USER_DB.count_users() == 0
-    inviter_id = None
-    claimed = None      # 已占用的一次性邀请码,建号后回填使用者
-    role = "user"
-
-    if is_first:
-        role = "admin"  # 首个用户免码,成为根邀请人/管理员
-    else:
-        require_invite = _require_invite()
-        code = auth.normalize_aff_code(req.invite_code)
-        if require_invite and not code:
-            raise HTTPException(status_code=403, detail="invite code required")
-        if require_invite:
-            # 邀请制的通行证只能由管理员发放。个人返佣码可以无限传播,
-            # 若也能过这道门,开启邀请制就失去意义。
-            if _claim_invite_code(code):
-                claimed = code
-            else:
-                raise HTTPException(status_code=403, detail="invalid invite code")
-        elif code:
-            # 开放注册时个人码只负责返佣归因；一次性注册码仍可照常使用。
-            inviter = USER_DB.get_user_by_aff_code(code)
-            if inviter:
-                inviter_id = inviter["id"]
-            elif _claim_invite_code(code):
-                claimed = code
-            else:
-                raise HTTPException(status_code=403, detail="invalid invite code")
-
     group = ensure_default_group()
     aff = _alloc_aff_code()
-
-    uid = USER_DB.create_user(
-        email=email,
-        password_hash=auth.hash_password(req.password),
-        aff_code=aff,
-        group_id=group["id"] if group else None,
-        inviter_id=inviter_id,
-        role=role)
-    if claimed:
-        USER_DB.bind_code_user(claimed, uid)
+    try:
+        uid, role, inviter_id = USER_DB.register_verified_user(
+            email, req.verification_code, auth.hash_password(req.password), aff,
+            group["id"] if group else None, auth.normalize_aff_code(req.invite_code),
+            _require_invite())
+    except RegistrationCodeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except CommunityInviteError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except CommunityEmailConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     # 注册赠额。放在 emit 之前:插件可能在 user.registered 里读余额,
     # 先记账再广播,插件看到的就是最终值。
     if config.SIGNUP_BONUS:
         credit(uid, config.SIGNUP_BONUS, REASON_SIGNUP, f"signup:{uid}",
                meta={"source": "register"})
+    _publish_registered_invite_reward(uid)
     emit("user.registered", user=USER_DB.get_user(uid),
          inviter=USER_DB.get_user(inviter_id) if inviter_id else None)
     # 注册成功才计数:被邀请码挡回去的请求不该消耗额度,否则填错一次码就少一次机会
@@ -247,6 +251,7 @@ def register(req: RegisterReq, request: Request = None):
     token = auth.issue_token(uid, role=role)
     return {"ok": True, "user_id": uid, "token": token, "role": role,
             "aff_code": aff}
+
 
 
 @router.post("/login")
@@ -347,7 +352,8 @@ def community_auth_start(req: CommunityStartReq, response: Response,
     USER_DB.create_community_flow(
         community_auth.digest(state), community_auth.digest(nonce),
         req.purpose, user["id"] if user else None,
-        now + community_auth.FLOW_TTL)
+        now + community_auth.FLOW_TTL,
+        referral_code=auth.normalize_aff_code(req.referral_code) if req.purpose == "login" else "")
     _set_community_flow_cookie(response, nonce)
     return {"ok": True, "authorize_url": authorize_url}
 
@@ -464,6 +470,7 @@ def community_auth_finish(req: CommunityFinishReq, request: Request,
     if config.SIGNUP_BONUS:
         credit(uid, config.SIGNUP_BONUS, REASON_SIGNUP, f"signup:{uid}",
                meta={"source": "community"})
+    _publish_registered_invite_reward(uid)
     emit("user.registered", user=USER_DB.get_user(uid),
          inviter=USER_DB.get_user(inviter_id) if inviter_id else None)
     _clear_community_flow_cookie(response)
@@ -1423,13 +1430,47 @@ def list_my_orders(limit: int = 50, offset: int = 0, user=Depends(current_user))
 
 # ---- 邀请 ----
 
+@router.get("/leaderboard")
+def token_leaderboard(range: str = Query(default="all", pattern="^(all|7d|30d)$"),
+                      page: int = Query(default=1, ge=1),
+                      page_size: int = Query(default=20, ge=1, le=100),
+                      user=Depends(current_user)):
+    now = int(time.time())
+    days = {"all": 0, "7d": 7, "30d": 30}[range]
+    since = now - days * 86400 if days else 0
+    result = USER_DB.token_leaderboard(user["id"], since, now, page, page_size)
+
+    def public_row(row):
+        if row is None:
+            return None
+        name = row["display_name"] or row["email"].split("@", 1)[0]
+        masked = name[:1] + "***" + (name[-1:] if len(name) > 2 else "")
+        return {
+            "rank": row["rank"] if row["total_tokens"] else None,
+            "position": row["position"], "name": masked,
+            "is_me": row["user_id"] == user["id"],
+            **{key: row[key] for key in (
+                "total_tokens", "input_tokens", "output_tokens", "cache_tokens", "cache_rows", "requests")},
+        }
+
+    return {"rows": [public_row(row) for row in result["rows"]],
+            "me": public_row(result["me"]), "range": range,
+            "since": since, "as_of": now, "page": page, "page_size": page_size,
+            "total_users": result["total_users"], "total_tokens": result["total_tokens"]}
+
+
+
 @router.get("/invite")
 def invite(user=Depends(current_user)):
     return {
         "aff_code": user["aff_code"],
         "invitees": USER_DB.count_invitees(user["id"]),
         "earned": USER_DB.ledger_sum(user["id"], reason="affiliate"),
+        "reward_policy": S.invite_rewards(),
+        "rewarded_invitees": USER_DB.invite_reward_count(user["id"]),
+        "require_invite": _require_invite(),
     }
+
 
 
 # ---- 公告 ----
@@ -1560,7 +1601,16 @@ class AdminResetPwReq(BaseModel):
     new_password: str = Field(min_length=6, max_length=128)
 
 
+class InviteRewardsReq(BaseModel):
+    model_config = {"extra": "forbid"}
+    enabled: bool = Field(strict=True)
+    amount: float = Field(strict=True, ge=0, allow_inf_nan=False)
+    max_invitees: int = Field(strict=True, ge=0)
+
+
+
 class SettingsReq(BaseModel):
+    invite_rewards: InviteRewardsReq | None = None
     require_invite: bool | None = None
     default_group: str | None = None
     checkin_min: float | None = None
@@ -1594,7 +1644,7 @@ class SettingsReq(BaseModel):
 PAY_KEYS = ("payment_providers", "min_topup", "site_url",
             "epay_api_url", "epay_pid", "epay_key", "epay_usd_rate")
 # 存库的其它设置项。与 PAY_KEYS 分开是因为支付那组有自己的「生效渠道」回执。
-OTHER_SETTING_KEYS = ("disabled_channels", "channel_routing", "checkin_min",
+OTHER_SETTING_KEYS = ("invite_rewards", "disabled_channels", "channel_routing", "checkin_min",
                       "checkin_max") + S.SMTP_KEYS
 
 
@@ -2105,6 +2155,7 @@ def admin_get_settings(user=Depends(require_admin)):
             "disabled_channels": config.DISABLED_CHANNELS,
             "checkin_min": config.CHECKIN_MIN,
             "checkin_max": config.CHECKIN_MAX,
+            "invite_rewards": S.invite_reward_defaults(),
         },
         "pricing_catalog": pricing_catalog.status(),
         # 生效值(库里有就是库里的)
@@ -2118,6 +2169,7 @@ def admin_get_settings(user=Depends(require_admin)):
         "epay_key_tail": key[-4:] if len(key) >= 4 else "",
         "checkin_min": S.checkin_min(),
         "checkin_max": S.checkin_max(),
+        "invite_rewards": S.invite_rewards(),
         # 邮件。密码同 epay_key 口径:只回「设了没有」
         "smtp_host": S.smtp_host(),
         "smtp_port": S.smtp_port(),

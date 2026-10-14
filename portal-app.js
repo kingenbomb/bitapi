@@ -2,7 +2,7 @@
    页面组件在 static/portal-pages.js(用户侧)与 static/portal-admin.js(管理台)。 */
 (function () {
   "use strict";
-  const { createApp, ref, computed, watch, watchEffect, onMounted, h } = Vue;
+  const { createApp, ref, computed, watch, watchEffect, onMounted, onUnmounted, h } = Vue;
   const P = window.BitPortal;
   const { api, msg, token, setToken, clearToken, dark, theme, themeOverrides, ic,
     tag, POLICY, ANN_LEVEL, relTime, nf, fmt, narrow } = P;
@@ -18,6 +18,7 @@
     ["usage", "使用记录", "doc", "每次请求的 token 明细与命中的定价档位"],
     ["wallet", "钱包", "wallet", "充值、兑换码与余额流水"],
     ["billing", "计费与套餐", "dollar", "买时长卡、看当前额度与生效单价"],
+    ["leaderboard", "Token 消耗榜", "bars", "累计与近期用量排名，用户名脱敏"],
     ["invite", "邀请返佣", "gift", "返佣码、返佣入账与绑定规则"],
     ["profile", "个人资料", "user", "昵称头像、登录绑定与密码"],
     ["admin", "管理控制台", "gear", "站点设置、分组、定价、用户与兑换码"],
@@ -25,7 +26,7 @@
   const COMP = { dashboard: PG.Dashboard, plaza: PG.Plaza,
     playground: PG.Playground, keys: PG.Keys,
     usage: PG.Usage, wallet: PG.Wallet, billing: PG.Billing,
-    invite: PG.Invite, profile: PG.Profile, admin: ADM.Admin };
+    leaderboard: PG.Leaderboard, invite: PG.Invite, profile: PG.Profile, admin: ADM.Admin };
   const META = {};
   NAV.forEach((n) => { META[n[0]] = { title: n[1], sub: n[3] }; });
   /* 登录页那几张:未登录才给看,已登录访问会被弹回概览。 */
@@ -47,11 +48,36 @@
   const Auth = {
     props: ["mode", "ref0"],
     setup(props) {
-      const f = ref({ email: "", password: "", invite: props.ref0 || "", code: "" });
+      const f = ref({ email: "", password: "", invite: props.ref0 || "", code: "", verification_code: "" });
+      watch(() => props.ref0, value => { f.value.invite = value || ""; });
+      const authQuery = computed(() => props.ref0 ? "?ref=" + encodeURIComponent(props.ref0) : "");
       const busy = ref(false);
       const communityBusy = ref(false);
       const err = ref("");
       const reg = computed(() => props.mode === "register");
+      const mailBusy = ref(false), mailWait = ref(0), mailSent = ref("");
+      let mailTimer;
+      onUnmounted(() => clearInterval(mailTimer));
+      watch(() => f.value.email, () => { f.value.verification_code = ""; mailSent.value = ""; });
+      const sendRegistrationCode = () => {
+        const email = (f.value.email || "").trim();
+        if (!email) return (err.value = "请先填写邮箱");
+        err.value = "";
+        mailBusy.value = true;
+        api("POST", "/register/code", { email })
+          .then((r) => {
+            mailSent.value = email;
+            mailWait.value = r.retry_after || 60;
+            clearInterval(mailTimer);
+            mailTimer = setInterval(() => {
+              mailWait.value = Math.max(0, mailWait.value - 1);
+              if (!mailWait.value) clearInterval(mailTimer);
+            }, 1000);
+            msg.success("验证码已发送，请查看收件箱或垃圾邮件");
+          })
+          .catch((e) => { err.value = e.message; })
+          .finally(() => { mailBusy.value = false; });
+      };
       /* 开了二次验证的账号:密码对了只拿到一张 5 分钟的票,再要一个验证码。 */
       const ticket = ref("");
 
@@ -68,9 +94,14 @@
         if (!f.value.password) return (err.value = "请填写密码");
         if (reg.value && f.value.password.length < 6)
           return (err.value = "密码至少 6 位");
+        if (reg.value && !/^[0-9]{6}$/.test(f.value.verification_code || ""))
+          return (err.value = "请输入邮件中的 6 位验证码");
         busy.value = true;
         const body = { email: email, password: f.value.password };
-        if (reg.value) body.invite_code = (f.value.invite || "").trim();
+        if (reg.value) {
+          body.invite_code = (f.value.invite || "").trim();
+          body.verification_code = f.value.verification_code;
+        }
         api("POST", reg.value ? "/register" : "/login", body)
           .then((r) => {
             if (r.needs_totp) { ticket.value = r.ticket; f.value.code = ""; return; }
@@ -97,7 +128,7 @@
       const communityLogin = () => {
         err.value = "";
         communityBusy.value = true;
-        api("POST", "/community/auth/start", { purpose: "login" })
+        api("POST", "/community/auth/start", { purpose: "login", referral_code: props.ref0 || "" })
           .then((r) => {
             if (!r.authorize_url) throw new Error("社区登录地址未配置");
             sessionStorage.setItem("bitapi_community_purpose", "login");
@@ -108,6 +139,7 @@
       };
 
       return { f, busy, communityBusy, err, reg, submit, communityLogin, ic,
+        mailBusy, mailWait, mailSent, sendRegistrationCode, authQuery,
         ticket, backToPassword };
     },
     template: `
@@ -143,6 +175,20 @@
           <n-input v-model:value="f.email" placeholder="you@example.com"
             :input-props="{type:'email',autocomplete:'username'}"/>
         </n-form-item>
+        <template v-if="reg">
+          <n-form-item label="邮件验证码" label-placement="top">
+            <n-input-group class="registration-code">
+              <n-input v-model:value="f.verification_code" placeholder="6 位验证码" maxlength="6"
+                :input-props="{inputmode:'numeric',autocomplete:'one-time-code'}"/>
+              <n-button :loading="mailBusy" :disabled="mailWait > 0" @click="sendRegistrationCode">
+                {{ mailWait ? mailWait + ' 秒后重发' : '发送验证码' }}
+              </n-button>
+            </n-input-group>
+          </n-form-item>
+          <n-text v-if="mailSent" depth="3" style="font-size:12px">
+            验证码已发送至 {{ mailSent }}，15 分钟内有效。
+          </n-text>
+        </template>
         <n-form-item :label="reg ? '密码(至少 6 位)' : '密码'"
           label-placement="top">
           <n-input v-model:value="f.password" type="password"
@@ -169,10 +215,10 @@
         </template>
         <div class="authswitch">
           <span v-if="reg">已有账号?
-            <n-button text type="primary" tag="a" href="#/login">去登录
+            <n-button text type="primary" tag="a" :href="'#/login' + authQuery">去登录
             </n-button></span>
           <span v-else>还没有账号?
-            <n-button text type="primary" tag="a" href="#/register">注册
+            <n-button text type="primary" tag="a" :href="'#/register' + authQuery">注册
             </n-button></span>
         </div>
         <!-- 模型广场不需要登录,登录页得给个入口,否则这页只有知道 hash 的人找得到。 -->

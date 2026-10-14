@@ -185,6 +185,35 @@
       max-width:calc(100vw - 34px); }
     .authwrap { padding:20px 14px; }
   }
+  /* Token 榜和邀请奖励共用现有控制台主题。 */
+  .rank-page { display:grid; gap:14px; }
+  .rank-toolbar { display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; }
+  .rank-toolbar :is(.n-radio-button,.n-button), .invite-settings .n-input-number,
+  .invite-settings .n-button { min-height:44px; }
+  .invite-settings .n-input__input-el { height:42px; }
+  .rank-summary { background:rgba(127,127,127,.06); margin-bottom:14px; }
+  .rank-total { font-size:clamp(30px,5vw,42px); font-weight:700; line-height:1.4;
+    overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+  .rank-total > span { font-size:13px; font-weight:500; opacity:.65; margin-left:10px; }
+  .rank-note { font-size:12px; line-height:1.7; opacity:.7; overflow-wrap:anywhere; }
+  .rank-identity { display:flex; align-items:center; gap:10px; }
+  .rank-number { min-width:25px; font-variant-numeric:tabular-nums; font-weight:650; }
+  .rank-number.is-leading, .rank-me { color:#a8613c; }
+  html.dark .rank-number.is-leading, html.dark .rank-me { color:#e4a880; }
+  .rank-user { min-width:0; overflow-wrap:anywhere; }
+  .rank-me { margin-left:8px; font-size:11px; }
+  .rank-tokens { display:flex; flex-direction:column; gap:3px; font-variant-numeric:tabular-nums; }
+  .rank-tokens strong { font-size:15px; }
+  .rank-tokens > span { font-size:11px; opacity:.7; overflow-wrap:anywhere; }
+  .rank-current td { background:rgba(168,97,60,.08)!important; }
+  .rank-table .n-pagination-item { min-width:44px; min-height:44px; }
+  .rank-table .n-pagination { flex-wrap:wrap; row-gap:8px; }
+  .invite-preview { background:rgba(127,127,127,.06); border-radius:10px; padding:16px; margin-top:16px; }
+  .invite-heading { margin:0 0 8px; font-size:15px; }
+  .invite-cost { font-variant-numeric:tabular-nums; }
+  .invite-stat { display:flex; flex-wrap:wrap; align-items:baseline; gap:12px; }
+  .registration-code .n-input, .registration-code .n-button { min-height:44px; }
+  .registration-code .n-input__input-el { height:42px; }
 </style>
 </head>
 <body>

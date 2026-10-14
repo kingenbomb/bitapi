@@ -40,6 +40,8 @@
         site_url: "", epay_api_url: "", epay_pid: "", epay_usd_rate: null,
         epay_key: "" });
       const checkinForm = reactive({ min: null, max: null });
+      const inviteForm = reactive({ enabled: false, amount: null, max_invitees: null });
+      const previewInvitees = ref(10), savingInvite = ref(false);
       /* 邮件设置同支付一样单独一份 form;smtp_pass 只写不读,留空 = 不改。 */
       const mail = reactive({ smtp_host: "", smtp_port: null, smtp_user: "",
         smtp_pass: "", smtp_from: "", smtp_from_name: "", smtp_security: "ssl",
@@ -71,6 +73,7 @@
         pay.epay_key = "";              // 永不回填,留空=不改
         checkinForm.min = r[0].checkin_min;
         checkinForm.max = r[0].checkin_max;
+        Object.assign(inviteForm, r[0].invite_rewards);
         mail.smtp_host = r[0].smtp_host || "";
         mail.smtp_port = r[0].smtp_port;
         mail.smtp_user = r[0].smtp_user || "";
@@ -150,6 +153,34 @@
           || mail.smtp_security !== (c.smtp_security || "ssl")
           || mail.site_name !== (c.site_name || "");
       });
+      const inviteDirty = computed(() => !!cfg.value.invite_rewards &&
+        Object.keys(inviteForm).some((key) => inviteForm[key] !== cfg.value.invite_rewards[key]));
+      const inviteError = computed(() => {
+        if (inviteForm.amount == null || inviteForm.max_invitees == null) return "奖励金额和人数上限都不能为空";
+        if (inviteForm.enabled && inviteForm.amount <= 0) return "开启奖励前，请填写大于 0 的每人奖励";
+        return "";
+      });
+      const invitePreviewCount = computed(() => !inviteForm.enabled || inviteError.value ? 0 :
+        Math.min(previewInvitees.value || 0, inviteForm.max_invitees || Infinity));
+      const invitePreviewCost = computed(() => invitePreviewCount.value * (inviteForm.amount || 0));
+      const saveInvite = () => {
+        if (inviteError.value) return msg.error(inviteError.value);
+        const policy = Object.assign({}, inviteForm);
+        dlg.warning({
+          title: "保存邀请奖励规则",
+          content: (policy.enabled ? "开启注册邀请奖励，每位有效新用户奖励邀请人 $" + Number(policy.amount).toFixed(4)
+            + (policy.max_invitees ? "，每位邀请人最多奖励 " + policy.max_invitees + " 人。" : "，奖励人数不限。") : "关闭后续注册的邀请奖励。")
+            + "保存后立即对后续注册生效，已有入账保留，不补发历史邀请。",
+          positiveText: "保存并生效", negativeText: "继续编辑",
+          onPositiveClick: () => {
+            savingInvite.value = true;
+            return api("PATCH", "/admin/settings", { invite_rewards: policy })
+              .then(() => { msg.success("邀请奖励规则已保存并生效"); return s.reload(); })
+              .catch((e) => { msg.error(e.message); return false; })
+              .finally(() => { savingInvite.value = false; });
+          },
+        });
+      };
       const saveMail = () => {
         if (mail.smtp_port === null || mail.smtp_port === undefined) {
           msg.error("SMTP 端口不能留空 —— 要回到环境变量默认值,点该项下方的「恢复默认」");
@@ -260,6 +291,8 @@
         return (Date.now() / 1000 - b.latest.mtime) > b.interval * 1.5;
       });
       return Object.assign({ cfg, form, pay, checkinForm, gopts, popts, cat,
+        inviteForm, previewInvitees, savingInvite, inviteDirty, inviteError,
+        invitePreviewCount, invitePreviewCost, saveInvite,
         dirty, payDirty, checkinDirty, saving, savingPay, savingCheckin,
         save, savePay, saveCheckin, resetKey, src, isDb,
         channels, busyCh, setChannel, backup, backingUp, backupNow, backupStale,
@@ -268,6 +301,41 @@
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
+<n-card size="small" title="注册邀请奖励" class="invite-settings" style="margin-bottom:14px">
+      <p class="rank-note">当前生效：{{ cfg.invite_rewards && cfg.invite_rewards.enabled ? '已开启，每人 $' + Number(cfg.invite_rewards.amount).toFixed(4) : '已关闭' }}。仅新用户通过有效注册、首次绑定邀请关系时发放。</p>
+      <n-alert v-if="!(cfg.from_db || {}).invite_rewards && (cfg.plugins || []).includes('affiliate_fixed')" type="info" :bordered="false" style="margin:16px 0">当前沿用固定邀请插件。保存后替代旧插件的邀请奖励与新用户见面礼，仅按本页金额奖励邀请人。</n-alert>
+      <n-form label-placement="top" class="invite-form">
+        <n-form-item label="开启注册邀请奖励" :show-feedback="false">
+          <n-switch v-model:value="inviteForm.enabled" aria-label="开启注册邀请奖励"/>
+        </n-form-item>
+        <n-grid :cols="'1 560:2'" :x-gap="20" :y-gap="16" responsive="self">
+          <n-gi><n-form-item label="每人奖励（美元）" :show-feedback="false">
+            <n-input-number v-model:value="inviteForm.amount" :min="0" :step="0.01" :precision="4" style="width:100%" :input-props="{'aria-label':'每人邀请奖励金额'}"><template #prefix>$</template></n-input-number>
+          </n-form-item></n-gi>
+          <n-gi><n-form-item label="每位邀请人的奖励人数上限" :show-feedback="false">
+            <n-input-number v-model:value="inviteForm.max_invitees" :min="0" :precision="0" style="width:100%" :input-props="{'aria-label':'邀请奖励人数上限'}"/>
+          </n-form-item><p class="rank-note">0 表示不限；按历次已发奖人数累计。</p></n-gi>
+        </n-grid>
+      </n-form>
+      <n-alert v-if="inviteError" type="warning" :bordered="false" style="margin-top:16px">{{ inviteError }}</n-alert>
+      <div class="invite-preview">
+        <h3 class="invite-heading">发奖预览</h3>
+        <p class="rank-note">假设同一邀请人此前未获注册奖励，新增以下数量的有效注册用户。</p>
+        <n-form-item label="模拟新注册人数" label-placement="top" :show-feedback="false">
+          <n-input-number v-model:value="previewInvitees" :min="1" :precision="0" :input-props="{'aria-label':'模拟新注册人数'}" style="max-width:240px"/>
+        </n-form-item>
+        <n-descriptions :column="1" label-placement="left">
+          <n-descriptions-item label="预计发奖人数">{{ nf(invitePreviewCount) }} 人</n-descriptions-item>
+          <n-descriptions-item label="预计奖励总额"><strong class="invite-cost">\${{ Number(invitePreviewCost).toFixed(4) }}</strong></n-descriptions-item>
+          <n-descriptions-item label="判定依据">{{ !inviteForm.enabled ? '奖励开关关闭，不发奖' : inviteError || (inviteForm.max_invitees ? '按有效人数及每人上限发放' : '每位有效新用户均发放') }}</n-descriptions-item>
+        </n-descriptions>
+      </div>
+      <p class="rank-note">有效注册须通过站点既有邮箱验证码或社区已验证邮箱核验。老账号登录、重复回调不会重复发奖；规则只用于后续注册，不补发历史邀请，也不改变已有邀请关系。</p>
+      <template #action><n-space align="center">
+        <n-button type="primary" :disabled="!inviteDirty || !!inviteError" :loading="savingInvite" @click="saveInvite">保存邀请奖励</n-button>
+        <n-text v-if="inviteDirty" depth="3" style="font-size:12px">有未保存的修改</n-text>
+      </n-space></template>
+    </n-card>
 <n-grid :cols="'1 1000:2'" :x-gap="14" :y-gap="14" responsive="self">
   <n-gi><n-card size="small" title="注册与默认分组">
     <n-space vertical :size="18">
@@ -277,7 +345,7 @@
           <n-text depth="3" style="font-size:11.5px">
             开启后新用户必须填码才能注册,环境变量默认
             {{ cfg.defaults && cfg.defaults.require_invite ? '开' : '关' }};
-            码在「邀请码」页批量发,老用户自己的邀请码也照样能用</n-text>
+            码在「邀请码」页批量发；个人返佣码不能代替注册邀请码</n-text>
         </div>
         <n-switch v-model:value="form.require_invite"/>
       </n-space>
@@ -555,7 +623,7 @@
       <n-tag size="small" round :bordered="false"
         :type="cfg.mail_configured ? 'success' : 'warning'">
         {{ cfg.mail_configured ? '已配置' : '未配置' }}</n-tag>
-      <n-text depth="3" style="font-size:11.5px">找回密码、邮箱验证都靠它;没配时找回密码入口会明说</n-text>
+      <n-text depth="3" style="font-size:11.5px">注册验证码、找回密码与邮箱验证都需要 SMTP；未配置时无法发送</n-text>
     </n-space></template>
     <n-grid :cols="'1 700:2 1100:4'" :x-gap="14" :y-gap="14" responsive="self">
       <n-gi :span="2">

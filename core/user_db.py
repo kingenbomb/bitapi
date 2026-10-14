@@ -11,6 +11,7 @@ import json
 import sqlite3
 import time
 
+from core import auth
 from core.db import ThreadConns
 
 # 用户状态
@@ -116,6 +117,16 @@ CREATE TABLE IF NOT EXISTS email_verifications (
 );
 CREATE INDEX IF NOT EXISTS idx_emailverif_user ON email_verifications(user_id);
 
+-- 注册前的邮箱所有权证明；仅保留最新验证码的加盐哈希，不创建待验证用户。
+CREATE TABLE IF NOT EXISTS registration_codes (
+    email       TEXT PRIMARY KEY,
+    code_hash   TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    sent        INTEGER NOT NULL DEFAULT 0
+);
+
 -- 找回密码的一次性令牌。只存 SHA-256:库泄露时拿不到能直接用的链接。
 -- 用掉(used_at)或过期(expires_at)都作废;同一用户新发一张时旧的一并作废。
 CREATE TABLE IF NOT EXISTS password_resets (
@@ -150,6 +161,7 @@ CREATE TABLE IF NOT EXISTS community_auth_flows (
     nonce_hash        TEXT NOT NULL UNIQUE,
     purpose           TEXT NOT NULL CHECK(purpose IN ('login','bind')),
     initiator_user_id INTEGER,
+    referral_code    TEXT,
     status            TEXT NOT NULL DEFAULT 'pending',
     subject           TEXT,
     username          TEXT,
@@ -279,6 +291,17 @@ _JSON_COLS = {"supported_models", "meta", "pricing_snapshot",
               "allowed_models", "allowed_ips", "models", "model_map", "headers"}
 
 
+class RegistrationCodeError(ValueError):
+    pass
+
+
+class RegistrationCodeCooldown(ValueError):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"请 {retry_after} 秒后再发送验证码")
+
+
+
 class CommunityFlowError(RuntimeError):
     pass
 
@@ -320,6 +343,9 @@ class UserDB:
         """轻量列迁移:老库补新增列(SQLite 无 IF NOT EXISTS for ADD COLUMN)。"""
         def cols(table):
             return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+
+        if "referral_code" not in cols("community_auth_flows"):
+            c.execute("ALTER TABLE community_auth_flows ADD COLUMN referral_code TEXT")
 
         added = cols("usage_logs")
         for name, ddl in (
@@ -508,6 +534,79 @@ class UserDB:
 
     # ---- users ----
 
+    def reserve_registration_code(self, email, code_hash):
+        now = int(time.time())
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("DELETE FROM registration_codes WHERE expires_at<=?", (now,))
+            previous = c.execute("SELECT created_at FROM registration_codes WHERE email=?",
+                                 (email,)).fetchone()
+            if previous and previous["created_at"] + 60 > now:
+                raise RegistrationCodeCooldown(previous["created_at"] + 60 - now)
+            c.execute("INSERT OR REPLACE INTO registration_codes"
+                      "(email,code_hash,created_at,expires_at,attempts,sent) VALUES(?,?,?,?,0,0)",
+                      (email, code_hash, now, now + 900))
+
+
+    def finish_registration_mail(self, email, code_hash, sent):
+        with self._conn() as c:
+            if sent:
+                c.execute("UPDATE registration_codes SET sent=1 WHERE email=? AND code_hash=?",
+                          (email, code_hash))
+            else:
+                c.execute("DELETE FROM registration_codes WHERE email=? AND code_hash=?",
+                          (email, code_hash))
+
+
+    def register_verified_user(self, email, code, password_hash, aff_code,
+                               group_id, invite_code, require_invite):
+        """邮箱证明、邀请码占用、建号同一事务；失败不消耗验证码或邀请码。"""
+        now = int(time.time())
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            proof = c.execute("SELECT * FROM registration_codes WHERE email=?", (email,)).fetchone()
+            if not proof or not proof["sent"]:
+                raise RegistrationCodeError("请先获取邮件验证码")
+            if proof["expires_at"] <= now:
+                raise RegistrationCodeError("验证码已过期，请重新获取")
+            if proof["attempts"] >= 5:
+                raise RegistrationCodeError("验证码错误次数过多，请重新获取")
+            if not auth.verify_password(code, proof["code_hash"]):
+                c.execute("UPDATE registration_codes SET attempts=attempts+1 WHERE email=?", (email,))
+                c.commit()  # 错误次数必须保留，不能随下面的异常回滚。
+                raise RegistrationCodeError("邮件验证码不正确")
+            if c.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone():
+                raise CommunityEmailConflict("email already registered")
+            role = "user" if c.execute("SELECT 1 FROM users LIMIT 1").fetchone() else "admin"
+            inviter_id = None
+            claimed = None
+            if role != "admin":
+                if require_invite and not invite_code:
+                    raise CommunityInviteError("invite code required")
+                if invite_code:
+                    inviter = None if require_invite else c.execute(
+                        "SELECT id FROM users WHERE aff_code=? AND status=?", (invite_code, US_ACTIVE)).fetchone()
+                    if inviter:
+                        inviter_id = inviter["id"]
+                    else:
+                        invite = c.execute("SELECT * FROM redeem_codes WHERE code=?", (invite_code,)).fetchone()
+                        if (not invite or invite["type"] != "invitation" or invite["status"] != "unused"
+                                or (invite["expires_at"] and invite["expires_at"] < now)):
+                            raise CommunityInviteError("invalid invite code")
+                        claimed = invite_code
+            cur = c.execute(
+                "INSERT INTO users(email,password_hash,role,group_id,inviter_id,aff_code,created_at,email_verified_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (email, password_hash, role, group_id, inviter_id, aff_code, now, now))
+            uid = cur.lastrowid
+            self._grant_invite_reward(c, uid, now)
+            if claimed:
+                c.execute("UPDATE redeem_codes SET status='used',used_by=?,used_at=? WHERE code=?",
+                          (uid, now, claimed))
+            c.execute("DELETE FROM registration_codes WHERE email=?", (email,))
+            return uid, role, inviter_id
+
+
     def create_user(self, email, password_hash, aff_code, group_id=None,
                     inviter_id=None, role="user", status=US_ACTIVE):
         now = int(time.time())
@@ -554,8 +653,40 @@ class UserDB:
 
     # ---- 白嫖社区登录 ----
 
+    def _grant_invite_reward(self, conn, user_id, now):
+        """注册事务内判定资格、人数上限并入账，和建号共同提交。"""
+        from core import site_settings as settings
+        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user["inviter_id"] or not user["email_verified_at"]:
+            return
+        inviter = conn.execute("SELECT * FROM users WHERE id=? AND status=?",
+                               (user["inviter_id"], US_ACTIVE)).fetchone()
+        if not inviter:
+            return
+        raw = conn.execute("SELECT value FROM settings WHERE key='invite_rewards'").fetchone()
+        policy = settings.invite_rewards(stored=(
+            json.loads(raw["value"]) if raw else settings.invite_reward_defaults()))
+        if not policy["enabled"]:
+            return
+        rewarded = conn.execute(
+            "SELECT COUNT(*) FROM credit_ledger WHERE user_id=? AND reason='affiliate' "
+            "AND json_extract(meta,'$.kind')='fixed_invite'", (inviter["id"],)).fetchone()[0]
+        if policy["max_invitees"] and rewarded >= policy["max_invitees"]:
+            return
+        self.apply_credit(inviter["id"], policy["amount"], "affiliate", f"aff:invite:{user_id}",
+                          meta={"kind": "fixed_invite", "source_user_id": user_id},
+                          transaction=conn, now=now)
+
+
+    def invite_reward_count(self, user_id):
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM credit_ledger WHERE user_id=? AND reason='affiliate' "
+                "AND json_extract(meta,'$.kind')='fixed_invite'", (user_id,)).fetchone()[0]
+
+
     def create_community_flow(self, state_hash, nonce_hash, purpose,
-                              initiator_user_id, expires_at):
+                              initiator_user_id, expires_at, referral_code=""):
         now = int(time.time())
         with self._conn() as c:
             # 流程只有五分钟寿命；每次开新流程时顺手清掉过期行，不另起定时器。
@@ -563,10 +694,11 @@ class UserDB:
             cur = c.execute(
                 "INSERT INTO community_auth_flows("
                 "state_hash,nonce_hash,purpose,initiator_user_id,status,"
-                "expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
+                "expires_at,created_at,referral_code) VALUES(?,?,?,?,?,?,?,?)",
                 (state_hash, nonce_hash, purpose, initiator_user_id,
-                 "pending", expires_at, now))
+                 "pending", expires_at, now, referral_code))
             return cur.lastrowid
+
 
     def claim_community_flow(self, state_hash, nonce_hash, now=None):
         """callback 原子占用 state；同一个回调只能有一个请求进入换 token。"""
@@ -741,13 +873,22 @@ class UserDB:
                     (rec["expires_at"] and rec["expires_at"] < now)):
                 raise CommunityInviteError("invalid invite code")
 
+            inviter_id = None
+            if flow["referral_code"]:
+                inviter = c.execute("SELECT id FROM users WHERE aff_code=? AND status=?",
+                                    (flow["referral_code"], US_ACTIVE)).fetchone()
+                if not inviter:
+                    raise CommunityInviteError("邀请链接已失效，请重新获取邀请链接")
+                inviter_id = inviter["id"]
+
             cur = c.execute(
                 "INSERT INTO users(email,password_hash,role,status,group_id,"
                 "email_verified_at,inviter_id,aff_code,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (email, "oauth-only", "user", US_ACTIVE, group_id,
-                 now, None, aff_code, now))
+                 now, inviter_id, aff_code, now))
             user_id = cur.lastrowid
+            self._grant_invite_reward(c, user_id, now)
             c.execute(
                 "INSERT INTO community_identities("
                 "subject,user_id,username,name,email,bound_at,last_login_at) "
@@ -763,7 +904,7 @@ class UserDB:
                 raise CommunityInviteError("invalid invite code")
             self._consume_community_flow(c, flow_id, now)
             c.commit()
-            return {"user_id": user_id, "inviter_id": None,
+            return {"user_id": user_id, "inviter_id": inviter_id,
                     "aff_code": aff_code}
         except sqlite3.IntegrityError as e:
             if c.in_transaction:
@@ -779,6 +920,7 @@ class UserDB:
             if c.in_transaction:
                 c.rollback()
             raise
+
 
     def list_users(self, limit=100, offset=0):
         with self._conn() as c:
@@ -980,6 +1122,54 @@ class UserDB:
             "first_at": r["first_at"],
             "last_at": r["last_at"],
         }
+
+    def token_leaderboard(self, user_id, since=0, until=None, page=1, page_size=20):
+        """启用账号的用量榜；无调用账号也在主体集合内，分页和本人排名用同一快照。
+
+        排名只统计输入 + 输出；缓存另外展示，不计入排名。
+        并列用量同名次，分页顺序按用户 ID 稳定排列。
+        """
+        until = int(time.time()) if until is None else until
+        offset = (page - 1) * page_size
+        with self._conn() as c:
+            rows = c.execute("""
+                WITH totals AS (
+                    SELECT u.id AS user_id, u.display_name, u.email,
+                        COUNT(l.id) AS requests,
+                        COALESCE(SUM(l.input_tokens),0) AS input_tokens,
+                        COALESCE(SUM(l.output_tokens),0) AS output_tokens,
+                        COUNT(CASE WHEN json_extract(l.pricing_snapshot,'$.total_ctx')
+                            IS NOT NULL THEN 1 END) AS cache_rows,
+                        COALESCE(SUM(MAX(json_extract(l.pricing_snapshot,'$.total_ctx')
+                            - l.input_tokens,0)),0) AS cache_tokens
+                    FROM users u LEFT JOIN usage_logs l ON l.user_id=u.id
+                        AND l.created_at>=? AND l.created_at<=?
+                    WHERE u.status=? GROUP BY u.id
+                ), scored AS (
+                    -- 榜单只算**真实吞吐**:输入 + 输出。缓存命中/写入是同一段
+                    -- prompt 被重复利用,算进来等于把「省下来的钱」也当用量,
+                    -- 命中越多排名越虚高 —— 与榜单「谁在真干活」的口径不符。
+                    SELECT *, input_tokens+output_tokens AS total_tokens
+                    FROM totals
+                ), ranked AS (
+                    SELECT *, RANK() OVER (ORDER BY total_tokens DESC) AS rank,
+                        ROW_NUMBER() OVER (ORDER BY total_tokens DESC,user_id) AS position,
+                        COUNT(*) OVER () AS total_users,
+                        SUM(total_tokens) OVER () AS all_tokens
+                    FROM scored
+                )
+                SELECT * FROM ranked
+                WHERE (position>? AND position<=?) OR user_id=?
+                ORDER BY position
+                """, (since, until, US_ACTIVE, offset, offset + page_size, user_id)).fetchall()
+        records = [dict(row) for row in rows]
+        return {
+            "rows": [r for r in records if offset < r["position"] <= offset + page_size],
+            "me": next((r for r in records if r["user_id"] == user_id), None),
+            "total_users": records[0]["total_users"] if records else 0,
+            "total_tokens": records[0]["all_tokens"] if records else 0,
+        }
+
 
     def usage_daily(self, user_id, days=14):
         """按本地日历日分桶的近 N 天用量,供概览折线/柱状图。
@@ -1397,37 +1587,38 @@ class UserDB:
 
     # ---- credit_ledger(余额变动唯一入口,幂等由 idem_key 保证) ----
 
-    def apply_credit(self, user_id, amount, reason, idem_key, meta=None):
+    def apply_credit(self, user_id, amount, reason, idem_key, meta=None, *, transaction=None, now=None):
         """单事务写流水 + 增量更新余额。返回 (ledger_row, created:bool)。
         idem_key 已存在则不重复记账,返回既有记录与 created=False。"""
-        now = int(time.time())
+        now = int(time.time()) if now is None else now
+        if transaction is not None:
+            return self._apply_credit_row(transaction, user_id, amount, reason, idem_key, meta, now)
         conn = self._conn()
         with conn:  # BEGIN..COMMIT,异常回滚
             # 先拿写锁再查幂等键。原先是 SELECT → UPDATE balance → INSERT ledger,
             # 两个并发请求都可能先查到不存在,输掉唯一键竞争的那次虽会回滚加钱,
             # 却把 IntegrityError 抛到 HTTP 层。签到按钮快速双击就会偶发 500。
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute(
-                "SELECT * FROM credit_ledger WHERE idem_key=?", (idem_key,)).fetchone()
-            if existing is not None:
-                return self._row(existing), False
-            # 余额与累计消费同步更新:负额计入 total_spent
-            conn.execute(
-                "UPDATE users SET balance = COALESCE(balance,0) + ?, "
-                "total_spent = COALESCE(total_spent,0) + ? WHERE id=?",
-                (amount, -amount if amount < 0 else 0, user_id))
-            row = conn.execute("SELECT balance FROM users WHERE id=?",
-                               (user_id,)).fetchone()
-            balance_after = row["balance"] if row else None
-            cur = conn.execute(
-                "INSERT INTO credit_ledger(user_id,amount,reason,idem_key,meta,"
-                "balance_after,created_at) VALUES(?,?,?,?,?,?,?)",
-                (user_id, amount, reason, idem_key,
-                 json.dumps(meta, ensure_ascii=False) if meta is not None else None,
-                 balance_after, now))
-            created = conn.execute("SELECT * FROM credit_ledger WHERE id=?",
-                                   (cur.lastrowid,)).fetchone()
-        return self._row(created), True
+            return self._apply_credit_row(conn, user_id, amount, reason, idem_key, meta, now)
+
+
+    def _apply_credit_row(self, conn, user_id, amount, reason, idem_key, meta, now):
+        """所有入账共用同一条事实写入；调用方负责事务边界。"""
+        existing = conn.execute("SELECT * FROM credit_ledger WHERE idem_key=?", (idem_key,)).fetchone()
+        if existing is not None:
+            return self._row(existing), False
+        conn.execute(
+            "UPDATE users SET balance = COALESCE(balance,0) + ?, "
+            "total_spent = COALESCE(total_spent,0) + ? WHERE id=?",
+            (amount, -amount if amount < 0 else 0, user_id))
+        row = conn.execute("SELECT balance FROM users WHERE id=?", (user_id,)).fetchone()
+        balance_after = row["balance"] if row else None
+        cur = conn.execute(
+            "INSERT INTO credit_ledger(user_id,amount,reason,idem_key,meta,balance_after,created_at) "
+            "VALUES(?,?,?,?,?,?,?)", (user_id, amount, reason, idem_key,
+             json.dumps(meta, ensure_ascii=False) if meta is not None else None, balance_after, now))
+        return self._row(conn.execute("SELECT * FROM credit_ledger WHERE id=?", (cur.lastrowid,)).fetchone()), True
+
 
     def get_ledger_by_idem(self, idem_key):
         with self._conn() as c:

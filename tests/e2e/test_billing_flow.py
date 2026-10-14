@@ -26,6 +26,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 PORT = 8123
 BASE = f"http://127.0.0.1:{PORT}"
 MASTER = "sk-e2e-master"
@@ -34,6 +36,7 @@ EPAY_PID = "20001"
 EPAY_KEY = "e2e-epay-key-7c1f"
 
 _fails = []
+_registration_db = None
 
 
 def check(label, cond, extra=""):
@@ -43,6 +46,9 @@ def check(label, cond, extra=""):
 
 
 def req(method, path, body=None, token=None, key=None, raw=False):
+    if method == "POST" and path == "/api/register":
+        from tests.registration_fixture import verified_registration_body
+        body = verified_registration_body(_registration_db, body)
     r = urllib.request.Request(BASE + path, method=method)
     if body is not None:
         r.add_header("Content-Type", "application/json")
@@ -66,6 +72,7 @@ def req(method, path, body=None, token=None, key=None, raw=False):
 
 
 def main():
+    global _registration_db
     tmp = tempfile.mkdtemp(prefix="bitapi_e2e_")
     env = dict(os.environ)
     env.update({
@@ -108,6 +115,8 @@ def main():
             log.seek(0)
             print(log.read()[-3000:])
             raise SystemExit("server did not start")
+        from core.user_db import UserDB
+        _registration_db = UserDB(os.path.join(tmp, "e2e.db"))
         run()
     finally:
         proc.terminate()
@@ -116,6 +125,8 @@ def main():
         except Exception:
             proc.kill()
         log.close()
+        if _registration_db:
+            _registration_db._conns.close_current()
     print()
     if _fails:
         # 失败时留下 tmp:里面的 server.log 是唯一的上游线索

@@ -1432,7 +1432,7 @@
           render: (r) => h("span", MONO_ATTR, r.balance_after == null
             ? "—" : "$" + fmt(r.balance_after, 2)) },
         { title: "幂等键", key: "idem_key", minWidth: 190, render: (r) =>
-            h(naive.NText, { depth: 3, style: SUBSTY }, () => r.idem_key || "—") },
+            h(naive.NText, { depth: 3, style: SUBSTY }, () => r.meta && r.meta.kind === "fixed_invite" ? "有效注册奖励" : r.idem_key || "—") },
       ];
       const OST = { pending: ["warning", "待支付"], paid: ["info", "已支付"],
         recharging: ["info", "到账中"], completed: ["success", "已完成"],
@@ -1463,7 +1463,7 @@
   <!-- 消费额不锁 2 位:小额消费在两位小数下会显示成 $0.00,与概览页对不上。 -->
   <n-gi><StatCard label="累计消费" :value="'$' + fmt(bal.total_spent)"
     sub="请求扣费与买卡合计" color="#6b5b95" icon="dollar"/></n-gi>
-  <n-gi><StatCard label="累计返佣" :value="'$' + fmt(inv.earned, 2)"
+  <n-gi><StatCard label="累计返佣" :value="'$' + fmt(inv.earned, 4)"
     :sub="'已邀请 ' + (inv.invitees || 0) + ' 人'" color="#a06a2c" icon="gift"/></n-gi>
 </n-grid>
 
@@ -1520,6 +1520,86 @@
 </n-card>
 </Load>`,
   };
+  const Leaderboard = {
+    components: { Load, Ic },
+    setup() {
+      const result = ref({ rows: [], me: null });
+      const range = ref("all"), page = ref(1), pageSize = 20;
+      const loading = ref(true), error = ref("");
+      let requestVersion = 0;
+      const ranges = [{ label: "累计", value: "all" },
+        { label: "近 7 天", value: "7d" }, { label: "近 30 天", value: "30d" }];
+      const reload = async () => {
+        const version = ++requestVersion;
+        loading.value = true; error.value = "";
+        try {
+          const data = await api("GET", "/leaderboard" + qs({
+            range: range.value, page: page.value, page_size: pageSize }));
+          if (version === requestVersion) result.value = data;
+        } catch (e) {
+          if (version === requestVersion) error.value = e.message || String(e);
+        } finally {
+          if (version === requestVersion) loading.value = false;
+        }
+      };
+      const setRange = (value) => { range.value = value; page.value = 1; };
+      watch([range, page], reload);
+      onMounted(reload);
+      onUnmounted(() => { requestVersion += 1; });
+      const cols = [
+        { title: "排名 / 用户", key: "name", minWidth: 130, render: (r) =>
+          h("div", { class: "rank-identity" }, [
+            h("span", { class: ["rank-number", r.rank && r.rank <= 3 ? "is-leading" : ""] }, r.rank || "—"),
+            h("div", { class: "rank-user" }, [
+              h("div", {}, [h("strong", {}, r.name), r.is_me ? h("span", { class: "rank-me" }, "我") : null]),
+              h("span", { class: "rank-note" }, nf(r.requests) + " 次请求"),
+            ]),
+          ]) },
+        { title: "Token 消耗", key: "total_tokens", align: "right", minWidth: 150,
+          render: (r) => h("div", { class: "rank-tokens" }, [
+            h("strong", {}, nf(r.total_tokens)),
+            h("span", {}, "输入 " + nf(r.input_tokens)),
+            h("span", {}, "输出 " + nf(r.output_tokens)),
+            h("span", {}, r.requests && !r.cache_rows ? "缓存未提供" : "缓存 " + nf(r.cache_tokens)
+              + (r.cache_rows < r.requests ? "（部分记录）" : "")),
+          ]) },
+      ];
+      const pagination = computed(() => ({ page: page.value, pageSize,
+        itemCount: result.value.total_users || 0, pageSlot: 5,
+        onChange: (value) => { page.value = value; },
+        prefix: ({ itemCount }) => "共 " + nf(itemCount) + " 位用户" }));
+      const rangeLabel = computed(() => (ranges.find((r) => r.value === result.value.range) || ranges[0]).label);
+      return { result, range, ranges, page, loading, error, reload, setRange,
+        cols, pagination, rangeLabel, nf, absTime, go,
+        rowClass: (r) => r.is_me ? "rank-current" : "" };
+    },
+    template: `
+<div class="rank-page">
+  <div class="rank-toolbar">
+    <n-radio-group :value="range" @update:value="setRange" aria-label="排行榜统计范围">
+      <n-radio-button v-for="r in ranges" :key="r.value" :value="r.value">{{ r.label }}</n-radio-button>
+    </n-radio-group>
+    <n-button secondary :loading="loading" @click="reload">刷新榜单</n-button>
+  </div>
+  <Load :loading="loading" :error="error" :on-retry="reload">
+    <n-card class="rank-summary" size="small" :bordered="false">
+      <div class="rank-note">{{ rangeLabel }} · 我的 Token 消耗</div>
+      <div class="rank-total">{{ result.me ? nf(result.me.total_tokens) : '—' }}<span>Token</span></div>
+      <p>{{ result.me && result.me.rank ? '当前排名第 ' + nf(result.me.rank) + ' 名' : '这个范围内还没有 Token 用量' }}<template v-if="result.total_users != null"> · 共 {{ nf(result.total_users) }} 位启用用户</template></p>
+      <n-button secondary @click="go('#/usage')">查看我的使用记录</n-button>
+    </n-card>
+    <n-card class="rank-table" size="small" title="Token 消耗排行">
+      <p class="rank-note">按输入与输出 Token 合计排名，缓存另列且不计入排名。相同用量并列，无用量用户位于末尾，禁用账号不参与。</p>
+      <p class="rank-note">{{ rangeLabel }}合计 {{ result.total_tokens != null ? nf(result.total_tokens) : '—' }} Token。用户名已脱敏，仅登录后可查看。{{ result.as_of ? '更新于 ' + absTime(result.as_of) : '' }}</p>
+      <p class="rank-note">「缓存未提供」或「部分记录」表示缓存统计不完整。</p>
+      <n-data-table :columns="cols" :data="result.rows" :row-key="r => r.position" :row-class-name="rowClass" :bordered="false" :pagination="pagination" remote size="small">
+        <template #empty><n-empty description="暂时没有可展示的用户"/></template>
+      </n-data-table>
+    </n-card>
+  </Load>
+</div>`,
+  };
+
   const Invite = {
     components: { Load, StatCard },
     setup() {
@@ -1537,9 +1617,11 @@
             h("span", { style: Object.assign({ fontSize: "12px" }, MONO) },
               absTime(r.created_at)) },
         { title: "返佣", key: "amount", align: "right", width: 110,
-          render: (r) => money(r.amount) },
+          render: (r) => h("span", { style: MONO },
+            (r.amount >= 0 ? "+$" : "-$") + fmt(Math.abs(r.amount), 4)) },
         { title: "触发", key: "idem_key", minWidth: 210, render: (r) =>
-            h(naive.NText, { depth: 3, style: SUBSTY }, () => r.idem_key || "—") },
+            h(naive.NText, { depth: 3, style: SUBSTY }, () =>
+              r.meta && r.meta.kind === "fixed_invite" ? "有效注册奖励" : r.idem_key || "—") },
       ];
       return Object.assign({ inv, affRows, cols, link, fmt,
         copyCode: () => copy(inv.value.aff_code || "", "已复制返佣码"),
@@ -1559,7 +1641,7 @@
         <n-button ghost @click="copyLink">复制链接</n-button>
       </n-input-group>
       <n-text depth="3" style="font-size:12.5px;line-height:1.6">
-        返佣规则由站点启用的插件决定,不同站点比例不同,以下方实际到账流水为准。
+        注册邀请奖励规则见下方说明；其他返佣由启用的插件决定，以实际到账流水为准。
         开放注册时邀请人一次绑定后终身有效；站点开启邀请制后,本码不能替代
         管理端发放的一次性注册邀请码。</n-text>
     </n-space>
@@ -1567,7 +1649,7 @@
   <n-gi><n-grid :cols="2" :x-gap="12" :y-gap="12">
     <n-gi><StatCard label="已邀请" :value="String(inv.invitees || 0)"
       sub="成功注册人数" color="#3f6b8a" icon="user"/></n-gi>
-    <n-gi><StatCard label="返佣总额" :value="'$' + fmt(inv.earned, 2)"
+    <n-gi><StatCard label="返佣总额" :value="'$' + fmt(inv.earned, 4)"
       sub="已计入可用余额" color="#a06a2c" icon="gift" :tint="true"/></n-gi>
     <n-gi :span="2"><n-alert type="default" :bordered="false"
       :show-icon="false" style="font-size:12.5px">
@@ -1576,6 +1658,16 @@
   </n-grid></n-gi>
 </n-grid>
 
+  <n-card class="invite-policy" style="margin-top:14px" size="small" title="邀请规则">
+    <template v-if="inv.reward_policy && inv.reward_policy.enabled">
+      <div class="invite-stat"><span class="invite-stat-label">每位新用户有效注册后</span><strong class="invite-cost">\${{ fmt(inv.reward_policy.amount, 4) }}</strong></div>
+      <p class="rank-note">奖励自动记入邀请人的钱包。已获得 {{ inv.rewarded_invitees }} 人的注册奖励；{{ inv.reward_policy.max_invitees ? '每位邀请人最多奖励 ' + inv.reward_policy.max_invitees + ' 人' : '奖励人数不限' }}。</p>
+      <p v-if="inv.reward_policy.max_invitees && inv.rewarded_invitees >= inv.reward_policy.max_invitees" class="rank-note">已达到奖励人数上限，后续邀请仍会绑定关系，本项奖励不再发放。</p>
+    </template>
+    <p v-else class="rank-note">当前未开启注册邀请奖励。仍可分享链接记录新用户邀请关系，已有入账保留。</p>
+    <p class="rank-note">邮箱注册须完成邮件验证；邀请制开启时仍须使用管理员的一次性注册邀请码，个人返佣码不能代替它。社区注册也保留现有邀请码要求。</p>
+    <p class="rank-note">仅新账号首次注册绑定邀请人，老账号登录或绑定社区不会新增邀请，也不会重复发奖。奖励按注册时生效的规则结算；新设置不补发历史邀请。</p>
+  </n-card>
 <n-card size="small" title="返佣入账" style="margin-top:14px">
   <n-data-table :columns="cols" :data="affRows" :bordered="false" size="small"
     :scroll-x="470" :row-key="(r) => r.id"
@@ -2802,6 +2894,6 @@
 
   window.BitPortalPages = { Load: Load, useFetch: useFetch,
     Dashboard: Dashboard, Keys: Keys, Usage: Usage, Wallet: Wallet,
-    Billing: Billing, Invite: Invite, Profile: Profile, Plaza: Plaza,
+    Billing: Billing, Leaderboard: Leaderboard, Invite: Invite, Profile: Profile, Plaza: Plaza,
     Playground: Playground };
 })();

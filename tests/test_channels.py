@@ -31,7 +31,7 @@ from core import channels as channels_mod  # noqa: E402
 from core import pool_state  # noqa: E402
 from core.billing import Billing  # noqa: E402
 from core.user_db import UserDB  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+from tests.registration_fixture import TestClient  # noqa: E402
 
 STREAM_LINES = [
     'data: {"id":"c","model":"gpt-9-pro","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}',

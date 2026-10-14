@@ -18,6 +18,14 @@
 
 对应端点：`GET /api/admin/stats?days=14`、`GET /api/admin/usage`、`GET /api/admin/usage/export.csv`、`GET /api/admin/users?q=`。
 
+## 注册验证码与邀请奖励
+
+首次邮箱注册（包括管理员）前先配置 SMTP，样例见 [`.env.example`](../.env.example)；已有管理员可在「站点设置 → 邮件设置」配置并发送测试邮件。SMTP 未配置时 `POST /api/register/code` 返回 `503`，发送失败返回 `502`，不会建立可使用的验证码。验证码 15 分钟有效、60 秒冷却、最多校验错误 5 次，库内仅保存加盐哈希。`BITAPI_AUTH_REGISTER_MAIL_PER_IP` / `BITAPI_AUTH_REGISTER_MAIL_PER_EMAIL` 限制每小时验证码发信，默认 10 / 3 次。
+
+在「站点设置 → 注册邀请奖励」独立保存开关、每人美元金额和每位邀请人的奖励人数上限，`0` 表示不限。页面预览是假设同一邀请人此前未获奖的模拟值，不会实际发奖。排查时用 `GET /api/invite` 核对生效规则及已奖励人数，再从钱包流水中查「有效注册奖励」（`reason=affiliate`、`meta.kind=fixed_invite`）。超过上限、重复注册、旧账号登录或绑定、历史邀请均不新增本项奖励；社区注册仍需要原有一次性邀请码。
+
+Token 榜位于 `/portal#/leaderboard`，接口 `GET /api/leaderboard?range=7d&page=1&page_size=20` 需要用户会话；支持 `all`、`7d`、`30d`。按启用账号的输入与输出 Token 合计排名，缓存不计入排名，无用量账号也参与展示。只返回脱敏名字及用量，不公开其他用户的邮箱、ID、余额。
+
 ## 备份与恢复
 
 库文件（`bitapi.db` / 旧名 `poolgate.db`）是用户、密钥、余额、订单、号池的唯一副本。

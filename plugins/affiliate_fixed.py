@@ -19,6 +19,9 @@ CONFIG = {
 
 @on("user.registered")
 def on_registered(user, inviter, **_):
+    from core import site_settings
+    if site_settings.is_from_db("invite_rewards"):
+        return  # 管理台规则已在注册事务中结算，不再叠加旧插件奖励。
     if not inviter:
         return
     if CONFIG["require_verified_email"] and not user.get("email_verified_at"):
