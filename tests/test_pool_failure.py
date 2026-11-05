@@ -207,6 +207,13 @@ class _RotatingDB:
     def set_status(self, _acct_id, _status):
         pass
 
+    def touch_used(self, acct_id):
+        """真库在这时记一次 last_used(面板的「最近使用」)。它不参与
+        pick_active 的排序 —— 轮换的键始终是 last_check,所以这里照实记下即可。"""
+        for r in self.rows:
+            if r["id"] == acct_id:
+                r["last_used"] = 1
+
 
 class _BareAdapter:
     """没有任何 capability:不刷 token,也没有余额/存活检查。"""

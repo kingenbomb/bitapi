@@ -18,48 +18,61 @@
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
     font:14px/1.5 -apple-system,Segoe UI,Roboto,"Microsoft YaHei",sans-serif; }
-  .wrap { padding:32px 40px; max-width:1240px; margin:0 auto; }
+  .wrap { padding:26px 32px; max-width:1440px; margin:0 auto; }
 
   .pagehead { display:flex; align-items:flex-start; justify-content:space-between;
-    gap:20px; margin-bottom:26px; flex-wrap:wrap; }
-  .pagehead h1 { font-size:28px; font-weight:700; margin:0 0 6px; letter-spacing:-.5px; }
+    gap:20px; margin-bottom:20px; flex-wrap:wrap; }
+  .pagehead h1 { font-size:26px; font-weight:700; margin:0 0 6px; letter-spacing:-.5px; }
   .pagehead .sub { color:var(--dim); font-size:13.5px; margin:0; }
   .pagehead .sub b { color:var(--fg); font-weight:600; }
   .tools { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .tools .clock { color:var(--dim2); font-size:12.5px; margin-right:6px; }
 
-  input, button { font:inherit; border-radius:8px; border:1px solid var(--line);
+  input, button, select { font:inherit; border-radius:8px; border:1px solid var(--line);
     background:var(--panel); color:var(--fg); padding:7px 12px; outline:none; }
-  input:focus { border-color:var(--black); }
+  input:focus, select:focus { border-color:var(--black); }
   button { cursor:pointer; transition:.12s; }
   button:hover { border-color:var(--gray); }
   button.primary { background:var(--black); border-color:var(--black); color:#fff; font-weight:500; }
   button.primary:hover { opacity:.88; }
   button.danger { color:var(--bad); border-color:var(--line); }
   button.danger:hover { border-color:var(--bad); background:var(--bad-bg); }
-  button:disabled { opacity:.5; cursor:default; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.sm { padding:4px 9px; font-size:12.5px; border-radius:7px; }
 
-  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:16px; margin-bottom:34px; }
+  /* 下拉菜单(自动刷新、更多操作、列显示共用一套) */
+  .menu { position:relative; display:inline-block; }
+  .menu .pop { display:none; position:absolute; right:0; top:calc(100% + 6px); z-index:40;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    box-shadow:0 10px 34px rgba(16,24,40,.14); padding:6px; min-width:190px; }
+  .menu.open .pop { display:block; }
+  .pop label { display:flex; align-items:center; gap:8px; padding:6px 9px;
+    font-size:13px; border-radius:7px; cursor:pointer; white-space:nowrap; }
+  .pop label:hover { background:var(--bg); }
+  .pop hr { border:none; border-top:1px solid var(--line2); margin:5px 2px; }
+  .pop .cap { font-size:11.5px; color:var(--dim2); padding:5px 9px 3px; }
+
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px; margin-bottom:22px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:14px;
-    padding:18px 20px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+    padding:16px 18px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
   .card .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:2px; }
-  .card h3 { margin:0; font-size:15.5px; font-weight:650; }
+  .card h3 { margin:0; font-size:15px; font-weight:650; }
   .card .pill { font-size:11.5px; color:var(--gray); background:var(--gray-bg);
     padding:2px 9px; border-radius:20px; }
-  .card .caps { font-size:11.5px; color:var(--dim2); margin:6px 0 14px; }
-  .card .num { font-size:30px; font-weight:750; letter-spacing:-1px; line-height:1.1; }
-  .card .numlabel { color:var(--dim); font-size:12.5px; margin-bottom:12px; }
+  .card .caps { font-size:11.5px; color:var(--dim2); margin:6px 0 12px; }
+  .card .num { font-size:27px; font-weight:750; letter-spacing:-1px; line-height:1.1; }
+  .card .numlabel { color:var(--dim); font-size:12.5px; margin-bottom:10px; }
   .card .stats { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
-  .card .bal { display:flex; justify-content:space-between; padding-top:12px;
+  .card .bal { display:flex; justify-content:space-between; padding-top:10px;
     border-top:1px solid var(--line2); }
   .card .bal .dim { color:var(--dim); }
   .card .bal b { font-weight:650; }
-  .card .acts { display:flex; gap:8px; margin-top:14px; padding-top:12px;
+  .card .acts { display:flex; gap:8px; margin-top:12px; padding-top:10px;
     border-top:1px solid var(--line2); }
-  .card .acts button { flex:1; padding:6px 8px; font-size:12.5px; border-radius:8px; }
+  .card .acts button { flex:1; padding:5px 8px; font-size:12.5px; border-radius:8px; }
 
   .st { display:inline-flex; align-items:center; gap:5px; padding:2px 9px;
-    border-radius:20px; font-size:12px; font-weight:500; }
+    border-radius:20px; font-size:12px; font-weight:500; white-space:nowrap; }
   .st::before { content:""; width:6px; height:6px; border-radius:50%; }
   .st.active { background:var(--ok-bg); color:var(--ok); }
   .st.active::before { background:var(--ok); }
@@ -72,43 +85,81 @@
   .st.unchecked { background:var(--gray-bg); color:var(--gray); }
   .st.unchecked::before { background:var(--gray); }
 
-  h2 { font-size:15px; font-weight:650; margin:0 0 14px; }
-  .tabs { display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
-  .tab { padding:6px 14px; border-radius:8px; cursor:pointer;
-    border:1px solid var(--line); background:var(--panel); color:var(--gray); font-size:13px; }
-  .tab:hover { border-color:var(--gray); }
-  .tab.on { background:var(--black); border-color:var(--black); color:#fff; }
+  .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .filters input[type=search] { min-width:220px; }
+  .filters .spacer { flex:1; }
+
+  .bulkbar { display:none; align-items:center; gap:8px; flex-wrap:wrap;
+    background:#fdf7f3; border:1px solid #eddccf; border-radius:10px;
+    padding:9px 12px; margin-bottom:12px; font-size:13px; }
+  .bulkbar.on { display:flex; }
+  .bulkbar b { color:var(--black); }
 
   .tablewrap { background:var(--panel); border:1px solid var(--line); border-radius:14px;
-    overflow:hidden; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+    overflow:auto; max-height:62vh; box-shadow:0 1px 2px rgba(16,24,40,.04); }
   table { width:100%; border-collapse:collapse; }
-  th, td { text-align:left; padding:12px 18px; font-size:13px; }
+  th, td { text-align:left; padding:10px 14px; font-size:13px; white-space:nowrap; }
   th { color:var(--dim); font-weight:600; background:var(--head);
-    border-bottom:1px solid var(--line); font-size:12px; letter-spacing:.02em; }
+    border-bottom:1px solid var(--line); font-size:12px; letter-spacing:.02em;
+    position:sticky; top:0; z-index:2; }
+  th.sortable { cursor:pointer; user-select:none; }
+  th.sortable:hover { color:var(--fg); }
+  th .arrow { color:var(--black); font-size:10px; margin-left:3px; }
   td { border-bottom:1px solid var(--line2); }
   tbody tr:last-child td { border-bottom:none; }
   tbody tr:hover { background:#f8fafc; }
+  tbody tr.sel { background:#fdf7f3; }
   td.mono { font-variant-numeric:tabular-nums; }
   .dim { color:var(--dim); }
+  td.wrap { white-space:normal; max-width:340px; word-break:break-all; }
+  .win { display:flex; align-items:center; gap:7px; min-width:150px; }
+  .win .bar { flex:1; height:6px; border-radius:4px; background:var(--line2);
+    overflow:hidden; min-width:56px; }
+  .win .bar i { display:block; height:100%; background:var(--ok); border-radius:4px; }
+  .win .bar i.warn { background:var(--warn); }
+  .win .bar i.bad { background:var(--bad); }
+  .win .winpct { font-size:12px; font-variant-numeric:tabular-nums; min-width:30px; }
+  .win .dim { font-size:11.5px; }
+  .rowacts { display:flex; gap:5px; }
+  .switch { width:38px; height:21px; border-radius:20px; background:var(--line);
+    border:none; position:relative; cursor:pointer; padding:0; flex:none; }
+  .switch::after { content:""; position:absolute; top:2px; left:2px; width:17px; height:17px;
+    border-radius:50%; background:#fff; transition:.15s; box-shadow:0 1px 3px rgba(0,0,0,.2); }
+  .switch.on { background:var(--ok); }
+  .switch.on::after { left:19px; }
+  .switch:disabled { opacity:.5; }
+
   .pager { display:flex; align-items:center; justify-content:space-between; gap:12px;
     flex-wrap:wrap; margin-top:12px; padding:0 2px; font-size:13px; }
   .pager .pg-btns { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .pager button { padding:5px 11px; font-size:12.5px; }
-  button.rowdel { padding:3px 8px; border-color:transparent; background:transparent;
-    font-size:14px; line-height:1; opacity:.5; }
-  button.rowdel:hover { opacity:1; border-color:var(--bad); background:var(--bad-bg); }
+
   .modal { display:none; position:fixed; inset:0; background:rgba(16,24,40,.45);
     align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal.on { display:flex; }
   .modal-box { background:var(--panel); border:1px solid var(--line); border-radius:14px;
-    padding:22px 24px; width:100%; max-width:560px; box-shadow:0 8px 40px rgba(16,24,40,.2); }
+    padding:20px 22px; width:100%; max-width:640px; max-height:88vh; overflow:auto;
+    box-shadow:0 8px 40px rgba(16,24,40,.2); }
+  .modal-box.wide { max-width:900px; }
   .modal-box h3 { margin:0 0 8px; font-size:17px; font-weight:650; }
   .modal-box p { margin:0 0 12px; font-size:12.5px; }
   .modal-box code { background:var(--gray-bg); padding:1px 5px; border-radius:4px; font-size:11.5px; }
-  .modal-box textarea { width:100%; height:200px; resize:vertical; padding:10px 12px;
+  .modal-box textarea { width:100%; height:180px; resize:vertical; padding:10px 12px;
     border:1px solid var(--line); border-radius:8px; font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;
     background:var(--bg); color:var(--fg); outline:none; }
   .modal-box textarea:focus { border-color:var(--black); }
   .modal-acts { display:flex; justify-content:flex-end; gap:10px; margin-top:14px; }
+  /* 测试回显:深色终端块。上游原话逐字贴在这里,不做美化 —— 报错文本本身就是证据。 */
+  .term { background:#0f172a; color:#d5e0ee; border-radius:10px; padding:12px 14px;
+    font:12.5px/1.6 ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap;
+    word-break:break-word; max-height:300px; overflow:auto; min-height:64px; }
+  .term .ok { color:#7ee0a8; }
+  .term .err { color:#ff9b9b; }
+  .statsgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+    gap:10px; margin-bottom:14px; }
+  .stat { background:var(--bg); border:1px solid var(--line2); border-radius:10px; padding:10px 12px; }
+  .stat .k { font-size:11.5px; color:var(--dim); }
+  .stat .v { font-size:19px; font-weight:700; letter-spacing:-.3px; }
 </style>
 </head>
 <body>
@@ -121,58 +172,158 @@
     <div class="tools">
       <span class="clock" id="msg">🕐 未刷新</span>
       <button onclick="setKey()" title="管理密钥只存在本机浏览器">密钥</button>
+      <div class="menu" id="m-auto">
+        <button onclick="toggleMenu('m-auto')" id="auto-btn">自动刷新</button>
+        <div class="pop">
+          <label><input type="checkbox" id="auto-on" onchange="setAuto()"> 启用自动刷新</label>
+          <div class="cap">间隔</div>
+          <div id="auto-opts"></div>
+        </div>
+      </div>
+      <div class="menu" id="m-more">
+        <button onclick="toggleMenu('m-more')">更多操作 ▾</button>
+        <div class="pop">
+          <div class="cap">数据</div>
+          <label onclick="openImport()">导入账号…</label>
+          <label onclick="doExport(false)">导出全部（含凭据）</label>
+          <label onclick="doExport(true)">导出选中（含凭据）</label>
+          <hr>
+          <div class="cap">列显示</div>
+          <div id="col-opts"></div>
+          <hr>
+          <label onclick="purge()">清除失效账号</label>
+        </div>
+      </div>
       <button onclick="refresh()">刷新</button>
-      <button class="danger" onclick="purge()">清除失效</button>
       <button class="primary" onclick="scan()">立即巡检</button>
     </div>
   </div>
+
   <div class="cards" id="cards"></div>
-  <h2>账号明细</h2>
-  <div class="tabs" id="tabs"></div>
-  <div id="table"></div>
+
+  <div class="filters">
+    <select id="f-channel" onchange="onFilter()"></select>
+    <select id="f-status" onchange="onFilter()">
+      <option value="">全部状态</option>
+      <option value="active">可用</option>
+      <option value="cooldown">冷却</option>
+      <option value="exhausted">额度耗尽</option>
+      <option value="dead">失效</option>
+      <option value="unchecked">待检</option>
+    </select>
+    <select id="f-sched" onchange="onFilter()">
+      <option value="">调度：全部</option>
+      <option value="1">在池中</option>
+      <option value="0">已摘出</option>
+    </select>
+    <input type="search" id="f-q" placeholder="搜索账号 / 备注（回车）"
+           onkeydown="if(event.key==='Enter')onFilter()">
+    <button onclick="onFilter()">查询</button>
+    <button onclick="resetFilters()">重置</button>
+    <span class="spacer"></span>
+    <span class="dim" id="selinfo"></span>
+  </div>
+
+  <div class="bulkbar" id="bulkbar">
+    <span>已选 <b id="seln">0</b> 个账号</span>
+    <button class="sm" onclick="pickAll()">本页全选</button>
+    <button class="sm" onclick="clearSel()">清除选择</button>
+    <span class="spacer" style="flex:1"></span>
+    <button class="sm" onclick="bulk('enable')">启用调度</button>
+    <button class="sm" onclick="bulk('disable')">停用调度</button>
+    <button class="sm" onclick="bulk('reset')">重置状态</button>
+    <button class="sm" onclick="bulkTest()">测试</button>
+    <button class="sm danger" onclick="bulk('delete')">批量删除</button>
+  </div>
+
+  <div class="tablewrap" id="tablebox"></div>
+  <div id="pager"></div>
 </div>
-<div class="modal" id="modal">
+
+<!-- 导入 -->
+<div class="modal" id="md-import">
   <div class="modal-box">
-    <h3>导入 Grok 账号</h3>
-    <p class="dim">粘贴 xAI OAuth 凭据 JSON:单个 <code>{"email":...,"refresh_token":...}</code>、数组 <code>[...]</code>,或 <code>{"accounts":[...]}</code>。<code>refresh_token</code> 必须有,否则号几小时后就失效。</p>
-    <textarea id="modal-ta" placeholder='{"email":"...","access_token":"...","refresh_token":"...","expired":"2026-..."}'></textarea>
+    <h3>导入账号</h3>
+    <p class="dim" id="import-hint"></p>
+    <select id="import-channel" onchange="renderImportHint()" style="margin-bottom:10px"></select>
+    <textarea id="import-ta" placeholder='{"refresh_token":"..."}  或  [{...},{...}]  或  {"accounts":[...]}'></textarea>
     <div class="modal-acts">
-      <button onclick="closeModal()">取消</button>
-      <button class="primary" onclick="doGrokImport()">导入</button>
+      <button onclick="closeModal('md-import')">取消</button>
+      <button class="primary" onclick="doImport()">导入</button>
     </div>
   </div>
 </div>
+
+<!-- 测试 -->
+<div class="modal" id="md-test">
+  <div class="modal-box">
+    <h3>测试账号连接</h3>
+    <p class="dim" id="test-who"></p>
+    <div class="term" id="test-out">等待开始…</div>
+    <div class="modal-acts">
+      <button onclick="closeModal('md-test')">关闭</button>
+      <button class="primary" id="test-run" onclick="runTest()">开始测试</button>
+    </div>
+  </div>
+</div>
+
+<!-- 统计 -->
+<div class="modal" id="md-stats">
+  <div class="modal-box wide">
+    <h3>账号用量</h3>
+    <p class="dim" id="stats-who"></p>
+    <div class="statsgrid" id="stats-cards"></div>
+    <div class="dim" id="stats-note" style="font-size:12.5px"></div>
+    <div class="modal-acts">
+      <button onclick="closeModal('md-stats')">关闭</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 const BASE = location.pathname.replace(/\/admin\/ui.*$/, '');  // nginx 子路径反代兼容
-let STATS = null, CUR = null;
-const ZH = { active:'可用', cooldown:'冷却', exhausted:'失效', dead:'失效', unchecked:'待检' };
+let STATS = null, DATA = null, SEL = new Set();
+
+const STATUS_ZH = { active:'可用', cooldown:'冷却', exhausted:'额度耗尽',
+                    dead:'失效', unchecked:'待检' };
+const PSIZE = 50;
+let OFFSET = 0;
+let SORT = localStorage.getItem('bitapi_panel_sort') || 'id';
+let ORDER = localStorage.getItem('bitapi_panel_order') || 'desc';
+// 存「被隐藏的列」而不是「可见的列」:以后 adapter 加了新列,老浏览器里默认就能看到,
+// 不用等用户去菜单里勾。
+let HIDDEN = new Set(JSON.parse(localStorage.getItem('bitapi_panel_hidden') || '[]'));
 
 /* 管理密钥:本机存一份,面板自己带上 Authorization。
-   原来这里硬返回 {},靠反代注入 key —— 那份配置不在仓库里,一旦面板不是从
-   那条反代进来的(直连源站、换了域名、Cloudflare 那条规则只弹 Basic Auth 而
-   没注入头),整页就只剩「无权限」四个字,而且没有任何自救入口。
    没存本地 key 时仍然不发头,保留反代注入那条路,两种部署都能用。 */
 const KEY_STORE = 'bitapi_admin_key';
 const adminKey = () => localStorage.getItem(KEY_STORE) || '';
 function hdr(){ const k = adminKey(); return k ? { Authorization: 'Bearer ' + k } : {}; }
+function jsonHdr(){ return Object.assign({ 'Content-Type':'application/json' }, hdr()); }
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function setKey(){
-  const cur = adminKey();
-  const k = prompt('管理密钥(BITAPI_ADMIN_KEY)。只保存在这台浏览器,留空则清除:', cur);
-  if(k === null) return false;                 // 取消
+  const k = prompt('管理密钥(BITAPI_ADMIN_KEY)。只保存在这台浏览器,留空则清除:', adminKey());
+  if(k === null) return false;
   const v = k.trim();
   if(v) localStorage.setItem(KEY_STORE, v); else localStorage.removeItem(KEY_STORE);
   refresh();
   return !!v;
 }
+function setKeyPrompt(){
+  const k = prompt('需要管理密钥(BITAPI_ADMIN_KEY)。只保存在这台浏览器:', '');
+  const v = (k || '').trim();
+  if(v) localStorage.setItem(KEY_STORE, v);
+  return !!v;
+}
 function msg(t){ $('#msg').textContent = '🕐 ' + t; }
 
-async function api(path){
-  let r = await fetch(BASE + path, { headers: hdr() });
-  /* 401 就当面问一次,而不是把人留在死胡同里 */
+async function api(path, opts){
+  let r = await fetch(BASE + path, Object.assign({ headers: hdr() }, opts || {}));
   if(r.status === 401 && !adminKey() && setKeyPrompt())
-    r = await fetch(BASE + path, { headers: hdr() });
+    r = await fetch(BASE + path, Object.assign({ headers: hdr() }, opts || {}));
   if(r.status === 401){
     $('#sub').textContent = '🔒 无权限 —— 点右上「密钥」填 BITAPI_ADMIN_KEY,'
       + '或让反代注入 Authorization';
@@ -181,29 +332,125 @@ async function api(path){
   return r.json();
 }
 
-/* 和 setKey 分开:这个只存不刷新,避免在 api() 里递归触发一轮请求 */
-function setKeyPrompt(){
-  const k = prompt('需要管理密钥(BITAPI_ADMIN_KEY)。只保存在这台浏览器:', '');
-  const v = (k || '').trim();
-  if(v) localStorage.setItem(KEY_STORE, v);
-  return !!v;
+/* ---- 下拉菜单 ---- */
+function toggleMenu(id){
+  const el = document.getElementById(id);
+  const was = el.classList.contains('open');
+  document.querySelectorAll('.menu.open').forEach(m => m.classList.remove('open'));
+  if(!was) el.classList.add('open');
+}
+document.addEventListener('click', e => {
+  if(!e.target.closest('.menu'))
+    document.querySelectorAll('.menu.open').forEach(m => m.classList.remove('open'));
+});
+
+/* ---- 自动刷新 ---- */
+const AUTO_STORE = 'bitapi_panel_autorefresh';
+const AUTO_STEPS = [5, 10, 15, 30, 60];
+let AUTO = JSON.parse(localStorage.getItem(AUTO_STORE) || '{"enabled":true,"sec":30}');
+let tick = 0;
+
+function renderAuto(){
+  $('#auto-on').checked = !!AUTO.enabled;
+  $('#auto-opts').innerHTML = AUTO_STEPS.map(s =>
+    `<label><input type="radio" name="auto-sec" ${AUTO.sec===s?'checked':''}
+       onchange="pickAuto(${s})"> ${s} 秒</label>`).join('');
+  $('#auto-btn').textContent = AUTO.enabled && AUTO.sec
+    ? `自动刷新：${Math.max(0, AUTO.sec - tick)}s` : '自动刷新';
+}
+function setAuto(){
+  AUTO.enabled = $('#auto-on').checked;
+  tick = 0; saveAuto();
+}
+function pickAuto(s){ AUTO.sec = s; AUTO.enabled = true; tick = 0; saveAuto(); }
+function saveAuto(){ localStorage.setItem(AUTO_STORE, JSON.stringify(AUTO)); renderAuto(); }
+
+setInterval(() => {
+  if(!AUTO.enabled || !AUTO.sec) return;
+  // 弹窗开着时不刷新:后台换掉列表会让「我正要删的那一行」悄悄变成别的号
+  if(document.hidden || document.querySelector('.modal.on')) return;
+  tick++;
+  if(tick >= AUTO.sec){ tick = 0; refresh(true); }
+  renderAuto();
+}, 1000);
+
+/* ---- 渠道列定义 ---- */
+function channels(){ return Object.keys((STATS && STATS.channels) || {}); }
+
+function visibleColumns(){
+  const ch = $('#f-channel').value;
+  const names = ch ? [ch] : channels();
+  const out = [], seen = new Set();
+  for(const name of names){
+    for(const c of (((STATS.channels||{})[name]||{}).columns || [])){
+      if(seen.has(c.label)) continue;
+      seen.add(c.label);
+      out.push(c);
+    }
+  }
+  return out;
 }
 
-async function refresh(){
+/* 取列值。key 支持点号路径(meta.plan)—— 老面板按 a[c.key] 直取,
+   grok 声明的 meta.sub 因此一直显示成空。 */
+function cellValue(acct, key){
+  return key.split('.').reduce((o, k) => (o == null ? null : o[k]), acct);
+}
+function fmtCell(v, type){
+  if(v == null || v === '') return '<span class="dim">—</span>';
+  if(type === 'money') return '$' + Number(v).toFixed(4);
+  if(type === 'credits') return Number(v).toFixed(0) + ' credits';
+  if(type === 'time') return esc(new Date(Number(v) * 1000).toLocaleString());
+  if(type === 'window') return fmtWindow(v);
+  return esc(v);
+}
+
+/* 用量窗口。形状由 adapter 归一(见 core/adapter.Adapter.window_meta):
+   {pct: 0..1, reset_at?: unix}。只有一个形状要认 —— 两边上游的字段名
+   在 adapter 里就被抹平了,面板不该知道 x-codex-* 或 anthropic-ratelimit-*。 */
+function fmtWindow(v){
+  if(!v || typeof v !== 'object') return '<span class="dim">—</span>';
+  const pct = Math.max(0, Math.min(100, Number(v.pct || 0) * 100));
+  const cls = pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : '';
+  const reset = v.reset_at ? `<span class="dim">· ${fmtReset(v.reset_at)}</span>` : '';
+  return `<div class="win" title="已用 ${pct.toFixed(0)}%">`
+    + `<div class="bar"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div>`
+    + `<span class="winpct">${pct.toFixed(0)}%</span>${reset}</div>`;
+}
+
+function fmtReset(ts){
+  const secs = Number(ts) - Date.now() / 1000;
+  if(!isFinite(secs) || secs <= 0) return '可重置';
+  if(secs < 3600) return Math.ceil(secs / 60) + ' 分钟后重置';
+  if(secs < 86400) return (secs / 3600).toFixed(1) + ' 小时后重置';
+  return Math.ceil(secs / 86400) + ' 天后重置';
+}
+function fmtTime(ts){
+  if(!ts) return '<span class="dim">—</span>';
+  const d = new Date(Number(ts) * 1000), now = Date.now();
+  const diff = (now - d.getTime()) / 1000;
+  if(diff < 60) return '刚刚';
+  if(diff < 3600) return Math.floor(diff/60) + ' 分钟前';
+  if(diff < 86400) return Math.floor(diff/3600) + ' 小时前';
+  return d.toLocaleDateString();
+}
+
+/* ---- 渲染 ---- */
+async function refresh(silent){
   try {
     STATS = await api('/admin/stats');
-    renderSub(); renderCards(); renderTabs();
-    if(!CUR) CUR = Object.keys(STATS.channels)[0];
-    if(CUR) loadAccounts(CUR);
+    renderSub(); renderCards(); renderFilters(); renderColOpts(); renderAuto();
+    await loadAccounts(silent);
     msg('最近刷新 ' + new Date().toLocaleTimeString());
-  } catch(e){}
+  } catch(e){ if(!silent) msg('刷新失败'); }
 }
 
 function renderSub(){
   const pool = STATS.pool || {}, ch = STATS.channels || {};
-  let total=0, active=0, money=0, credits=0, chn=Object.keys(ch).length;
+  let total=0, active=0, parked=0, money=0, credits=0;
   for(const [name, p] of Object.entries(pool)){
     total += p.total||0; active += (p.by_status||{}).active||0;
+    parked += p.parked||0;
     const balCol = ((ch[name]||{}).columns || []).find(c => c.key === 'balance');
     if(balCol && balCol.type === 'credits') credits += p.balance||0;
     else money += p.balance||0;
@@ -211,14 +458,15 @@ function renderSub(){
   const parts = [];
   if(money)   parts.push(`$${money.toFixed(2)}`);
   if(credits) parts.push(`${credits.toFixed(0)} credits`);
-  const balStr = parts.join(' + ') || '$0.00';
-  $('#sub').innerHTML = `<b>${chn}</b> 渠道 · <b>${total}</b> 账号 · <b>${active}</b> 可用 · 总额 <b>${balStr}</b>`;
+  const parkedStr = parked ? ` · 已摘出 <b>${parked}</b>` : '';
+  $('#sub').innerHTML = `<b>${Object.keys(ch).length}</b> 渠道 · <b>${total}</b> 账号 · `
+    + `<b>${active}</b> 可用${parkedStr} · 总额 <b>${parts.join(' + ') || '$0.00'}</b>`;
 }
 
 function renderCards(){
   const ch = STATS.channels, pool = STATS.pool || {};
   $('#cards').innerHTML = Object.entries(ch).map(([name, meta]) => {
-    const p = pool[name] || { total:0, balance:0, by_status:{} };
+    const p = pool[name] || { total:0, balance:0, by_status:{}, parked:0 };
     const bs = p.by_status || {};
     const balCol = (meta.columns || []).find(c => c.key === 'balance');
     const balStr = balCol && balCol.type === 'credits'
@@ -226,112 +474,386 @@ function renderCards(){
       : `$${(p.balance||0).toFixed(2)}`;
     const bal = meta.capabilities.includes('balance')
       ? `<div class="bal"><span class="dim">余额合计</span><b>${balStr}</b></div>` : '';
+    const parked = p.parked
+      ? `<span class="st cooldown">已摘出 ${p.parked}</span>` : '';
     const stLine = ['active','cooldown','exhausted','dead','unchecked']
-      .filter(s => bs[s]).map(s => `<span class="st ${s}">${ZH[s]} ${bs[s]}</span>`).join('')
-      || '<span class="dim">—</span>';
+      .filter(s => bs[s]).map(s => `<span class="st ${s}">${STATUS_ZH[s]} ${bs[s]}</span>`).join('')
+      + parked || '<span class="dim">—</span>';
     return `<div class="card">
-      <div class="top"><h3>${name}</h3><span class="pill">${(meta.models||[]).length} 模型</span></div>
-      <div class="caps">${meta.capabilities.join(' · ')}</div>
+      <div class="top"><h3>${esc(name)}</h3><span class="pill">${(meta.models||[]).length} 模型</span></div>
+      <div class="caps">${meta.capabilities.map(esc).join(' · ')}</div>
       <div class="num">${p.total||0}</div>
       <div class="numlabel">账号总数</div>
-      <div class="stats">${stLine}</div>
+      <div class="stats">${stLine || '<span class="dim">—</span>'}</div>
       ${bal}
       <div class="acts">
-        <button onclick="scan('${name}')">巡检</button>
-        ${name==='grok' ? `<button onclick="grokImport()">导入号</button>` : ''}
-        <button class="danger" onclick="purge('${name}')">清失效</button>
-        <button class="danger" onclick="delChannel('${name}')">删除渠道</button>
+        <button onclick="pickChannel('${esc(name)}')">查看</button>
+        <button onclick="scan('${esc(name)}')">巡检</button>
+        <button onclick="delChannel('${esc(name)}')">删除渠道</button>
       </div>
     </div>`;
   }).join('') || '<div class="dim">无渠道</div>';
 }
 
-function renderTabs(){
-  $('#tabs').innerHTML = Object.keys(STATS.channels).map(name =>
-    `<div class="tab ${name===CUR?'on':''}" onclick="loadAccounts('${name}')">${name}</div>`).join('');
+function renderFilters(){
+  const names = channels();
+  const cur = $('#f-channel').value;
+  $('#f-channel').innerHTML = '<option value="">全部渠道</option>'
+    + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  if(names.includes(cur)) $('#f-channel').value = cur;
+  else if(names.length && !cur) $('#f-channel').value = names[0];
+  // 导入弹窗里也只能选代码里真有 import_account 的渠道 —— 列出来却点了报 400
+  // 比不列更糟
+  $('#import-channel').innerHTML = names.map(n =>
+    `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  renderImportHint();
 }
 
-const PSIZE = 50;   // 每页账号数
-let OFFSET = 0;     // 当前页偏移
+function renderColOpts(){
+  const cols = visibleColumns();
+  $('#col-opts').innerHTML = cols.length ? cols.map(c =>
+    `<label><input type="checkbox" ${HIDDEN.has(c.label)?'':'checked'}
+       onchange="toggleCol('${esc(c.label)}')"> ${esc(c.label)}</label>`).join('')
+    : '<div class="cap">该渠道未声明额外列</div>';
+}
+function toggleCol(label){
+  if(HIDDEN.has(label)) HIDDEN.delete(label); else HIDDEN.add(label);
+  localStorage.setItem('bitapi_panel_hidden', JSON.stringify([...HIDDEN]));
+  loadAccounts();
+}
 
-async function loadAccounts(name, offset){
-  if(name !== CUR) OFFSET = 0;       // 切渠道重置到第一页
-  else if(offset != null) OFFSET = Math.max(0, offset);
-  CUR = name; renderTabs();
-  const meta = STATS.channels[name];
-  const cols = (meta.columns||[]).filter(c => !['status','email'].includes(c.key));
-  const data = await api(`/admin/accounts?channel=${encodeURIComponent(name)}&offset=${OFFSET}&limit=${PSIZE}`);
-  const accts = data.accounts || [];
-  const total = data.total || 0;
-  const head = ['<th>identity</th>','<th>状态</th>']
-    .concat(cols.map(c => `<th>${c.label}</th>`)).concat(['<th>最后检查</th>','<th></th>']).join('');
+function pickChannel(name){ $('#f-channel').value = name; OFFSET = 0; loadAccounts(); }
+function onFilter(){ OFFSET = 0; clearSel(); loadAccounts(); }
+function resetFilters(){
+  $('#f-channel').value = channels()[0] || '';
+  $('#f-status').value = ''; $('#f-sched').value = ''; $('#f-q').value = '';
+  onFilter();
+}
+function setSort(key){
+  if(SORT === key) ORDER = ORDER === 'asc' ? 'desc' : 'asc';
+  else { SORT = key; ORDER = 'desc'; }
+  localStorage.setItem('bitapi_panel_sort', SORT);
+  localStorage.setItem('bitapi_panel_order', ORDER);
+  OFFSET = 0; loadAccounts();
+}
+
+async function loadAccounts(silent){
+  const ch = $('#f-channel').value;
+  const p = new URLSearchParams();
+  if(ch) p.set('channel', ch);
+  const st = $('#f-status').value; if(st) p.set('status', st);
+  const sc = $('#f-sched').value;  if(sc !== '') p.set('schedulable', sc);
+  const q = $('#f-q').value.trim(); if(q) p.set('q', q);
+  p.set('sort', SORT); p.set('order', ORDER);
+  p.set('offset', OFFSET); p.set('limit', PSIZE);
+  let data;
+  try { data = await api('/admin/accounts?' + p.toString()); }
+  catch(e){ if(!silent) msg('加载失败'); return; }
+  DATA = data;
+  renderTable();
+  renderPager();
+  renderSel();
+}
+
+function renderTable(){
+  const cols = visibleColumns().filter(c => !HIDDEN.has(c.label));
+  const accts = (DATA && DATA.accounts) || [];
+  const sortable = { identity:1, status:1, balance:1, last_check:1, last_used:1, created_at:1 };
+  const arrow = k => SORT === k ? `<span class="arrow">${ORDER==='asc'?'▲':'▼'}</span>` : '';
+  const th = k => sortable[k]
+    ? `<th class="sortable" onclick="setSort('${k}')">${k==='identity'?'账号':k==='status'?'状态':k}${arrow(k)}</th>`
+    : `<th>${k}</th>`;
+  const head = ['<th style="width:34px"><input type="checkbox" onclick="pickAll(this.checked)"></th>',
+    '<th class="sortable" onclick="setSort(\'identity\')">账号' + arrow('identity') + '</th>',
+    '<th class="sortable" onclick="setSort(\'status\')">状态' + arrow('status') + '</th>',
+    '<th>调度</th>']
+    .concat(cols.map(c => `<th>${esc(c.label)}</th>`))
+    .concat(['<th class="sortable" onclick="setSort(\'last_used\')">最近使用' + arrow('last_used') + '</th>',
+             '<th>操作</th>']).join('');
+
   const rows = accts.map(a => {
-    const cells = cols.map(c => {
-      let v = a[c.key];
-      if(c.type === 'money' && v != null) v = '$' + Number(v).toFixed(4);
-      else if(c.type === 'credits' && v != null) v = Number(v).toFixed(0) + ' credits';
-      else if(c.type === 'time' && v) v = new Date(v*1000).toLocaleString();
-      return `<td class="mono">${v ?? '<span class="dim">—</span>'}</td>`;
-    }).join('');
-    const lc = a.last_check ? new Date(a.last_check*1000).toLocaleTimeString() : '—';
-    const id = encodeURIComponent(a.identity);
-    return `<tr><td class="mono">${a.identity}</td><td><span class="st ${a.status}">${ZH[a.status]||a.status}</span></td>${cells}<td class="dim mono">${lc}</td><td><button class="rowdel" title="删除此账号" onclick="delAccount('${name}','${id}')">🗑</button></td></tr>`;
+    const cells = cols.map(c => `<td class="mono">${fmtCell(cellValue(a, c.key), c.type)}</td>`).join('');
+    const id = a.id;
+    const on = !!a.schedulable;
+    return `<tr class="${SEL.has(id)?'sel':''}">
+      <td><input type="checkbox" ${SEL.has(id)?'checked':''} onclick="pick(${id},this.checked)"></td>
+      <td class="mono">${esc(a.identity)}</td>
+      <td><span class="st ${esc(a.status)}">${STATUS_ZH[a.status]||esc(a.status)}</span></td>
+      <td><button class="switch ${on?'on':''}" title="${on?'在池中,点一下摘出':'已摘出,点一下放回'}"
+           onclick="toggleSched(${id},${on?0:1},this)"></button></td>
+      ${cells}
+      <td class="dim mono">${fmtTime(a.last_used)}</td>
+      <td><div class="rowacts">
+        <button class="sm" onclick="openTest(${id},'${esc(a.identity)}')">测试</button>
+        <button class="sm" onclick="openStats(${id},'${esc(a.identity)}')">统计</button>
+        <button class="sm danger" onclick="delAccount(${id},'${esc(a.identity)}')">删除</button>
+      </div></td>
+    </tr>`;
   }).join('');
-  const span = cols.length + 4;
-  $('#table').innerHTML = `<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${rows||`<tr><td colspan="${span}" class="dim">无账号</td></tr>`}</tbody></table></div>${pager(name, total)}`;
+  const span = cols.length + 5;
+  $('#tablebox').innerHTML = `<table><thead><tr>${head}</tr></thead>
+    <tbody>${rows || `<tr><td colspan="${span}" class="dim">无账号</td></tr>`}</tbody></table>`;
 }
 
-function pager(name, total){
-  if(!total) return '';
-  const from = total ? OFFSET + 1 : 0, to = Math.min(OFFSET + PSIZE, total);
+function renderPager(){
+  const total = (DATA && DATA.total) || 0;
+  if(!total){ $('#pager').innerHTML = ''; return; }
+  const from = OFFSET + 1, to = Math.min(OFFSET + PSIZE, total);
   const page = Math.floor(OFFSET / PSIZE) + 1, pages = Math.max(1, Math.ceil(total / PSIZE));
-  const prevOff = Math.max(0, OFFSET - PSIZE), nextOff = OFFSET + PSIZE;
-  return `<div class="pager">
+  const prev = Math.max(0, OFFSET - PSIZE), next = OFFSET + PSIZE;
+  $('#pager').innerHTML = `<div class="pager">
     <span class="dim">${from}–${to} / 共 ${total}</span>
     <span class="pg-btns">
-      <button ${OFFSET<=0?'disabled':''} onclick="loadAccounts('${name}',0)">« 首页</button>
-      <button ${OFFSET<=0?'disabled':''} onclick="loadAccounts('${name}',${prevOff})">‹ 上一页</button>
+      <button ${OFFSET<=0?'disabled':''} onclick="go(0)">« 首页</button>
+      <button ${OFFSET<=0?'disabled':''} onclick="go(${prev})">‹ 上一页</button>
       <span class="dim">第 ${page} / ${pages} 页</span>
-      <button ${nextOff>=total?'disabled':''} onclick="loadAccounts('${name}',${nextOff})">下一页 ›</button>
-      <button ${nextOff>=total?'disabled':''} onclick="loadAccounts('${name}',${(pages-1)*PSIZE})">末页 »</button>
+      <button ${next>=total?'disabled':''} onclick="go(${next})">下一页 ›</button>
+      <button ${next>=total?'disabled':''} onclick="go(${(pages-1)*PSIZE})">末页 »</button>
     </span>
   </div>`;
 }
+function go(o){ OFFSET = Math.max(0, o); loadAccounts(); }
 
-async function delAccount(channel, idEnc){
-  const identity = decodeURIComponent(idEnc);
-  if(!confirm(`确认删除账号【${identity}】?`)) return;
+/* ---- 选择 ---- */
+function pick(id, on){ if(on) SEL.add(id); else SEL.delete(id); renderSel(); renderTable(); }
+function pickAll(on){
+  ((DATA && DATA.accounts) || []).forEach(a => { if(on) SEL.add(a.id); else SEL.delete(a.id); });
+  renderSel(); renderTable();
+}
+function clearSel(){ SEL.clear(); renderSel(); renderTable(); }
+function renderSel(){
+  const n = SEL.size;
+  $('#bulkbar').classList.toggle('on', n > 0);
+  $('#seln').textContent = n;
+  $('#selinfo').textContent = n ? `已选 ${n} 个` : '';
+}
+
+/* ---- 行操作 ---- */
+async function toggleSched(id, on, btn){
+  btn.disabled = true;
+  try {
+    await api('/admin/accounts/bulk', {
+      method:'POST', headers: jsonHdr(),
+      body: JSON.stringify({ ids:[id], action: on ? 'enable' : 'disable' }) });
+    msg(on ? '已放回号池' : '已摘出号池');
+    refresh(true);
+  } catch(e){ msg('操作失败'); }
+  btn.disabled = false;
+}
+
+async function delAccount(id, identity){
+  if(!confirm(`确认删除账号【${identity}】?\n凭据一并删除,不可恢复。`)) return;
   msg('删除 ' + identity + '…');
   try {
-    const r = await fetch(`${BASE}/admin/account/delete?channel=${encodeURIComponent(channel)}&identity=${idEnc}`, { method:'POST', headers: hdr() });
-    await r.json();
+    await api('/admin/accounts/bulk', {
+      method:'POST', headers: jsonHdr(), body: JSON.stringify({ ids:[id], action:'delete' }) });
     msg('已删除 ' + identity);
-    STATS = await api('/admin/stats'); renderCards();
-    loadAccounts(channel, OFFSET);
+    SEL.delete(id);
+    refresh();
   } catch(e){ msg('删除失败'); }
 }
 
-function grokImport(){
-  $('#modal').style.display = 'flex';
-  $('#modal-ta').value = '';
-  $('#modal-ta').focus();
+async function bulk(action){
+  const ids = [...SEL];
+  if(!ids.length) return;
+  if(action === 'delete' && !confirm(`确认删除选中的 ${ids.length} 个账号?凭据一并删除,不可恢复。`)) return;
+  msg('批量操作 ' + ids.length + ' 个账号…');
+  try {
+    const j = await api('/admin/accounts/bulk', {
+      method:'POST', headers: jsonHdr(), body: JSON.stringify({ ids, action }) });
+    msg(`批量${action}完成 ${j.count ?? 0} 个`);
+    if(action === 'delete') clearSel();
+    refresh();
+  } catch(e){ msg('批量操作失败'); }
 }
-function closeModal(){ $('#modal').style.display = 'none'; }
 
-async function doGrokImport(){
-  const raw = $('#modal-ta').value.trim();
-  if(!raw){ return; }
+/* ---- 导入 / 导出 ---- */
+function renderImportHint(){
+  const ch = $('#import-channel').value;
+  const meta = (STATS.channels || {})[ch] || {};
+  // 提示由渠道自己声明(core/adapter.Adapter.credentials_hint)——
+  // 面板里写死一张「渠道名 → 提示」的表,加一个渠道就得回来改这个文件。
+  const hint = meta.credentials_hint || '该渠道的凭据 JSON';
+  $('#import-hint').innerHTML = `粘贴 ${esc(ch||'')} 的凭据 JSON。`
+    + `<br>${esc(hint)}。<b>refresh_token 必须有</b>,否则号几小时后就失效。`;
+}
+function openImport(){
+  document.querySelectorAll('.menu.open').forEach(m => m.classList.remove('open'));
+  const ch = $('#f-channel').value;
+  if(ch) $('#import-channel').value = ch;
+  $('#import-ta').value = '';
+  renderImportHint();
+  $('#md-import').classList.add('on');
+  $('#import-ta').focus();
+}
+async function doImport(){
+  const channel = $('#import-channel').value;
+  const raw = $('#import-ta').value.trim();
+  if(!raw) return;
   let payload;
   try { payload = JSON.parse(raw); }
   catch(e){ alert('JSON 解析失败:' + e.message); return; }
-  msg('导入 grok 号…');
+  const accounts = Array.isArray(payload) ? payload
+    : (payload.accounts && Array.isArray(payload.accounts)) ? payload.accounts : [payload];
+  msg('导入 ' + channel + '…');
   try {
-    const r = await fetch(`${BASE}/admin/grok/import`, { method:'POST', headers:{...hdr(),'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    const j = await r.json();
+    const j = await api('/admin/accounts/import', {
+      method:'POST', headers: jsonHdr(), body: JSON.stringify({ channel, accounts }) });
     msg(`导入完成:成功 ${j.count||0}${(j.errors&&j.errors.length)?' · 失败 '+j.errors.length:''}`);
     if(j.errors && j.errors.length) alert('部分失败:\n' + j.errors.join('\n'));
-    closeModal(); refresh();
+    if(!j.errors || !j.errors.length) closeModal('md-import');
+    refresh();
   } catch(e){ msg('导入失败'); }
+}
+
+async function doExport(selectedOnly){
+  const ids = selectedOnly ? [...SEL] : [];
+  if(selectedOnly && !ids.length){ alert('先选中要导出的账号'); return; }
+  const what = selectedOnly ? `选中的 ${ids.length} 个账号` : '当前筛选下的全部账号';
+  if(!confirm(`导出${what}?\n\n文件里包含账号凭据(明文),请自己保管好。`)) return;
+  const p = new URLSearchParams();
+  if(!selectedOnly && $('#f-channel').value) p.set('channel', $('#f-channel').value);
+  if(ids.length) p.set('ids', ids.join(','));
+  msg('导出中…');
+  try {
+    const j = await api('/admin/accounts/export?' + p.toString());
+    const blob = new Blob([JSON.stringify(j, null, 2)], { type:'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'bit-api-accounts-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'') + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    msg(`已导出 ${j.count||0} 个账号`);
+  } catch(e){ msg('导出失败'); }
+}
+
+/* ---- 测试 ---- */
+let TEST_ID = null;
+function openTest(id, identity){
+  TEST_ID = id;
+  $('#test-who').textContent = identity + '  ·  #' + id;
+  const t = new Date().toLocaleTimeString();
+  $('#test-out').innerHTML = `<span class="dim">[${t}] 连接 ${esc(identity)} …</span>`;
+  $('#test-run').textContent = '开始测试';
+  $('#md-test').classList.add('on');
+}
+
+async function runTest(){
+  if(TEST_ID == null) return;
+  const btn = $('#test-run');
+  btn.disabled = true; btn.textContent = '测试中…';
+  $('#test-out').innerHTML = '<span class="dim">正在发送测试请求…</span>';
+  try {
+    const j = await api('/admin/accounts/test', {
+      method:'POST', headers: jsonHdr(), body: JSON.stringify({ id: TEST_ID }) });
+    const t = new Date().toLocaleTimeString();
+    if(j.ok){
+      const u = j.usage || {};
+      $('#test-out').innerHTML =
+        `<span class="dim">[${t}] 模型 ${esc(j.model)} · ${j.ms}ms</span>\n`
+        + `<span class="ok">✔ 上游返回：</span>\n${esc(j.text || '(空回复)')}\n`
+        + `<span class="dim">usage: in=${u.prompt_tokens||0} out=${u.completion_tokens||0}</span>`;
+    } else {
+      $('#test-out').innerHTML =
+        `<span class="dim">[${t}] ${j.ms}ms</span>\n`
+        + `<span class="err">✘ HTTP ${esc(j.code||'-')} 上游原话：</span>\n${esc(j.error||'')}`;
+    }
+  } catch(e){
+    $('#test-out').innerHTML = '<span class="err">✘ 请求面板接口失败(看右上角状态)</span>';
+  }
+  btn.disabled = false; btn.textContent = '重试';
+}
+
+async function bulkTest(){
+  const ids = [...SEL];
+  if(!ids.length) return;
+  if(!confirm(`依次测试选中的 ${ids.length} 个账号?会真的发 ${ids.length} 条请求。`)) return;
+  TEST_ID = null;
+  $('#test-who').textContent = `批量测试 ${ids.length} 个账号`;
+  $('#md-test').classList.add('on');
+  $('#test-run').disabled = true;
+  const out = $('#test-out');
+  out.innerHTML = '';
+  let ok = 0;
+  for(const id of ids){
+    try {
+      const j = await api('/admin/accounts/test', {
+        method:'POST', headers: jsonHdr(), body: JSON.stringify({ id }) });
+      if(j.ok) ok++;
+      out.innerHTML += `<span class="${j.ok?'ok':'err'}">${j.ok?'✔':'✘'} `
+        + `${esc(j.identity)} #${id} ${j.ms}ms</span> `
+        + `<span class="dim">${esc(j.ok ? (j.text||'(空)') : ('HTTP '+(j.code||'-')+' '+(j.error||''))).slice(0,220)}</span>\n`;
+      out.scrollTop = out.scrollHeight;
+    } catch(e){
+      out.innerHTML += `<span class="err">✘ #${id} 面板接口失败</span>\n`;
+    }
+  }
+  out.innerHTML += `\n<span class="dim">完成:成功 ${ok} / ${ids.length}</span>`;
+  $('#test-run').disabled = false;
+  $('#test-run').textContent = '关闭';
+  $('#test-run').onclick = () => { closeModal('md-test'); $('#test-run').onclick = runTest; };
+}
+
+/* ---- 统计 ---- */
+async function openStats(id, identity){
+  $('#stats-who').textContent = identity + '  ·  #' + id;
+  $('#stats-cards').innerHTML = '<span class="dim">加载中…</span>';
+  $('#stats-note').textContent = '';
+  $('#md-stats').classList.add('on');
+  try {
+    const j = await api('/admin/accounts/stats?ids=' + id + '&days=7');
+    const s = (j.stats || [])[0];
+    if(!s){ $('#stats-cards').innerHTML = '<span class="dim">读不到这个账号</span>'; return; }
+    const card = (k, v) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+    $('#stats-cards').innerHTML =
+      card('近 7 天请求', s.requests)
+      + card('输入 token', s.input_tokens.toLocaleString())
+      + card('输出 token', s.output_tokens.toLocaleString())
+      + card('近 7 天实扣', '$' + Number(s.cost).toFixed(4))
+      + card('平均响应', s.avg_ms ? s.avg_ms + 'ms' : '—')
+      + card('余额', s.balance == null ? '—' : (Number(s.balance).toFixed(2)))
+      + card('最近使用', fmtTime(s.last_used).replace(/<[^>]+>/g,''))
+      + card('最近检查', fmtTime(s.last_check).replace(/<[^>]+>/g,''))
+      + card('状态', STATUS_ZH[s.status] || s.status)
+      + card('调度', s.schedulable ? '在池中' : '已摘出');
+    $('#stats-note').textContent =
+      '用量取自本站 usage_logs（按实际作答的账号归属）。加这列之前的旧日志归不到号上，'
+      + '不计入 —— 所以这个数只会比实际少，不会多。'
+      + (s.last_at ? '本窗口最后一次使用：' + new Date(s.last_at * 1000).toLocaleString() : '');
+  } catch(e){
+    $('#stats-cards').innerHTML = '<span class="dim">加载失败</span>';
+  }
+}
+function closeModal(id){ document.getElementById(id).classList.remove('on'); }
+document.querySelectorAll('.modal').forEach(m => m.addEventListener('click', e => {
+  if(e.target === m) m.classList.remove('on');
+}));
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape') document.querySelectorAll('.modal.on').forEach(m => m.classList.remove('on'));
+});
+
+/* ---- 渠道级动作 ---- */
+async function scan(channel){
+  const q = channel ? '?channel=' + encodeURIComponent(channel) : '';
+  msg((channel ? channel + ' ' : '') + '巡检中…');
+  try {
+    const j = await api('/admin/scan' + q, { method:'POST' });
+    msg((channel ? channel + ' ' : '') + '巡检完成 ' + JSON.stringify(j.result || {}));
+    refresh();
+  } catch(e){ msg('巡检失败'); }
+}
+
+async function purge(){
+  document.querySelectorAll('.menu.open').forEach(m => m.classList.remove('open'));
+  const label = '全部渠道';
+  if(!confirm('确认清除【' + label + '】的失效账号?权限拒绝和额度耗尽账号也会删除,'
+    + '冷却账号与已摘出的账号不会删除。此操作不可恢复。')) return;
+  msg('清理 ' + label + '…');
+  try {
+    const j = await api('/admin/purge', { method:'POST' });
+    msg('已清除 ' + label + ' ' + (j.deleted ?? 0) + ' 个账号');
+    refresh();
+  } catch(e){ msg('清理失败'); }
 }
 
 async function delChannel(channel){
@@ -341,39 +863,14 @@ async function delChannel(channel){
   if(typed !== channel){ msg('已取消(输入不匹配)'); return; }
   msg('删除渠道 ' + channel + '…');
   try {
-    const r = await fetch(`${BASE}/admin/channel/delete?channel=${encodeURIComponent(channel)}`, { method:'POST', headers: hdr() });
-    const j = await r.json();
+    const j = await api('/admin/channel/delete?channel=' + encodeURIComponent(channel), { method:'POST' });
     msg(`已删除渠道 ${channel} ${j.deleted ?? 0} 个账号`);
     refresh();
   } catch(e){ msg('删除失败'); }
 }
 
-async function scan(channel){
-  const q = channel ? '?channel=' + encodeURIComponent(channel) : '';
-  msg((channel ? channel + ' ' : '') + '巡检中…');
-  try {
-    const r = await fetch(BASE + '/admin/scan' + q, { method:'POST', headers: hdr() });
-    const j = await r.json();
-    msg((channel ? channel + ' ' : '') + '巡检完成 ' + JSON.stringify(j.result || {}));
-    refresh();
-  } catch(e){ msg('巡检失败'); }
-}
-
-async function purge(channel){
-  const label = channel || '全部渠道';
-  if(!confirm('确认清除【' + label + '】的失效账号?权限拒绝和额度耗尽账号也会删除，冷却账号不会删除。此操作不可恢复。')) return;
-  const q = channel ? '?channel=' + encodeURIComponent(channel) : '';
-  msg('清理 ' + label + '…');
-  try {
-    const r = await fetch(BASE + '/admin/purge' + q, { method:'POST', headers: hdr() });
-    const j = await r.json();
-    msg('已清除 ' + label + ' ' + (j.deleted ?? 0) + ' 个账号');
-    refresh();
-  } catch(e){ msg('清理失败'); }
-}
-
+renderAuto();
 refresh();
-setInterval(refresh, 30000);
 </script>
 </body>
 </html>

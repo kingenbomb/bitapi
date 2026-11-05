@@ -256,17 +256,37 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(m.get(name), "grok")
 
     def test_import_endpoint_has_a_method_to_call(self):
-        """`/admin/grok/import` 调的是 adapter.import_account。
+        """`/admin/accounts/import` 调的是 adapter.import_account。
 
         单独钉一条:断掉的那次两端都「看着正常」—— 方法没了,端点照样注册、
         面板照样渲染,只有点下去才知道是 500。
+
+        这个端点原先是 grok 专用的 `/admin/grok/import`(路由里写死了渠道名),
+        按 docs/adapters.md 的承诺改成了渠道参数化的一条 —— 门禁跟着挪过来,
+        断言本身没变。
         """
         import inspect
         import server
         self.assertIn("import_account",
-                      inspect.getsource(server.admin_grok_import))
+                      inspect.getsource(server.admin_accounts_import))
         self.assertTrue(hasattr(GrokAdapter(), "import_account"),
                         "端点调 import_account,渠道就必须有这个方法")
+
+    def test_no_route_hardcodes_a_channel_name(self):
+        """路由表里不该出现写死的渠道名。
+
+        写死一个渠道名,后来新增的渠道就得回来改核心代码 —— 那正是
+        docs/adapters.md 承诺不做的事。渠道由请求体/query 传入。
+        """
+        import inspect
+        import server
+        for name, fn in inspect.getmembers(server, inspect.isfunction):
+            path = getattr(getattr(fn, "router", None), "path", "") or ""
+            if not path.startswith("/admin/"):
+                continue
+            self.assertNotIn("grok", path, f"{path} 把渠道名写进了路由")
+            self.assertNotIn("openai", path, f"{path} 把渠道名写进了路由")
+            self.assertNotIn("claude", path, f"{path} 把渠道名写进了路由")
 
 
 if __name__ == "__main__":

@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     user_id          INTEGER NOT NULL,
     api_key_id       INTEGER,
     channel          TEXT,
+    account_id       INTEGER,                   -- 实际作答的号池账号(accounts.id)
     model            TEXT,
     input_tokens     INTEGER DEFAULT 0,
     output_tokens    INTEGER DEFAULT 0,
@@ -352,7 +353,10 @@ class UserDB:
                 ("token_source", "TEXT DEFAULT 'estimate'"),
                 ("actual_cost", "REAL DEFAULT 0"),
                 ("billing_mode", "TEXT DEFAULT 'free'"),
-                ("pricing_snapshot", "TEXT")):
+                ("pricing_snapshot", "TEXT"),
+                # 按号统计的锚点。不加这一列,面板上的「该账号用量」就只能是
+                # 渠道级汇总 —— 一个渠道几十个号时那个数对站长没有意义。
+                ("account_id", "INTEGER")):
             if name not in added:
                 c.execute(f"ALTER TABLE usage_logs ADD COLUMN {name} {ddl}")
 
@@ -1070,20 +1074,54 @@ class UserDB:
     def add_usage(self, user_id, api_key_id=None, channel=None, model=None,
                   input_tokens=0, output_tokens=0, cost=0.0, actual_cost=0.0,
                   billing_mode="free", pricing_snapshot=None, stream=0,
-                  duration_ms=0, token_source="estimate"):
+                  duration_ms=0, token_source="estimate", account_id=None):
         now = int(time.time())
         snap = (json.dumps(pricing_snapshot, ensure_ascii=False)
                 if pricing_snapshot is not None else None)
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO usage_logs(user_id,api_key_id,channel,model,"
+                "INSERT INTO usage_logs(user_id,api_key_id,channel,account_id,model,"
                 "input_tokens,output_tokens,cost,actual_cost,billing_mode,"
                 "pricing_snapshot,token_source,stream,duration_ms,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (user_id, api_key_id, channel, model, input_tokens,
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (user_id, api_key_id, channel, account_id, model, input_tokens,
                  output_tokens, cost, actual_cost, billing_mode, snap,
                  token_source, 1 if stream else 0, duration_ms, now))
             return cur.lastrowid
+
+    def account_usage(self, account_ids, since=0):
+        """按账号聚合用量:请求数、token、实扣、最后使用时间。
+
+        只统计有 account_id 的行 —— 加这一列之前的历史日志归属不到号上,
+        把它们算进某个号等于编数。面板显示的是「可核对的那部分」。
+        """
+        ids = [int(i) for i in (account_ids or [])]
+        if not ids:
+            return {}
+        ph = ",".join("?" for _ in ids)
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT account_id, COUNT(*) reqs, "
+                f"COALESCE(SUM(input_tokens),0) in_tok, "
+                f"COALESCE(SUM(output_tokens),0) out_tok, "
+                f"COALESCE(SUM(actual_cost),0) cost, "
+                f"COALESCE(AVG(duration_ms),0) avg_ms, "
+                f"MAX(created_at) last_at "
+                f"FROM usage_logs WHERE account_id IN ({ph}) AND created_at>=? "
+                f"GROUP BY account_id", [*ids, since]).fetchall()
+        return {r["account_id"]: dict(r) for r in rows}
+
+    def account_usage_daily(self, account_id, days=14):
+        """某个号近 N 天的日序列,给统计弹窗画趋势。"""
+        since = int(time.time()) - days * 86400
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT date(created_at,'unixepoch','localtime') d, "
+                "COUNT(*) reqs, COALESCE(SUM(input_tokens+output_tokens),0) tok, "
+                "COALESCE(SUM(actual_cost),0) cost FROM usage_logs "
+                "WHERE account_id=? AND created_at>=? GROUP BY d ORDER BY d",
+                (int(account_id), since)).fetchall()
+        return [dict(r) for r in rows]
 
     def usage_overview(self, user_id, since=0):
         """概览用的一次性聚合:请求数、输入/输出 token、原价与实扣、耗时。

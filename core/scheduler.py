@@ -15,7 +15,7 @@ import time
 
 from core import db as dbmod
 from core.adapter import CAP_BALANCE, CAP_HEALTH, CAP_REFRESH, all_adapters
-from core.pool import classify_failure
+from core.pool import classify_failure, refresh_fields
 
 
 def _check_one(db, adapter, acct, margin, min_balance):
@@ -27,10 +27,10 @@ def _check_one(db, adapter, acct, margin, min_balance):
             exp = acct.get("token_exp") or 0
             if not acct.get("token") or exp - time.time() < margin:
                 upd = adapter.refresh_token(acct)
-                db.update_account(aid, token=upd["token"],
-                                  token_exp=upd.get("token_exp", 0),
-                                  meta=upd.get("meta", acct.get("meta")))
+                db.update_account(aid, **refresh_fields(upd, acct))
                 acct["token"] = upd["token"]
+                if upd.get("secret"):
+                    acct["secret"] = upd["secret"]
 
         # 1.5) 强探活(可选):adapter 声明了 verify_alive 则先校验账号是否仍有效
         #      (有的上游删号后余额接口仍返回非 None,只有走一次真登录才认得出)。
@@ -126,9 +126,9 @@ async def scan_once(db, concurrency, margin, min_balance, log=print, channel=Non
         # (否则万级号 = 万次 set_status,1 核直接打满)
         if getattr(adapter, "proxy", False) or hasattr(adapter, "sync_pool"):
             continue
-        accts = (db.list_accounts(channel=channel, status=dbmod.ST_ACTIVE) +
-                 db.list_accounts(channel=channel, status=dbmod.ST_UNCHECKED) +
-                 db.list_accounts(channel=channel, status=dbmod.ST_COOLDOWN))
+        accts = (db.list_accounts(channel=channel, status=dbmod.ST_ACTIVE, schedulable=1)
+                 + db.list_accounts(channel=channel, status=dbmod.ST_UNCHECKED, schedulable=1)
+                 + db.list_accounts(channel=channel, status=dbmod.ST_COOLDOWN, schedulable=1))
         for acct in accts:
             tasks.append(guarded(adapter, acct))
 

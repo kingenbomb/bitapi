@@ -35,7 +35,7 @@ import urllib.request
 
 import config
 from core.adapter import (BILL_UPSTREAM, CAP_CHAT, CAP_HEALTH, CAP_REFRESH,
-                          Adapter, register_adapter)
+                          Adapter, register_adapter, to_unix)
 
 # 上游只认这两个域名。base_url 存在凭据里(每个号可能不同),用白名单挡住
 # 被改写的凭据把 Bearer token 发到别处 —— 那是把号直接送人。
@@ -70,14 +70,7 @@ def _upstream_model(model):
 
 def _iso_to_unix(text):
     """把凭据里的 expired(ISO8601,可能带 Z)转 unix 秒;解析不了返回 0。"""
-    s = str(text or "").strip().replace("Z", "+00:00")
-    if not s:
-        return 0
-    try:
-        import datetime
-        return int(datetime.datetime.fromisoformat(s).timestamp())
-    except (ValueError, TypeError):
-        return 0
+    return to_unix(text)
 
 
 class GrokError(RuntimeError):
@@ -100,6 +93,8 @@ class GrokAdapter(Adapter):
     # token 实测 6 小时。刷新周期取「有效期 - 提前量」,由巡检提前换掉。
     refresh_interval = 21600 - config.GROK_REFRESH_MARGIN
     billing_mode = BILL_UPSTREAM   # 上游返回真实 usage,不必 tiktoken 估算
+    credentials_hint = ('xAI OAuth 凭据:{"email":"...","refresh_token":"...",'
+                        '"access_token":"..."(可选),"expired":"..."(可选)}')
 
     # ---- 凭据与 URL ----
 

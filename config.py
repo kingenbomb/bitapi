@@ -113,6 +113,34 @@ GROK_CLIENT_ID = env("GROK_CLIENT_ID", "b1a00492-073a-47ea-816f-4c329264a828")
 GROK_REFRESH_MARGIN = max(300, env_int("GROK_REFRESH_MARGIN", 3600))
 GROK_TIMEOUT = max(10, env_int("GROK_TIMEOUT", 300))
 
+# ---- openai 渠道(ChatGPT 订阅号,走 Codex 那条 Responses 端点)----
+# 只列订阅额度认得的模型。Codex 家族以外的名字(如 gpt-4o)拿订阅号调会被上游拒。
+OPENAI_MODELS = env("OPENAI_MODELS", "gpt-5.4,gpt-5.4-mini,gpt-5.3-codex")
+# 上游根地址。真实路径是在它后面拼 /responses,留成可配是为了换镜像时不必改代码。
+OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://chatgpt.com/backend-api/codex")
+OPENAI_TOKEN_ENDPOINT = env("OPENAI_TOKEN_ENDPOINT", "https://auth.openai.com/oauth/token")
+# Codex CLI 的公开 client id。订阅号的 refresh 流程只认它,换不了。
+OPENAI_CLIENT_ID = env("OPENAI_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
+# access_token 实测很短命(几小时)。提前半小时刷,比等到快过期再刷安全 —— 巡检是
+# 半小时一轮,提前量小于巡检周期就等于「这一轮不刷,下一轮已经过期了」。
+OPENAI_REFRESH_MARGIN = max(300, env_int("OPENAI_REFRESH_MARGIN", 1800))
+OPENAI_TIMEOUT = max(10, env_int("OPENAI_TIMEOUT", 300))
+# 上游按 User-Agent / version 头认 CLI 版本,太旧会被拒。跟着上游走。
+OPENAI_CLI_VERSION = env("OPENAI_CLI_VERSION", "0.125.0")
+
+# ---- claude 渠道(Anthropic 订阅号)----
+CLAUDE_MODELS = env("CLAUDE_MODELS",
+                    "claude-opus-4-8,claude-sonnet-5,claude-sonnet-4-6,claude-haiku-4-5")
+CLAUDE_BASE_URL = env("CLAUDE_BASE_URL", "https://api.anthropic.com")
+CLAUDE_TOKEN_ENDPOINT = env("CLAUDE_TOKEN_ENDPOINT",
+                            "https://platform.claude.com/v1/oauth/token")
+# Claude Code 的公开 client id(公共 PKCE 客户端,没有 client secret)。
+CLAUDE_CLIENT_ID = env("CLAUDE_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+CLAUDE_REFRESH_MARGIN = max(300, env_int("CLAUDE_REFRESH_MARGIN", 1800))
+CLAUDE_TIMEOUT = max(10, env_int("CLAUDE_TIMEOUT", 300))
+# 订阅号只认 Claude Code 这个客户端。版本号会随上游轮换,过期表现为 403。
+CLAUDE_CLI_VERSION = env("CLAUDE_CLI_VERSION", "2.1.161")
+
 # MagicPatterns 的 reasoningContent 是上游真实思考流；Anthropic 客户端可选择接收 thinking SSE。
 ANTHROPIC_EXPOSE_REASONING = env_bool("ANTHROPIC_EXPOSE_REASONING", True)
 

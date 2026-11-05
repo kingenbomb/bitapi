@@ -7,8 +7,13 @@ bit-api 统一网关 —— FastAPI:OpenAI 端点 + 管理 API + 上报。
   POST /v1/messages           Anthropic Messages 兼容(内部归一到 OpenAI 执行层)
   GET  /v1/models             聚合所有 channel 的模型
   GET  /admin/stats           各渠道号池统计
-  GET  /admin/accounts        账号列表
+  GET  /admin/accounts        账号列表(筛选 / 排序 / 分页)
   POST /admin/accounts        本地注册 worker 上报入库
+  POST /admin/accounts/bulk   批量启用/停用调度、重置状态、删除
+  POST /admin/accounts/import 通用凭据导入(各 adapter 自己解释 shape)
+  GET  /admin/accounts/export 导出 JSON(含凭据)
+  POST /admin/accounts/test   单账号发一条真请求,回上游原话
+  GET  /admin/accounts/stats  按账号的用量 / 余额 / 最近使用
 """
 import asyncio
 import json
@@ -33,6 +38,7 @@ from core.adapter import (GenerationSubmittedError, all_adapters,
                           enabled_adapters, get_adapter, model_routes,
                           model_to_channel)
 from core.pool_state import DB, POOL, import_keys, parse_keys
+from core.pool import persist_runtime_meta
 from core.scheduler import scan_once, scanner_loop
 from core.portal_state import (BILLING, apply_channel_switches,
                                ensure_default_group,
@@ -46,6 +52,8 @@ from routers.portal import (community_oauth_callback as portal_community_callbac
 
 # 触发 adapter 注册(import 即注册)。加渠道照 docs/adapters.md 往这里加一行。
 import adapters.grok  # noqa: F401  (xAI 官方接口,自持 OAuth 续期)
+import adapters.openai  # noqa: F401  (ChatGPT 订阅号,Codex Responses 端点)
+import adapters.claude  # noqa: F401  (Anthropic 订阅号,Messages 端点)
 
 
 @asynccontextmanager
@@ -422,7 +430,7 @@ def list_models(authorization: str = Header(None), x_api_key: str = Header(None,
     return {"object": "list", "data": data}
 
 
-def _nonstream_via(channel, adapter, routed):
+def _nonstream_via(channel, adapter, routed, holder=None):
     """在一个渠道上完成一次非流式请求。返回 (response, upstream_usage)。
 
     upstream_usage 只在上游真的给了 usage 时非空。响应体里的 usage 可能是估算值
@@ -437,7 +445,7 @@ def _nonstream_via(channel, adapter, routed):
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"proxy error: {e}") from e
         return resp, (resp.get("usage") if isinstance(resp, dict) else None)
-    reply = _sync(adapter, channel, messages, model, routed)
+    reply = _sync(adapter, channel, messages, model, routed, holder=holder)
     if reply.get("raw") and not virtual:
         raw = scrubmod.scrub_raw(reply["raw"])
         return raw, (raw.get("usage") if isinstance(raw, dict) else None)
@@ -478,7 +486,7 @@ def _openai_nonstream(body, served=None):
     last_exc = None
     for i, (channel, adapter) in enumerate(routes):
         try:
-            resp, upstream_usage = _nonstream_via(channel, adapter, routed)
+            resp, upstream_usage = _nonstream_via(channel, adapter, routed, holder=served)
         except HTTPException as e:
             if e.status_code in _FAILOVER_STATUS and i < len(routes) - 1:
                 print(f"[route] {routed['model']} 在 {channel} 失败({e.status_code}),"
@@ -566,6 +574,8 @@ def _openai_stream(body, usage_holder=None):
         if usage_holder is not None:
             if served.get("channel"):
                 usage_holder["channel"] = served["channel"]
+            if served.get("account_id"):
+                usage_holder["account_id"] = served["account_id"]
             if not served.get("upstream_usage"):
                 # 合成终止帧里的 usage 是给客户端看的估算值,不能冒充上游真实值;
                 # 计量层自己会算同一个估算数并如实标 estimate
@@ -617,6 +627,8 @@ def _billed_stream(inner, usage_holder, settle):
       - **客户端断连后不 break**,继续排空上游把 usage 合并完
         (否则上游照常计费而平台漏记)
       - 无论何种结局都在最后调 settle(结算幂等由 request_id 保证)
+      - 顺手把这次观察到的账号运行时状态(用量窗口)落盘 —— 与计费同一次收尾,
+        但两者互不依赖:没有 user 的请求(内部 master key)也要更新窗口
     """
     usage_holder["_t0"] = time.time()
     end_reason = "eof"
@@ -685,7 +697,8 @@ def chat_completions(body: dict, request: Request, authorization: str = Header(N
             duration_ms=elapsed_ms,
             request_id=request_id, end_reason="done",
             # 非流协议在完整 JSON 返回前没有可见 token，首字即响应到达。
-            first_token_ms=elapsed_ms)
+            first_token_ms=elapsed_ms,
+            account_id=served.get("account_id"))
     return resp
 
 
@@ -720,7 +733,8 @@ def _stream_chat_billed(body, user, group, channel, adapter, messages, model,
             stream=True,
             duration_ms=int((time.time() - started) * 1000),
             request_id=request_id, end_reason=end_reason,
-            first_token_ms=usage_holder.get("frt_ms"))
+            first_token_ms=usage_holder.get("frt_ms"),
+            account_id=usage_holder.get("account_id"))
 
     return StreamingResponse(
         _billed_stream(_openai_stream(body, usage_holder), usage_holder, settle),
@@ -1079,7 +1093,8 @@ def messages_api(body: dict, request: Request, authorization: str = Header(None)
                 stream=True,
                 duration_ms=int((time.time() - started) * 1000),
                 request_id=request_id, end_reason=end_reason,
-                first_token_ms=usage_holder.get("frt_ms"))
+                first_token_ms=usage_holder.get("frt_ms"),
+                account_id=usage_holder.get("account_id"))
 
         return StreamingResponse(
             _billed_stream(
@@ -1101,7 +1116,8 @@ def messages_api(body: dict, request: Request, authorization: str = Header(None)
             stream=False,
             duration_ms=elapsed_ms,
             request_id=request_id, end_reason="done",
-            first_token_ms=elapsed_ms)
+            first_token_ms=elapsed_ms,
+            account_id=served.get("account_id"))
     return _anthropic_message_from_openai(openai_resp, model, request_messages=req_messages)
 
 
@@ -1121,25 +1137,54 @@ def _upstream_failed(channel, model, error, kind="error"):
          kind=kind)
 
 
-def _sync(adapter, channel, messages, model, body=None, max_switch=6):
-    """非流式:取号 → chat,空回复/失败切号重试。返回 {content, reasoning, raw}。"""
+def _remember_window(adapter, acct_id, headers=None, patch=None):
+    """把上游给的用量窗口落到这个号上。
+
+    **在观察到的当下写,不攒到请求结束** —— 请求失败时结算那段根本不会跑到,
+    而 429 的响应头恰恰是最该记的那一份(窗口打满上游才回 429)。攒到最后写
+    等于「越是想看清楚的号,面板上的数越旧」。
+
+    写库有节流(core.pool.persist_runtime_meta),所以一次请求重试六次也只落一次。
+    """
+    if not acct_id:
+        return
+    if patch is None:
+        if headers is None:
+            return
+        patch = adapter.window_meta(headers)
+    if patch:
+        persist_runtime_meta(DB, acct_id, patch)
+
+
+def _sync(adapter, channel, messages, model, body=None, max_switch=6, holder=None):
+    """非流式:取号 → chat,空回复/失败切号重试。返回 {content, reasoning, raw}。
+
+    holder 传了就被写上实际作答的账号 id(计费与「按号统计」要记真正花了钱的
+    那个号,不是请求开始时猜的)。换号重试时后写的覆盖前写的,与 channel 同口径。
+    """
     last_err = None
     last_kind = None
     for _ in range(max_switch):
         acct = POOL.get_valid_account(channel, adapter)
         if not acct:
             raise HTTPException(status_code=503, detail=f"no available account for {channel}")
+        if holder is not None:
+            holder["account_id"] = acct["id"]
         try:
-            content, reasoning, raw, usage = _norm(
-                adapter.chat(acct, messages, stream=False, model=model, body=body))
+            result = adapter.chat(acct, messages, stream=False, model=model, body=body)
+            content, reasoning, raw, usage = _norm(result)
         except Exception as e:
             last_err = str(e)
+            _remember_window(adapter, acct["id"], headers=getattr(e, "headers", None))
             last_kind = POOL.mark_failure(
                 acct["id"], e, dead=getattr(adapter, "exhausted_is_dead", False),
                 adapter=adapter)
             continue
+        if isinstance(result, dict) and result.get("meta"):
+            _remember_window(adapter, acct["id"], patch=result["meta"])
         if content or raw:
-            return {"content": content, "reasoning": reasoning, "raw": raw, "usage": usage}
+            return {"content": content, "reasoning": reasoning, "raw": raw,
+                    "usage": usage}
         POOL.mark_exhausted(acct["id"], dead=getattr(adapter, "exhausted_is_dead", False),
                             adapter=adapter)  # 空回复,换号
     # 全是上游限流时如实回 429:客户端 SDK 见 429 会自己退避重试,回 502 只会让它
@@ -1217,12 +1262,17 @@ def _stream_sse(adapter, channel, model, body, max_switch=6, usage_holder=None):
         acct = POOL.get_valid_account(channel, adapter)
         if not acct:
             return False
+        if usage_holder is not None:
+            usage_holder["account_id"] = acct["id"]
         q = queue.Queue()
         err = {}
+        facts = {}      # worker 线程写、主线程读 —— 不直接改 usage_holder,免得两个线程同时碰它
 
-        def worker(acct=acct, q=q, err=err):
+        def worker(acct=acct, q=q, err=err, facts=facts):
             try:
-                adapter.stream_chat(acct, model, body, on_sse=lambda l: q.put(l))
+                r = adapter.stream_chat(acct, model, body, on_sse=lambda l: q.put(l))
+                if isinstance(r, dict) and r.get("meta"):
+                    facts["meta"] = r["meta"]
             except Exception as e:
                 err["e"] = e
             finally:
@@ -1241,12 +1291,15 @@ def _stream_sse(adapter, channel, model, body, max_switch=6, usage_holder=None):
             yield _scrub_sse(item)
         th.join(timeout=1)
         if got:
+            _remember_window(adapter, acct["id"], patch=facts.get("meta"))
             return True
         # 一个 SSE 都没吐:上游异常时按异常性质落状态(超时/5xx 只冷却),
         # 无异常的空流才算额度耗尽。
         dead = getattr(adapter, "exhausted_is_dead", False)
         if err.get("e") is not None:
             print(f"[stream] {channel} 上游异常: {err['e']}", flush=True)
+            _remember_window(adapter, acct["id"],
+                             headers=getattr(err["e"], "headers", None))
             POOL.mark_failure(acct["id"], err["e"], dead=dead, adapter=adapter)
             last_err = err["e"]
         else:
@@ -1296,9 +1349,11 @@ def _stream(adapter, channel, messages, model, body=None, max_switch=6, usage_ho
         acct = POOL.get_valid_account(channel, adapter)
         if not acct:
             return False
+        if usage_holder is not None:
+            usage_holder["account_id"] = acct["id"]
         q = queue.Queue()
         result = {"raw": None, "content": None, "reasoning": None,
-                  "usage": None, "err": None}
+                  "usage": None, "meta": None, "err": None}
 
         def worker(acct=acct, q=q, result=result):
             try:
@@ -1309,6 +1364,7 @@ def _stream(adapter, channel, messages, model, body=None, max_switch=6, usage_ho
                     result["content"] = r.get("content")
                     result["reasoning"] = r.get("reasoning")
                     result["usage"] = r.get("usage")
+                    result["meta"] = r.get("meta")
             except Exception as e:
                 result["err"] = e
             finally:
@@ -1359,11 +1415,14 @@ def _stream(adapter, channel, messages, model, body=None, max_switch=6, usage_ho
             if result["err"] is None:
                 completed = True
                 final_usage = result["usage"]
+                _remember_window(adapter, acct["id"], patch=result.get("meta"))
             break
         # 什么都没吐出来:上游异常按性质落状态,无异常的空回复才算额度耗尽。
         dead = getattr(adapter, "exhausted_is_dead", False)
         if result["err"] is not None:
             print(f"[stream] {channel} 上游异常: {result['err']}", flush=True)
+            _remember_window(adapter, acct["id"],
+                             headers=getattr(result["err"], "headers", None))
             POOL.mark_failure(acct["id"], result["err"], dead=dead, adapter=adapter)
             last_err = result["err"]
         else:
@@ -1713,7 +1772,8 @@ def responses_api(body: dict, request: Request, authorization: str = Header(None
                 request_messages=req_messages, output_text=usage_holder.get("text"),
                 stream=True, duration_ms=int((time.time() - started) * 1000),
                 request_id=request_id, end_reason=end_reason,
-                first_token_ms=usage_holder.get("frt_ms"))
+                first_token_ms=usage_holder.get("frt_ms"),
+                account_id=usage_holder.get("account_id"))
 
         return StreamingResponse(
             _billed_stream(
@@ -1731,13 +1791,14 @@ def responses_api(body: dict, request: Request, authorization: str = Header(None
             upstream_usage=served.get("upstream_usage"),
             request_messages=req_messages, output_text=_extract_output_text(chat),
             stream=False, duration_ms=elapsed_ms,
-            request_id=request_id, end_reason="done", first_token_ms=elapsed_ms)
+            request_id=request_id, end_reason="done", first_token_ms=elapsed_ms,
+            account_id=served.get("account_id"))
     return _openai_to_response(chat, body, model)
 
 
 # ---- 向量 ----
 
-def _embed_via(channel, adapter, body, max_switch=6):
+def _embed_via(channel, adapter, body, max_switch=6, holder=None):
     """在一个渠道上做一次 embeddings:取号 → adapter.embeddings,失败切号。
     与 _sync 同一套失败口径:没号 503、换遍号仍失败 502 / 429。"""
     if not callable(getattr(adapter, "embeddings", None)):
@@ -1748,6 +1809,8 @@ def _embed_via(channel, adapter, body, max_switch=6):
         acct = POOL.get_valid_account(channel, adapter)
         if not acct:
             raise HTTPException(status_code=503, detail=f"no available account for {channel}")
+        if holder is not None:
+            holder["account_id"] = acct["id"]
         try:
             return adapter.embeddings(acct, body)
         except Exception as e:
@@ -1783,8 +1846,9 @@ def embeddings_api(body: dict, request: Request, authorization: str = Header(Non
     started = time.time()
     last_exc = None
     for i, (channel, adapter) in enumerate(routes):
+        served = {}
         try:
-            resp = _embed_via(channel, adapter, routed)
+            resp = _embed_via(channel, adapter, routed, holder=served)
         except HTTPException as e:
             if e.status_code in _FAILOVER_STATUS and i < len(routes) - 1:
                 last_exc = e
@@ -1798,8 +1862,9 @@ def embeddings_api(body: dict, request: Request, authorization: str = Header(Non
                                    "content": _embedding_input_text(body.get("input"))}],
                 output_text="", stream=False,
                 duration_ms=int((time.time() - started) * 1000),
-                request_id=_request_id(), end_reason="done")
-        return resp
+                request_id=_request_id(), end_reason="done",
+                account_id=served.get("account_id"))
+            return resp
     raise last_exc
 
 
@@ -1822,31 +1887,216 @@ def admin_stats(authorization: str = Header(None)):
     channels = {}
     for name, ad in all_adapters().items():
         channels[name] = {"models": ad.models, "capabilities": ad.capabilities,
-                          "columns": ad.columns}
+                          "columns": ad.columns,
+                          # 面板的导入弹窗按这个提示该粘什么形状的凭据。
+                          # 由渠道自己声明,面板里不写死渠道名。
+                          "credentials_hint": getattr(ad, "credentials_hint", "")}
     return {"channels": channels, "pool": DB.stats()}
 
 
 @app.get("/admin/accounts")
-def admin_accounts(channel: str = None, status: str = None,
+def admin_accounts(channel: str = None, status: str = None, q: str = None,
+                   schedulable: int = None, sort: str = None, order: str = "desc",
                    offset: int = 0, limit: int = 50,
                    authorization: str = Header(None)):
+    """号池列表。筛选 / 排序 / 分页都在服务端做 —— 号池上万行时,把全量丢给浏览器
+    再筛,面板会卡在渲染上,而且「总共多少条」也得先全拿到才知道。
+
+    schedulable 传 1/0 只看在池的 / 被摘出的;不传就都看。
+    """
     _check(authorization, config.ADMIN_KEY)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
+    q = (q or "").strip() or None
     adapter = get_adapter(channel) if channel else None
     if adapter and hasattr(adapter, "sync_runtime"):
         adapter.sync_runtime(DB)
-    accts = DB.list_accounts(channel=channel, status=status, limit=limit, offset=offset)
+    accts = DB.list_accounts(channel=channel, status=status, q=q,
+                             schedulable=schedulable, sort=sort, order=order,
+                             limit=limit, offset=offset)
     if adapter and hasattr(adapter, "decorate_accounts"):
         adapter.decorate_accounts(accts)
-    # 脱敏:不返回 secret/token 明文
+    # 脱敏:不返回 secret/token 明文(导出端点才是拿凭据的地方,那条路有单独的确认)
     for a in accts:
         a.pop("secret", None)
         if a.get("token"):
             a["token"] = a["token"][:12] + "..."
-    total = DB.count_accounts(channel=channel, status=status)
-    return {"accounts": accts, "count": len(accts),
-            "total": total, "offset": offset, "limit": limit}
+    total = DB.count_accounts(channel=channel, status=status, q=q,
+                              schedulable=schedulable)
+    return {"accounts": accts, "count": len(accts), "total": total,
+            "offset": offset, "limit": limit, "sort": sort, "order": order}
+
+
+@app.post("/admin/accounts/bulk")
+async def admin_accounts_bulk(request: Request, authorization: str = Header(None)):
+    """批量操作。body: {ids:[...], action:"enable"|"disable"|"reset"|"delete"}。
+
+    只认传进来的 id,没有「按筛选条件批量删」这条路 —— 那是没有边界的写操作,
+    而面板上选中的是哪几行,操作的人自己看得见。按条件改请看「批量编辑」那种
+    带预览的形态。
+    """
+    _check(authorization, config.ADMIN_KEY)
+    body = await request.json()
+    ids = body.get("ids") or []
+    action = str(body.get("action") or "").strip()
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids required")
+    if action in ("enable", "disable"):
+        done = DB.set_schedulable(ids, action == "enable")
+        return {"ok": True, "action": action, "count": len(done), "ids": done}
+    if action == "reset":
+        # 重置状态 = 让号回到「待检」,由下一轮巡检按真实情况重新定级。
+        # 直接写 active 等于替巡检下结论,而我们对这个号此刻如何一无所知。
+        return {"ok": True, "action": action,
+                "count": DB.set_statuses(ids, dbmod.ST_UNCHECKED)}
+    if action == "delete":
+        return {"ok": True, "action": action, "count": DB.delete_ids(ids)}
+    raise HTTPException(status_code=400, detail=f"unknown action: {action}")
+
+
+@app.post("/admin/accounts/import")
+async def admin_accounts_import(request: Request, authorization: str = Header(None)):
+    """通用导入。body: {channel, accounts: <dict> | [dict] | {accounts:[...]}}。
+
+    每个 item 交给 adapter.import_account —— 凭据长什么样、哪些字段必须有,由
+    渠道自己说。加一个渠道不必回来改这里(docs/adapters.md 承诺的那件事)。
+    """
+    _check(authorization, config.ADMIN_KEY)
+    body = await request.json()
+    channel = body.get("channel")
+    ad = get_adapter(channel)
+    if not ad:
+        raise HTTPException(status_code=400, detail=f"unknown channel: {channel}")
+    if not callable(getattr(ad, "import_account", None)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{channel} 不支持凭据导入,key 池型渠道请用 /admin/import-keys")
+    items = body.get("accounts")
+    if items is None:
+        items = body.get("data")
+    if isinstance(items, dict) and "accounts" in items:
+        items = items["accounts"]
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="accounts required")
+
+    imported, skipped, errs = [], [], []
+    for idx, it in enumerate(items):
+        try:
+            action, identity = ad.import_account(DB, it)
+            # 导出 → 导入要能原样还原。status / schedulable 是站长的决定
+            # (哪些号被摘出、哪些被标停用),恢复时被悄悄抹掉就等于换了一批号。
+            if isinstance(it, dict) and "schedulable" in it:
+                row = DB.get_by_identity(channel, identity)
+                if row:
+                    DB.update_account(row["id"],
+                                      schedulable=1 if it["schedulable"] else 0)
+            (imported if action == "imported" else skipped).append(identity)
+        except Exception as e:
+            # 失败那一条标出是哪一条:凭据坏掉时 import_account 还没来得及算出
+            # identity,只能从原始 item 里挑几个像身份的字段兜底。
+            label = ""
+            if isinstance(it, dict):
+                sec = it.get("secret") if isinstance(it.get("secret"), dict) else it
+                label = str(sec.get("email") or it.get("identity")
+                            or sec.get("account_uuid")
+                            or sec.get("chatgpt_account_id") or "").strip()
+            errs.append(f"#{idx + 1} {label + ': ' if label else ''}{e}")
+    return {"ok": True, "channel": channel, "imported": imported,
+            "skipped": skipped, "count": len(imported),
+            "skipped_count": len(skipped), "errors": errs}
+
+
+@app.get("/admin/accounts/export")
+def admin_accounts_export(channel: str = None, ids: str = None,
+                          authorization: str = Header(None)):
+    """导出 JSON(**含凭据**)。ids 给了就只导这几行,否则按 channel / 全量。
+
+    这是唯一会吐出 secret 明文的读端点,和 `/admin/accounts` 的脱敏故意相反 ——
+    备份与迁移要的就是能原样导回去的那份。面板点它之前会先弹一次确认。
+    """
+    _check(authorization, config.ADMIN_KEY)
+    id_list = [int(x) for x in str(ids or "").replace(" ", "").split(",") if x.strip().isdigit()]
+    rows = DB.list_accounts(channel=channel, ids=id_list or None, limit=100000)
+    keep = ("channel", "identity", "secret", "meta", "token", "token_exp",
+            "balance", "status", "schedulable", "last_check", "last_used")
+    accounts = [{k: r.get(k) for k in keep} for r in rows]
+    return {"exported_at": int(time.time()), "count": len(accounts),
+            "accounts": accounts}
+
+
+@app.post("/admin/accounts/test")
+async def admin_accounts_test(request: Request, authorization: str = Header(None)):
+    """单账号测试:拿这个号发一条真请求,把上游原话回显给面板。
+
+    body: {channel, identity} 或 {id},可选 model / prompt。
+    与网关同一条 adapter 路径(adapter.test_account → chat),所以「测试通过」
+    和「真能调通」说的是同一件事。不计费、不进 usage_logs —— 这是运维动作。
+    """
+    _check(authorization, config.ADMIN_KEY)
+    body = await request.json()
+    acct = None
+    if body.get("id"):
+        acct = DB.get_account(int(body["id"]))
+    elif body.get("channel") and body.get("identity"):
+        acct = DB.get_by_identity(body["channel"], body["identity"])
+    if not acct:
+        raise HTTPException(status_code=404, detail="account not found")
+    ad = get_adapter(acct["channel"])
+    if not ad or not callable(getattr(ad, "test_account", None)):
+        raise HTTPException(status_code=400,
+                            detail=f"{acct['channel']} 不支持账号测试")
+    started = time.time()
+    try:
+        result = await asyncio.to_thread(ad.test_account, acct,
+                                         body.get("model"), body.get("prompt"))
+    except Exception as e:
+        # 上游原话逐字带回面板:是 401(号坏了)还是 503(上游此刻不好),
+        # 站长要自己看得见,不能只给一句「测试失败」。
+        detail = getattr(e, "detail", None) or str(e)
+        # 失败也带响应头 —— 窗口打满时上游回 429,最新的百分比就在那个头里,
+        # 而「测试」正是站长发现调不动时第一个会点的按钮。
+        if getattr(e, "headers", None) is not None:
+            persist_runtime_meta(DB, acct["id"], ad.window_meta(e.headers))
+        return {"ok": False, "channel": acct["channel"],
+                "identity": acct["identity"], "code": getattr(e, "code", 0),
+                "ms": int((time.time() - started) * 1000), "error": str(detail)[:1000]}
+    if result.get("meta"):
+        persist_runtime_meta(DB, acct["id"], result["meta"])
+    return {"ok": True, "channel": acct["channel"], "identity": acct["identity"],
+            "model": result.get("model"), "ms": result.get("ms"),
+            "text": result.get("text"), "reasoning": result.get("reasoning"),
+            "usage": result.get("usage")}
+
+
+@app.get("/admin/accounts/stats")
+def admin_accounts_stats(channel: str = None, ids: str = None, days: int = 7,
+                         authorization: str = Header(None)):
+    """按账号的用量 / 最近使用。余额与状态直接从 accounts 行上带出。
+
+    用量来自 usage_logs.account_id —— 加这一列之前的历史日志归属不到号上,
+    那些不计入(算进去就是编数)。days 给的是统计窗口。
+    """
+    _check(authorization, config.ADMIN_KEY)
+    from core.portal_state import USER_DB
+    id_list = [int(x) for x in str(ids or "").replace(" ", "").split(",") if x.strip().isdigit()]
+    rows = DB.list_accounts(channel=channel, ids=id_list or None, limit=1000)
+    since = int(time.time()) - max(1, min(days, 90)) * 86400
+    usage = USER_DB.account_usage([r["id"] for r in rows], since=since)
+    out = []
+    for r in rows:
+        u = usage.get(r["id"]) or {}
+        out.append({
+            "id": r["id"], "channel": r["channel"], "identity": r["identity"],
+            "status": r["status"], "schedulable": r["schedulable"],
+            "balance": r["balance"], "last_used": r["last_used"],
+            "last_check": r["last_check"],
+            "requests": u.get("reqs", 0), "input_tokens": u.get("in_tok", 0),
+            "output_tokens": u.get("out_tok", 0), "cost": u.get("cost", 0.0),
+            "avg_ms": int(u.get("avg_ms") or 0), "last_at": u.get("last_at") or 0,
+        })
+    return {"days": days, "since": since, "stats": out}
 
 
 @app.post("/admin/accounts")
@@ -1968,31 +2218,6 @@ async def admin_delete_account(channel: str, identity: str, authorization: str =
     else:
         DB.delete_account(channel, identity)
     return {"ok": True, "channel": channel, "identity": identity}
-
-
-@app.post("/admin/grok/import")
-async def admin_grok_import(request: Request, authorization: str = Header(None)):
-    """导入 grok OAuth 号(单个 dict / 列表 / {accounts:[...]}) → 写 auths 文件 + 入库。"""
-    _check(authorization, config.ADMIN_KEY)
-    ad = get_adapter("grok")
-    if not ad:
-        raise HTTPException(status_code=400, detail="grok adapter not loaded")
-    body = await request.json()
-    if isinstance(body, dict) and "accounts" in body:
-        items = body["accounts"]
-    elif isinstance(body, list):
-        items = body
-    else:
-        items = [body]
-    imported, skipped, errs = [], [], []
-    for it in items:
-        try:
-            action, email = ad.import_account(DB, it)
-            (imported if action == "imported" else skipped).append(email)
-        except Exception as e:
-            errs.append(str(e))
-    return {"ok": True, "imported": imported, "skipped": skipped,
-            "count": len(imported), "skipped_count": len(skipped), "errors": errs}
 
 
 GEN_MAX_N = 4        # 一次生成的张数上限

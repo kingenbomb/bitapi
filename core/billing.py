@@ -258,7 +258,8 @@ class Billing:
     def record_usage(self, user, group, channel, model, adapter=None,
                      upstream_usage=None, request_messages=None, output_text=None,
                      stream=False, duration_ms=0, units=1,
-                     request_id=None, end_reason=None, first_token_ms=None):
+                     request_id=None, end_reason=None, first_token_ms=None,
+                     account_id=None):
         """写 usage_logs 并按策略扣费。返回 usage_log 的 id(重复结算返回既有 id)。
 
           adapter          : 命中的 adapter(读 billing_mode 作计量提示)
@@ -269,6 +270,8 @@ class Billing:
           request_id       : 幂等键来源。同一 request_id 重复结算只扣一次
           end_reason       : done | eof | client_gone | scanner_error | error
           first_token_ms   : 首字延迟(ms),流式争议时的复盘依据
+          account_id       : 实际作答的号池账号(accounts.id)。面板按号统计靠它,
+                             不参与计费 —— 归不到号上时传 None,日志照写。
 
         透支策略(对齐 sub2api):不做额度预占,允许本次请求把余额扣成负数,
         保证进行中的请求能完成;下一次请求由 precheck 的 balance<=0 拦住。
@@ -320,7 +323,7 @@ class Billing:
 
         log_id = self.db.add_usage(
             user_id=user["id"], api_key_id=user.get("_api_key_id"),
-            channel=channel, model=model,
+            channel=channel, model=model, account_id=account_id,
             input_tokens=in_tok, output_tokens=out_tok,
             cost=cost, actual_cost=actual_cost, billing_mode=billing_mode,
             pricing_snapshot=snapshot, stream=stream,

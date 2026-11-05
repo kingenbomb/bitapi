@@ -204,9 +204,83 @@ curl -X POST http://127.0.0.1:8080/admin/accounts \
        "secret":{"password":"x"},"token":"...","token_exp":1799999999}'
 ```
 
-**3. 实现 `sync_pool(db)`**（号在文件系统或外部系统里，adapter 自己同步进 DB）
+**3. 凭据导入**（订阅号型渠道：一个号一份 OAuth 凭据，形状由渠道自己定）
+
+让 adapter 实现 `import_account(db, item)`，管理台「导入账号」与 `POST /admin/accounts/import` 都会走它：
+
+```python
+def import_account(self, db, item):
+    """返回 (action, identity)，action ∈ {"imported", "skipped"}。
+    凭据必须核完再入库 —— 少一个 refresh_token 就是一颗几小时后才炸的雷。"""
+```
+
+凭据存 `accounts.secret`，**库是唯一真源**：导入之后不再读任何外部文件、任何外部系统。
+`GET /admin/accounts/export` 导出的就是同一份形状，能原样导回来。
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/accounts/import \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{"channel":"myprovider","accounts":[{"refresh_token":"...","email":"a@b.com"}]}'
+```
+
+一条坏的不影响整批：端点逐条捕获并把「#几条、哪个身份、什么错」交回界面。
+
+**4. 实现 `sync_pool(db)`**（号在文件系统或外部系统里，adapter 自己同步进 DB）
 
 若要接一个有外部号源的渠道（比如号是一批本地文件），可以让 adapter 提供 `sync_pool(db)`：用 mtime 做增量同步、批量 upsert，万级文件也不卡 CPU，巡检会跳过它的逐号网络探测。
+
+## 让管理台认得你的渠道
+
+面板（`/admin/ui`）不认渠道名，只读 adapter 声明的东西。加一个渠道不用碰 `dashboard.html`。
+
+| 声明 | 面板拿它做什么 |
+|---|---|
+| `columns` | 表头。`key` 支持点号路径（`meta.plan` 读 `accounts.meta.plan`），`type ∈ text / time / money / credits` 决定怎么格式化 |
+| `capabilities` | 卡片上那行字；有 `balance` 才会显示「余额合计」 |
+| `models` | 卡片右上角的模型数 |
+| `test_account(acct, model=None)` | 「测试」按钮。**默认实现已够用**（发一句 `hi` 走 `chat()`，不计费），只有需要预热、探测特殊端点时才覆盖 |
+| `decorate_accounts(accts)` | 列表返回前的最后一手：补展示字段、抹掉不该外泄的字段 |
+
+**「可调度」是核心的，不是 adapter 的。** `accounts.schedulable` 为 0 的号，取号、巡检、
+批量操作三条路一起跳过，状态字段一动不动 —— 它是站长的手动闸门，跟「这个号坏没坏」
+是两件事。所以面板上「可用 N」和「已摘出 M」分开显示：合起来看才对得上账。
+
+**续期要落盘。** `refresh_token()` 返回里带上 `secret` 就是「这份凭据变了，照它覆盖」：
+
+```python
+def refresh_token(self, acct):
+    got = <打上游的刷新接口>
+    new_secret = dict(self._secret(acct))
+    if got.get("refresh_token"):          # 有的上游会轮换，旧的当场作废
+        new_secret["refresh_token"] = got["refresh_token"]
+    return {"token": got["access_token"], "token_exp": exp, "secret": new_secret}
+```
+
+不返回 `secret` 就保持库里那份不动。**漏了这一步的后果是静默的**：下一轮刷新用旧
+refresh_token，直接 `invalid_grant`，而报错看上去像「上游挂了」。取号路径与巡检
+两条路都认这个契约（`core/pool.refresh_fields`）。
+
+**用量窗口。** 上游按滚动窗口限额的渠道（订阅号都是）实现 `window_meta(headers)`，
+面板上就有那两条进度条：
+
+```python
+def window_meta(self, headers):
+    return {"usage_5h": {"pct": 0.42, "reset_at": 1790000000},
+            "usage_7d": {"pct": 0.81},
+            "usage_updated_at": <unix 秒>}
+```
+
+`pct` 统一成 **0..1 的分数**（两边上游一个给百分数一个给分数，归一在这里做完，
+面板只乘 100 显示），`reset_at` 认不出来就别放这个键 —— 显示「未知」比显示一个
+错的时间好。列声明成 `{"key": "meta.usage_5h", "label": "5h 窗口", "type": "window"}`。
+
+返回值经 `chat()` 的 `"meta"` 键（或 `stream_chat()` 的 `{"meta": ...}` 返回值）
+交给核心写库，**在观察到的当下就写**：请求失败时结算那段根本不会跑到，而窗口打满
+上游回 429 的那份响应头恰恰是最该记的。写库有节流（`core/pool.persist_runtime_meta`），
+一次请求重试六次也只落一次。
+
+上游把窗口打在响应头里时，错误对象也请带上 `headers`（`raise MyError(code, body, headers=e.headers)`）——
+核心会在失败路径上把那份头也读一遍。
 
 ## 让用户能用上新模型
 
@@ -222,6 +296,8 @@ curl -X POST http://127.0.0.1:8080/admin/accounts \
 - [ ] `chat()` 非流式返回 `{"raw": ...}` 而不是裸字符串（这样 usage/tool_calls 不丢）
 - [ ] `capabilities` 只声明真正实现了的
 - [ ] `billing_mode` 与上游是否给 usage 一致
+- [ ] `refresh_token()` 会轮换上游凭据的话，返回值里带上新的 `secret`（见上）
+- [ ] 凭据导入型的渠道实现了 `import_account`，且把「少一个必需字段」当错抛出来
 - [ ] 上游报错时抛异常（核心会切号重试），别静默返回空
 - [ ] 抛出的异常带得上上游状态码（`e.code`），失败分类靠它区分「key 坏了」和「上游此刻不好」
 - [ ] key 长期有效、无 token/余额/配额的渠道声明了 `stateless_keys = True`

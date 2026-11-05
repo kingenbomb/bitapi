@@ -56,6 +56,51 @@ def _stateless(adapter):
     return bool(getattr(adapter, "stateless_keys", False))
 
 
+def refresh_fields(upd, acct):
+    """adapter.refresh_token 的返回值 → update_account 的字段。
+
+    轮换必须落盘。有的上游(实测 xAI、OpenAI、Anthropic 都是)刷新时会把旧的
+    refresh_token 作废并发一把新的,只写 token 不写 secret 的话,库里的
+    refresh_token 就是下一轮必然 invalid_grant 的那把 —— 号会安静地过期,而且
+    报错看上去像「上游挂了」。adapter 返回 secret 就是这个意思:
+    「这份凭据变了,照它覆盖」。
+
+    没返回 secret 的 adapter(或没换的那种)保持库里那份不动。
+    """
+    fields = {"token": upd["token"], "token_exp": upd.get("token_exp", 0),
+              "meta": upd.get("meta", acct.get("meta"))}
+    if upd.get("secret"):
+        fields["secret"] = upd["secret"]
+    return fields
+
+
+# 用量窗口这类运行时状态的写库节流(秒)。上游每几秒就把窗口数往上抬一点,
+# 每次请求都写等于把库当日志用 —— 而面板上「42% 还是 43%」没有区别。
+META_WRITE_INTERVAL = 60
+
+
+def persist_runtime_meta(db, acct_id, patch, min_interval=META_WRITE_INTERVAL):
+    """把 adapter 观察到的账号运行时状态(用量窗口)合并进 accounts.meta。
+
+    节流靠补丁自带的 usage_updated_at,不靠进程内的「上次写是什么时候」——
+    那样重启就归零,多 worker 还会各写各的。库里的那份时间戳就是唯一的判据。
+
+    返回是否真的写了。
+    """
+    if not patch or not acct_id:
+        return False
+    acct = db.get_account(acct_id)
+    if not acct:
+        return False
+    meta = dict(acct.get("meta") or {})
+    fresh = patch.get("usage_updated_at") or 0
+    if fresh and fresh - (meta.get("usage_updated_at") or 0) < min_interval:
+        return False
+    meta.update(patch)
+    db.update_account(acct_id, meta=meta)
+    return True
+
+
 class Pool:
     def __init__(self, db, min_balance=0.05, refresh_margin=600):
         self.db = db
@@ -82,14 +127,14 @@ class Pool:
                     try:
                         upd = adapter.refresh_token(acct)
                         self.db.update_account(
-                            acct["id"], token=upd["token"],
-                            token_exp=upd.get("token_exp", 0),
-                            meta=upd.get("meta", acct.get("meta")),
+                            acct["id"], **refresh_fields(upd, acct),
                             status=dbmod.ST_ACTIVE)
                         acct["token"] = upd["token"]
                         acct["token_exp"] = upd.get("token_exp", 0)
                         if upd.get("meta"):
                             acct["meta"] = upd["meta"]
+                        if upd.get("secret"):
+                            acct["secret"] = upd["secret"]
                     except Exception as e:
                         self.mark_failure(acct["id"], e, adapter=adapter)
                         continue
@@ -116,6 +161,7 @@ class Pool:
             # 所以这里给这类渠道补一次轮换。
             if not adapter.has(CAP_BALANCE) and not adapter.has(CAP_HEALTH):
                 self._rotate(acct["id"])
+            self.db.touch_used(acct["id"])
             return acct
         emit("pool.empty", channel=channel, reason="all_tries_failed")
         return None

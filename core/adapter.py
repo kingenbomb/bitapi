@@ -7,6 +7,7 @@ Adapter 抽象基类 + 注册表。
 调度器和面板读 capabilities/columns 动态适配,加新网站零改动主程序。
 """
 import random
+import time
 from abc import ABC
 
 # 能力标记
@@ -15,6 +16,10 @@ CAP_BALANCE = "balance"         # 有余额/额度概念
 CAP_HEALTH = "health"           # 支持存活检测
 CAP_REGISTER = "auto_register"  # 支持自动注册补号
 CAP_CHAT = "chat"               # 支持对话(网关转发)
+
+# 管理台「测试账号」发的那句话。只验证这个号此刻出不出得来话,不评测模型,
+# 所以越短越省额度。
+TEST_PROMPT = "hi"
 
 # 计量模式(billing_mode)—— 决定该渠道的用量/token 从哪来,供计量层归一。
 #   upstream    = 上游返回标准 usage(官方 API 与正版反代),直接采信
@@ -34,6 +39,60 @@ class GenerationSubmittedError(RuntimeError):
         super().__init__(message)
 
 
+def _norm_chat_result(result):
+    """adapter.chat 的返回值归一 → (content, reasoning, raw, usage)。
+
+    server.py 里有一份同样的归一(_norm),但它属于网关那条路,不该被管理端点
+    import —— 这里再写一遍是因为形状是 chat() 的契约本身,不是谁私有的实现。
+    """
+    if isinstance(result, dict):
+        return (result.get("content", ""), result.get("reasoning"),
+                result.get("raw"), result.get("usage"))
+    return result or "", None, None, None
+
+
+def header_get(headers, name, default=None):
+    """大小写不敏感地取一个响应头。
+
+    http.client.HTTPMessage 本来就大小写不敏感,但测试与假 headers 是普通 dict。
+    头名的大小写是上游定的,不该让每个调用点自己去猜。
+    """
+    if headers is None:
+        return default
+    try:
+        v = headers.get(name)
+    except AttributeError:
+        return default
+    if v is not None:
+        return v
+    low = name.lower()
+    for k, val in getattr(headers, "items", lambda: [])():
+        if str(k).lower() == low:
+            return val
+    return default
+
+
+def to_unix(value):
+    """上游给的过期/重置时间 → unix 秒。认不出来返回 0。
+
+    同一个上游不同端点给的格式都不一样(数字、数字串、带 Z 的 ISO8601),
+    「认不出来就当没有」比猜一个时间安全 —— 猜错了会显示成「刚重置过」。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        pass
+    try:
+        import datetime
+        return int(datetime.datetime.fromisoformat(
+            s.replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return 0
+
+
 class Adapter(ABC):
     # --- 子类必须覆盖 ---
     name = "base"                 # channel 名(唯一)
@@ -45,6 +104,9 @@ class Adapter(ABC):
     streaming = False             # True=取号后自产 OpenAI SSE(navos),实现 stream_chat
     exhausted_is_dead = False     # 额度耗尽是否视为永久失效(由渠道声明)
     billing_mode = BILL_ESTIMATE  # 计量模式(见 BILL_* 常量);逆向渠道默认估算
+    # 管理台「导入账号」弹窗里那句提示:这个渠道认什么形状的凭据。
+    # 由渠道自己说 —— 面板里写死渠道名的话,加一个渠道就得回去改 HTML。
+    credentials_hint = ""
     # True = 透传型 key 池:key 长期有效,没有 token/余额/配额这些我们能判的本地状态。
     # 这种渠道里「上游此刻不好」和「这把 key 坏了」是两件事,而我们只看得见前者 ——
     # 所以除了上游明说的凭据失效(401/402/403 与 terminal 标记),一律不改状态,只轮换。
@@ -76,6 +138,47 @@ class Adapter(ABC):
         """存活检测。返回 True/False。"""
         return True
 
+    def window_meta(self, headers):
+        """上游响应头 → 该账号的用量窗口状态(要合并进 accounts.meta 的补丁)。
+
+        纯函数,给一个 headers 就返回一个 dict。默认空 —— 上游没有窗口概念的
+        渠道什么都不用做,面板上也不会多出那两列。
+
+        **归一在这里做,不在面板做。** 两边上游的字段名长得完全不一样
+        (OpenAI 是 x-codex-primary/secondary-*,Claude 是 anthropic-ratelimit-
+        unified-5h/7d-*),而面板只该认一种形状 —— 把上游包装成 bit-api 认识的
+        样子,正是 adapter 的职责。统一后的形状:
+
+          {"usage_5h": {"pct": 0.42, "reset_at": <unix 秒>},
+           "usage_7d": {"pct": 0.81, "reset_at": <unix 秒>},
+           "usage_updated_at": <unix 秒>}
+
+        pct 是 0..1 的分数:OpenAI 给百分数、Claude 给分数,统一成分数,
+        面板只乘 100 显示。reset_at 认不出来就不放这个键 —— 显示「未知」
+        比显示一个错的时间好。
+        """
+        return {}
+
+    def test_account(self, acct, model=None, prompt=None):
+        """管理台「测试账号」:拿这个号发一条真请求,把上游原话与用量交回去。
+
+        默认实现走 chat() 非流式,所以声明了 CAP_CHAT 的渠道不用各写一份 ——
+        加渠道的人不该为了「面板上能测」再实现一个方法。上游异常原样往外抛
+        (带 .code),由端点转成界面上那行红字:是 401 还是 5xx,站长要看得见。
+
+        只读:测试不改账号状态。真坏了的话,下一次经过网关的请求会按同一套
+        classify_failure 落状态,不必让「看一眼」这个动作产生副作用。
+        """
+        model = model or (self.models or [None])[0]
+        messages = [{"role": "user", "content": prompt or TEST_PROMPT}]
+        started = time.time()
+        result = self.chat(acct, messages, stream=False, model=model)
+        ms = int((time.time() - started) * 1000)
+        content, reasoning, raw, usage = _norm_chat_result(result)
+        meta = result.get("meta") if isinstance(result, dict) else None
+        return {"ok": True, "model": model, "ms": ms, "text": content,
+                "reasoning": reasoning, "usage": usage, "raw": raw, "meta": meta}
+
     # --- 网关对话 ---
 
     def chat(self, acct, messages, stream=False, model=None, on_token=None, body=None):
@@ -84,7 +187,19 @@ class Adapter(ABC):
           body = 完整 OpenAI 请求(含 tools/tool_choice 等);需要透传 tools 的 adapter 用它。
           返回: str 或 {"content": str, "reasoning": str|None, "raw": dict}
             raw = 完整 OpenAI 响应(含 tool_calls);server 优先用 raw 原样返回。
+            可选 "meta" = 这次请求观察到的账号运行时状态(见 window_meta),
+              由核心合并进 accounts.meta。不返回就是这次没什么可落的。
           stream=True 时逐段调 on_token(text, kind),kind ∈ {"content","reasoning"}
+        """
+        raise NotImplementedError
+
+    def stream_chat(self, acct, model, body, on_sse):
+        """透传型 adapter(streaming=True):逐帧产出 **OpenAI SSE**。
+
+        非流式由 chat() 负责;这个方法只在流式路径上被调。
+        返回 None,或 {"meta": ...} —— 与 chat() 的 "meta" 同一件事:这次请求
+        观察到的账号运行时状态,由核心写库。返回值形式而不是回调,是为了让
+        已经实现的渠道(openai_compat)不改签名也不受影响。
         """
         raise NotImplementedError
 
