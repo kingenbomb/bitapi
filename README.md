@@ -341,6 +341,6 @@ bitapi/
 
 ## 许可证与使用责任
 
-本项目基于 [MIT License](LICENSE) 发布。模型品牌图标来自 [LobeHub Icons](https://github.com/lobehub/lobe-icons) 项目，相关品牌与商标归其各自所有者。
+本项目基于 [MIT License](LICENSE) 发布。相关品牌与商标归其各自所有者。
 
 使用者需自行取得上游服务及凭据的合法使用权限，并遵守相应服务条款、数据处理和访问限制。开源许可不授予任何第三方模型、账号、商标或服务的使用权。
