@@ -167,6 +167,14 @@ def rebate(order, user, inviter, **_):
 
 放进 `plugins/`，加到 `BITAPI_PLUGINS`，完事。插件抛异常会被捕获并记日志，绝不影响主流程。
 
+### 改 `routers/` 时的三条硬规矩
+
+**1. `/api` 的 router 只在 `portal_shared.py` 建一次。** 子模块一律 `from routers.portal_shared import router` 往同一个实例上注册。谁自己新建 `APIRouter`，谁的 `prefix="/api"` 和 `route_class=SessionRoute`（CSRF / Origin 校验）就都没了 —— 而且**不报错**，只是那条路由不再带会话鉴权。
+
+**2. 别在新模块里缓存 `USER_DB` / `BILLING`。** 换库有两条路径：`portal_state.rebind(db)` 和测试里直接 `mod.USER_DB = db`。模块级缓存一份自己的引用，第二条路径就会漏掉，表现是「写进去了但读不到」。用 `portal_shared._db()` 现取。
+
+**3. 按行号搬代码时，装饰器算在块内。** `@router.post(...)` 在 `def` 的上一行，只按 `def` 切会把装饰器留在原地，函数搬走了却不再注册成路由。
+
 ## 上手文档
 
 用户控制台的「Token 消耗榜」提供累计、近 7 天、近 30 天排名。按概览相同口径汇总输入、输出与可计算的缓存 Token；所有启用账号均在统计范围内，无调用账号保留在列表末尾，相同用量并列。榜单仅登录后可见，用户名脱敏，自己的排名不受当前分页影响。
@@ -182,8 +190,6 @@ def rebate(order, user, inviter, **_):
 | [docs/payments.md](docs/payments.md) | 如何接支付渠道 |
 | [docs/deploy.md](docs/deploy.md) | 部署：Docker / systemd / 裸跑、nginx 样板、上线核对、恢复 |
 | [docs/operations.md](docs/operations.md) | 运维手册：备份与恢复、SMTP、告警、限速、看板口径 |
-| [docs/audit-2026-11-04.md](docs/audit-2026-11-04.md) | 安全与缺陷清单（2026-11-04 全量审计，**待修**） |
-| [docs/junk-2026-11-04.md](docs/junk-2026-11-04.md) | 垃圾清单（死代码、僵尸文件、过期登记，**已于 2026-11-04 清理完毕**：回收约 24 MB、删 7 个死函数、修 3 个陈旧测试；本次清理独立 diff 见 [junk-2026-11-04.patch](docs/junk-2026-11-04.patch)） |
 | [docs/incidents/](docs/incidents/) | 事故账：出过什么问题、哪个门禁守着它 |
 
 ## 目录结构

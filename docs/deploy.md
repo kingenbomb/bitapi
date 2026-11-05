@@ -34,7 +34,7 @@ journalctl -u bit-api -f
 
 单元文件 [`deploy/bit-api.service`](../deploy/bit-api.service) 里几处不是装饰:
 
-- `LimitNOFILE=65536`:2026-09-05 的事故是 fd 撞 1024 把站点打死(每条流式请求两个 fd 起步),见 `docs/incidents/`
+- `LimitNOFILE=65536`:默认 1024 会被 fd 撞满把站点打死(每条流式请求两个 fd 起步)
 - `Environment=BITAPI_HOST=127.0.0.1`:生产只监听回环,对外靠 nginx
 - `ProtectSystem=strict` + `ReadWritePaths=/opt/bit-api`:进程只能写自己的目录
 

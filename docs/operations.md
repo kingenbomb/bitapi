@@ -185,37 +185,3 @@ BITAPI_ALERT_WEBHOOK_URL='https://api.telegram.org/bot<token>/sendMessage?chat_i
 4. 改 `.env.local` 前先 `cp` 一份带时间戳的备份。
 
 2026-11-05 那次清理里，`BACKUP_KEEP` 第一版是往文件末尾**追加**，结果和原有的第 27 行重复定义了两个值。虽然 shell 通常后者覆盖前者，但重复配置是隐患 —— 正确做法是 `sed -i` 直接改原值。
-
-## 代码结构：两个大文件是怎么拆的
-
-2026-11-05 之前 `server.py`（3247 行）和 `routers/portal.py`（2931 行）合计占了源码的四分之一。当时拆成下面这样，**路由数一条没变**（`server` 41 条 + `/api` 94 条，测试 1088 项全绿）：
-
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `server.py` | 2656 | 网关路由 + 中间件 + 装配 |
-| `routers/portal.py` | 2006 | 用户侧 `/api/*` |
-| `routers/portal_admin.py` | 741 | 管理端 `/api/admin/*` 与随管理端暴露的几组端点 |
-| `routers/portal_shared.py` | 318 | router 实例、登录依赖、双方共用的模型与辅助函数 |
-| `core/protocol/anthropic.py` | 345 | Anthropic ↔ OpenAI 格式翻译（纯函数） |
-| `core/protocol/responses.py` | 321 | Responses ↔ Chat 格式翻译（纯函数） |
-
-### 三条不许破的规矩
-
-**1. `/api` 的 router 只在 `portal_shared.py` 建一次。** 子模块一律 `from routers.portal_shared import router` 往同一个实例上注册。谁自己新建 `APIRouter`，谁的 `prefix="/api"` 和 `route_class=SessionRoute`（CSRF / Origin 校验）就都没了 —— 而且**不报错**，只是那条路由不再带会话鉴权。
-
-**2. 别在新模块里缓存 `USER_DB` / `BILLING`。** 换库有两条路径：`portal_state.rebind(db)` 和测试里直接 `mod.USER_DB = db`。模块级缓存一份自己的引用，第二条路径就会漏掉，表现是「写进去了但读不到」。`portal_shared._db()` 和 `portal_admin._db()` 每次从 `portal_state` 现取，是这个原因。
-
-> 拆完第一版就是栽在这里：`portal_admin` 直接用了模块级 `USER_DB`，全量测试 342 项失败。注意 `USER_DB.xxx` 好改，**把 `USER_DB` 当参数传出去**的（`generate_codes(USER_DB, ...)`）最容易漏。
-
-**3. 按行号搬代码时，装饰器算在块内。** `@router.post(...)` 在 `def` 的上一行，只按 `def` 切会把装饰器留在原地，函数搬走了却不再注册成路由。这次 `server.py` 就这么丢过一条 `POST /v1/messages/count_tokens` —— 路由比对才发现。
-
-### 怎么验证拆对了
-
-```bash
-# 路由清单比对（重构前后各存一份）
-python -c "import server; print(len(server.portal_router.routes))"   # 应为 94
-python -m pytest tests/ -q -p no:cacheprovider                       # 1088 passed
-python scripts/check_dead_code.py                                    # exit 0
-```
-
-> 别用 `app.routes` 数 `/api` 路由：这个 FastAPI 版本用 `_IncludedRouter` 惰性挂载，`include_router` 不在 `app.routes` 里摊平子路由，数出来只有 1 条 —— 是观测方式不对，不是路由丢了。

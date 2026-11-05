@@ -84,7 +84,7 @@ total_ctx = input_tokens + cache_write_tokens + cache_read_tokens   # 不含 out
 
 ## 一键导入内置阶梯价
 
-`data/pricing_seed.json` 附了 11 条真实的阶梯定价（gpt-5.6 系列、minimax-m3、gemini-3.1 等），来自生产环境实测。管理控制台「定价列表」里点「导入内置阶梯价」即可。
+`data/pricing_seed.json` 附了 16 条真实定价（gpt-5.6 系列、minimax-m3、gemma-4、jina 向量等），来自生产环境实测。管理控制台「定价列表」里点「导入内置阶梯价」即可。
 
 也可以用 API：
 
