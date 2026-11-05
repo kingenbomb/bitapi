@@ -5,7 +5,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "c.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 from core import credit as C  # noqa: E402
 from core import hooks  # noqa: E402

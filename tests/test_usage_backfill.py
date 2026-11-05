@@ -13,10 +13,10 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "ub.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -78,6 +78,7 @@ class UsageBackfillTest(unittest.TestCase):
         db_path = os.path.join(_TMP, "ub-ep.db")
         config.DB_PATH = db_path
         fresh = UserDB(db_path)
+        fresh.upsert_pricing("ub-*", billing_mode="free")
         billing = Billing(fresh, pricing=portal_state.PRICING)
         for mod in (portal_state, server, portal_routes):
             mod.USER_DB = fresh
@@ -85,7 +86,7 @@ class UsageBackfillTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com", "password": "secret123"})
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com", "password": "secret123"})
         assert r.status_code == 200, r.text
         cls.uid = r.json()["user_id"]
         h = {"Authorization": "Bearer " + r.json()["token"]}
@@ -145,8 +146,10 @@ class UsageBackfillTest(unittest.TestCase):
         usage = [f for f in self._frames(r.text) if f.get("usage")][0]["usage"]
         self.assertEqual(usage["completion_tokens"], 9)
         log = self._log()
+        # input_tokens 记净输入(总输入 40 - 命中缓存 12 = 28),缓存单列在快照里
         self.assertEqual((log["input_tokens"], log["output_tokens"], log["token_source"]),
-                         (40, 9, "upstream"))
+                         (28, 9, "upstream"))
+        self.assertEqual(log["pricing_snapshot"]["cache_read_tokens"], 12)
 
     # ---- Anthropic ----
 
@@ -168,7 +171,7 @@ class UsageBackfillTest(unittest.TestCase):
     def test_anthropic_nonstream_real_usage_with_cache_and_max_tokens(self):
         r = self._anthropic("ub-real-model")
         body = r.json()
-        self.assertEqual(body["usage"], {"input_tokens": 40, "output_tokens": 9,
+        self.assertEqual(body["usage"], {"input_tokens": 28, "output_tokens": 9,
                                          "cache_read_input_tokens": 12})
         self.assertEqual(body["stop_reason"], "max_tokens")
         self.assertEqual(self._log()["token_source"], "upstream")
@@ -200,12 +203,39 @@ class UsageBackfillTest(unittest.TestCase):
         r = self._anthropic("ub-real-model", stream=True)
         events = dict(self._events(r.text))
         self.assertEqual(events["message_delta"]["usage"],
-                         {"input_tokens": 40, "output_tokens": 9, "cache_read_input_tokens": 12})
+                         {"input_tokens": 28, "output_tokens": 9, "cache_read_input_tokens": 12})
         log = self._log()
-        self.assertEqual((log["input_tokens"], log["token_source"]), (40, "upstream"))
+        # 净输入 = 40 - 12(缓存命中);缓存量单列,不再按输入价重复计
+        self.assertEqual((log["input_tokens"], log["token_source"]), (28, "upstream"))
+        self.assertEqual(log["pricing_snapshot"]["cache_read_tokens"], 12)
+
+    def test_responses_bridge_preserves_cache_read_write_details_and_billing(self):
+        details = {"cached_tokens": 12, "cache_write_tokens": 8,
+                   "cache_creation": {"ttl_30m_tokens": 8, "ttl_12h_tokens": 0}}
+        usage = {**RealUsageAdapter.USAGE, "prompt_tokens_details": details}
+        for stream in (False, True):
+            with self.subTest(stream=stream), mock.patch.object(RealUsageAdapter, "USAGE", usage):
+                response = self.client.post("/v1/responses", headers=self.h,
+                    json={"model": "ub-real-model", "input": "hi", "stream": stream})
+                self.assertEqual(response.status_code, 200, response.text)
+                result = (dict(self._events(response.text))["response.completed"]["response"]
+                          if stream else response.json())
+                self.assertEqual(result["usage"]["input_tokens"], 40)
+                self.assertEqual(result["usage"]["input_tokens_details"], details)
+                log = self._log()
+                self.assertEqual(log["input_tokens"], 20)
+                self.assertEqual((log["pricing_snapshot"]["cache_read_tokens"],
+                                  log["pricing_snapshot"]["cache_write_tokens"]), (12, 8))
 
 
 class UsageHelperTest(unittest.TestCase):
+    def test_responses_usage_does_not_invent_missing_cache_counters(self):
+        self.assertEqual(server._responses_usage({"prompt_tokens": 10, "completion_tokens": 2})[
+            "input_tokens_details"], {})
+        self.assertEqual(server._responses_usage({"prompt_tokens": 10, "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}})[
+            "input_tokens_details"], {"cached_tokens": 0, "cache_write_tokens": 0})
+
     def test_anthropic_usage_mapping(self):
         self.assertEqual(server._anthropic_usage(None, 3, 4), {"input_tokens": 3, "output_tokens": 4})
         self.assertEqual(server._anthropic_usage({"prompt_tokens": 0, "completion_tokens": 0,
@@ -214,7 +244,7 @@ class UsageHelperTest(unittest.TestCase):
         self.assertEqual(server._anthropic_usage({"prompt_tokens": 10, "completion_tokens": 2,
                                                   "total_tokens": 12,
                                                   "cache_creation_input_tokens": 5}),
-                         {"input_tokens": 10, "output_tokens": 2, "cache_creation_input_tokens": 5})
+                         {"input_tokens": 5, "output_tokens": 2, "cache_creation_input_tokens": 5})
 
     def test_stop_reason_mapping(self):
         self.assertEqual(server._anthropic_stop("stop", False), "end_turn")

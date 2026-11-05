@@ -8,7 +8,7 @@
   2. model_pricing · group 专属 · prefix*
   3. model_pricing · 全局 · 精确名 → prefix*
   4. 内置价目表 → LiteLLM 价目表(pricing_catalog)
-  5. 兜底:免费(cost=0)—— 永不因缺价拒绝请求
+  5. 无价目时拒绝请求；免费模型须显式配置免费价。
 
 价格单位:token 类为「美元/1M token」,per_request 为「美元/次」。
 
@@ -28,6 +28,7 @@ TIER_OFFICIAL = "official"
 TIER_LONG = "long"
 
 _MILLION = 1_000_000.0
+_PRICE_REFERENCES = {"gpt-image-2-web": "gpt-image-2.5-flare"}
 
 FREE_PRICING = {
     "model_pattern": None, "billing_mode": MODE_FREE, "source": "fallback",
@@ -51,8 +52,21 @@ class Pricing:
 
     # ---- 解析 ----
 
+    def canonical(self, model):
+        from core.adapter import model_to_channel
+        names = model_to_channel()
+        if model in names:
+            return model
+        text = str(model or "")
+        base = text.rsplit("[", 1)[0] if text.endswith("]") and "[" in text else text
+        for name in names:
+            if name.casefold() == base.casefold():
+                return name
+        return base.casefold()
+
     def resolve(self, model, group_id=None):
         """返回定价 dict(必含 billing_mode 与各单价字段)+ source 标记。"""
+        model = self.canonical(model)
         key = (model, group_id)
         now = time.time()
         with self._lock:
@@ -74,20 +88,23 @@ class Pricing:
         hit = self._match(self.db.list_pricing(None), model)
         if hit:
             return dict(hit, source="global")
+        reference = _PRICE_REFERENCES.get(model)
+        if reference:
+            return dict(self._resolve_uncached(reference, group_id), model_pattern=model, pricing_model=reference)
         # 4: 内置价目表 → LiteLLM 价目表
         if self.catalog is not None:
             cat = self.catalog.lookup(model)
             if cat:
                 return dict(cat, source=cat.get("source") or "litellm")
-        # 5: 兜底免费
-        return dict(FREE_PRICING, model_pattern=model)
+        raise ValueError(f"model pricing not configured: {model}")
 
     @staticmethod
     def _match(rows, model):
         """精确名优先于 prefix*;多个 prefix* 命中时取最长前缀(更具体者胜)。"""
         best_prefix, best_len = None, -1
         for r in rows:
-            pat = r.get("model_pattern") or ""
+            pat = (r.get("model_pattern") or "").casefold()
+            model = model.casefold()
             if pat == model:
                 return r
             if pat == "*":
@@ -103,7 +120,7 @@ class Pricing:
 
     @staticmethod
     def compute(pricing, in_tok=0, out_tok=0, cache_read=0, cache_write=0,
-                units=1, rate_multiplier=1.0):
+                units=1, rate_multiplier=1.0, cache_write_ttls=None):
         """返回 (cost, actual_cost, snapshot)。cost 为原价,actual_cost 乘倍率后。
 
         snapshot 冻结本次计价参数(档位 + 实际生效单价 + total_ctx + 倍率),
@@ -111,11 +128,23 @@ class Pricing:
         """
         mode = pricing.get("billing_mode") or MODE_FREE
         mult = rate_multiplier if rate_multiplier is not None else 1.0
+        reference = {"pricing_model": pricing["pricing_model"]} if pricing.get("pricing_model") else {}
+        cache_meta = {}
+        write_12h = 0
+        if cache_write_ttls is not None:
+            counts = [cache_write_ttls.get(key) for key in ("ttl_30m_tokens", "ttl_12h_tokens")]
+            valid = all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in counts)
+            valid = valid and sum(counts) <= (cache_write or 0)
+            cache_meta["cache_write_ttl_valid"] = valid
+            if valid:
+                write_12h = counts[1]
+                cache_meta.update(cache_write_30m_tokens=counts[0], cache_write_12h_tokens=counts[1],
+                                  cache_write_unclassified_tokens=(cache_write or 0) - sum(counts))
 
         if mode == MODE_FREE:
             cost = 0.0
             snap = {"mode": MODE_FREE, "tier": TIER_OFFICIAL,
-                    "rate_multiplier": mult, "source": pricing.get("source")}
+                    "rate_multiplier": mult, "source": pricing.get("source"), **reference, **cache_meta}
             return cost, 0.0, snap
 
         if mode == MODE_PER_REQUEST:
@@ -123,7 +152,7 @@ class Pricing:
             cost = unit_price * (units or 1)
             snap = {"mode": MODE_PER_REQUEST, "tier": TIER_OFFICIAL,
                     "per_request_price": unit_price, "units": units or 1,
-                    "rate_multiplier": mult, "source": pricing.get("source")}
+                    "rate_multiplier": mult, "source": pricing.get("source"), **reference, **cache_meta}
             return cost, cost * mult, snap
 
         # token 模式
@@ -146,13 +175,16 @@ class Pricing:
         cr_p = pick("long_cache_read_price", "cache_read_price")
 
         cost = ((in_tok or 0) * in_p + (out_tok or 0) * out_p
-                + (cache_write or 0) * cw_p + (cache_read or 0) * cr_p) / _MILLION
+                + (cache_write or 0) * cw_p + write_12h * cw_p
+                + (cache_read or 0) * cr_p) / _MILLION
+        if cache_meta.get("cache_write_ttl_valid"):
+            cache_meta.update(cache_write_30m_price=cw_p, cache_write_12h_price=2 * cw_p)
         snap = {
             "mode": MODE_TOKEN, "tier": tier, "total_ctx": total_ctx,
             "long_threshold": threshold,
             "input_price": in_p, "output_price": out_p,
             "cache_write_price": cw_p, "cache_read_price": cr_p,
-            "rate_multiplier": mult, "source": pricing.get("source"),
+            "rate_multiplier": mult, "source": pricing.get("source"), **reference, **cache_meta,
         }
         return cost, cost * mult, snap
 

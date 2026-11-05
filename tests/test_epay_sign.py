@@ -15,7 +15,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "epay.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 import config  # noqa: E402
 from core.payments import NOT_PAID  # noqa: E402

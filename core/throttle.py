@@ -3,11 +3,11 @@
 """
 进程内滑动窗口限速 + 客户端 IP 取值。
 
-给登录、注册、找回密码这几个「不需要密钥就能打」的入口用。网关那条路的 RPM
-限流在 core/billing.py 里有自己的一份,按用户计;这里按 IP 与邮箱计,拦的是
+给登录、注册、找回密码这几个「不需要密钥就能打」的入口用。网关那条路的并发
+限制在 core/billing.py 里,按用户计;这里按 IP 与邮箱限速,拦的是
 撞库、批量注册刷赠额、用别人邮箱刷验证码。
 
-进程内状态,依赖单 worker(与 RPM 限流、巡检同一前提)。不落库:这是「此刻在被
+进程内状态,依赖单 worker(与并发限制、巡检同一前提)。不落库:这是「此刻在被
 打」的瞬时判断,重启清零是可接受的 —— 攻击者要靠重启绕过得先能让服务重启。
 
 只记失败不记成功:正常用户输对密码不该消耗额度,而攻击者每次都是失败。
@@ -86,15 +86,14 @@ class AuthThrottled(Exception):
 
 
 def client_ip(request):
-    """密钥 IP 白名单与登录限速共用的取值。反代部署必须读 X-Forwarded-For 的
-    第一跳,否则永远拿到 nginx 的 127.0.0.1 —— 那样全站用户共享一个限速桶,
-    一个人撞库全站登不上。直接暴露公网时关掉开关,因为客户端可以自己伪造这个头。"""
+    """密钥白名单与登录限速共用。默认取直连地址；显式信任反代时取 XFF 末跳。
+    源站必须只允许可信反代访问，且反代须覆盖客户端提交的 XFF。"""
     if request is None:
         return None
     if config.TRUST_PROXY_HEADERS:
         fwd = request.headers.get("x-forwarded-for")
         if fwd:
-            return fwd.split(",")[0].strip()
+            return fwd.split(",")[-1].strip()
         real = request.headers.get("x-real-ip")
         if real:
             return real.strip()
@@ -106,10 +105,15 @@ def client_ip(request):
 LOGIN_IP = SlidingWindow(config.AUTH_LOGIN_FAILS_PER_IP, config.AUTH_LOGIN_WINDOW)
 LOGIN_EMAIL = SlidingWindow(config.AUTH_LOGIN_FAILS_PER_EMAIL, config.AUTH_LOGIN_WINDOW)
 REGISTER_IP = SlidingWindow(config.AUTH_REGISTER_PER_IP, config.AUTH_REGISTER_WINDOW)
-REGISTER_MAIL_IP = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_IP, 3600)
-REGISTER_MAIL_EMAIL = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_EMAIL, 3600)
 RESET_EMAIL = SlidingWindow(config.AUTH_RESET_PER_EMAIL, config.AUTH_RESET_WINDOW)
 RESET_IP = SlidingWindow(config.AUTH_RESET_PER_IP, config.AUTH_RESET_WINDOW)
+REGISTER_MAIL_IP = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_IP, 3600)
+REGISTER_MAIL_EMAIL = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_EMAIL, 3600)
+BIND_MAIL_IP = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_IP, 3600)
+BIND_MAIL_EMAIL = SlidingWindow(config.AUTH_REGISTER_MAIL_PER_EMAIL, 3600)
+BIND_MAIL_USER = SlidingWindow(5, 3600)
+REDEEM_USER = SlidingWindow(10, 3600)
+REDEEM_IP = SlidingWindow(30, 3600)
 
 
 def check(*pairs):
@@ -128,5 +132,7 @@ def check(*pairs):
 
 def reset_all():
     """测试用:清空全部限速器。"""
-    for lim in (LOGIN_IP, LOGIN_EMAIL, REGISTER_IP, REGISTER_MAIL_IP, REGISTER_MAIL_EMAIL, RESET_EMAIL, RESET_IP):
+    for lim in (LOGIN_IP, LOGIN_EMAIL, REGISTER_IP, RESET_EMAIL, RESET_IP,
+                REGISTER_MAIL_IP, REGISTER_MAIL_EMAIL, BIND_MAIL_IP, BIND_MAIL_EMAIL,
+                BIND_MAIL_USER, REDEEM_USER, REDEEM_IP):
         lim.reset()

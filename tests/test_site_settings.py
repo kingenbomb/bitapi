@@ -12,10 +12,9 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "ss.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 import config  # noqa: E402
-import adapters.grok  # noqa: E402,F401  (注册一个渠道,好验开关的生效面)
+import adapters.gpt  # noqa: E402,F401  (注册一个渠道,好验开关的生效面)
 from core import adapter as adapter_mod  # noqa: E402
 from core import site_settings as S  # noqa: E402
 from core.user_db import UserDB  # noqa: E402
@@ -281,7 +280,7 @@ class ChannelSwitchTest(unittest.TestCase):
         self.db = UserDB(os.path.join(_TMP, f"ch{id(self)}.db"))
         S.bind(self.db)
         config.DISABLED_CHANNELS = []
-        self.known = ("grok", "acme", "beta")
+        self.known = ("nv", "jina", "gpt")
         # _DISABLED 是模块级状态,漏了这一步会污染同一进程里后面的用例
         self.addCleanup(adapter_mod.set_disabled_channels, [])
 
@@ -290,27 +289,27 @@ class ChannelSwitchTest(unittest.TestCase):
             S.validate("disabled_channels", ["clipfy"], known_channels=self.known)
 
     def test_list_is_normalized_and_deduped(self):
-        got = S.validate("disabled_channels", [" grok ", "grok", "acme"],
+        got = S.validate("disabled_channels", [" nv ", "nv", "jina"],
                          known_channels=self.known)
-        self.assertEqual(got, ["acme", "grok"])
+        self.assertEqual(got, ["jina", "nv"])
 
     def test_comma_string_is_accepted(self):
         """手写进库的值可能是字符串(get_setting 解析不出 json 就原样返回)。"""
         self.assertEqual(
-            S.validate("disabled_channels", "acme,grok", known_channels=self.known),
-            ["acme", "grok"])
+            S.validate("disabled_channels", "nv,gpt", known_channels=self.known),
+            ["gpt", "nv"])
 
     def test_empty_means_all_online(self):
         self.assertEqual(S.validate("disabled_channels", [],
                                     known_channels=self.known), [])
 
     def test_db_value_wins_over_env(self):
-        config.DISABLED_CHANNELS = ["grok"]
-        self.assertEqual(S.disabled_channels(), ["grok"])
-        self.db.set_setting("disabled_channels", ["grok"])
-        self.assertEqual(S.disabled_channels(), ["grok"])
+        config.DISABLED_CHANNELS = ["gpt"]
+        self.assertEqual(S.disabled_channels(), ["gpt"])
+        self.db.set_setting("disabled_channels", ["nv"])
+        self.assertEqual(S.disabled_channels(), ["nv"])
         self.db.delete_setting("disabled_channels")
-        self.assertEqual(S.disabled_channels(), ["grok"])
+        self.assertEqual(S.disabled_channels(), ["gpt"])
 
     def test_registry_hides_disabled_from_users_but_not_from_maintenance(self):
         """下线是对用户下线。号池巡检与管理面板走 all_adapters(),必须照旧看得到 ——

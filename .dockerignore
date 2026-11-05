@@ -18,4 +18,5 @@ deploy/
 deploy.ps1
 deploy.cmd
 poolgate.db*
-data/litellm_pricing.json
+data/*
+!data/pricing_seed.json

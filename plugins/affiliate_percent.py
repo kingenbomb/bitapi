@@ -5,6 +5,7 @@
 
 改 CONFIG 即可调整;不想要就从 BITAPI_PLUGINS 里移除。
 """
+import math
 from core.credit import REASON_AFFILIATE, credit
 from core.hooks import on
 
@@ -18,6 +19,13 @@ CONFIG = {
 
 
 def _payout(inviter, source_user, base_amount, idem_key, meta):
+    if not math.isfinite(CONFIG["rate"]) or not 0 <= CONFIG["rate"] <= 1:
+        raise ValueError("affiliate rate must be between 0 and 1")
+    for key in ("min_amount", "max_per_event"):
+        if not math.isfinite(CONFIG[key]) or CONFIG[key] < 0:
+            raise ValueError(key + " must be finite and nonnegative")
+    if base_amount is not None and not math.isfinite(base_amount):
+        raise ValueError("base_amount must be finite")
     if not inviter or base_amount is None:
         return
     if base_amount < CONFIG["min_amount"]:

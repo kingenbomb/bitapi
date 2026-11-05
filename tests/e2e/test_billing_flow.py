@@ -151,7 +151,7 @@ def test_billing_flow():
 def run():
     print("\n[1] 注册管理员(首个用户免邀请码)")
     s, b = req("POST", "/api/register",
-               {"email": "admin@e2e.example.com", "password": "secret123"})
+               {"email": "admine2e@gmail.com", "password": "secret123"})
     check("首个用户注册成为 admin", s == 200 and b.get("role") == "admin", f"{s} {b}")
     admin_tok = b["token"]
     admin_aff = b["aff_code"]
@@ -159,18 +159,18 @@ def run():
     print("\n[2] 建 balance 计费组 + 定价($1/1M in, $2/1M out)")
     s, b = req("POST", "/api/admin/groups",
                {"name": "paid", "billing_policy": "balance",
-                "supported_models": ["*"], "rpm_limit": 0,
+                "supported_models": ["*"], "concurrency_limit": 0,
                 "rate_multiplier": 1.0}, token=admin_tok)
     check("建 balance 组", s == 200, f"{s} {b}")
     gid = b.get("id")
     s, b = req("POST", "/api/admin/pricing",
-               {"model_pattern": "demo-*", "billing_mode": "token",
+               {"model_pattern": "kg-*", "billing_mode": "token",
                 "input_price": 1.0, "output_price": 2.0}, token=admin_tok)
-    check("配定价 demo-*", s == 200, f"{s} {b}")
+    check("配定价 kg-*", s == 200, f"{s} {b}")
 
     print("\n[3] 开放注册下使用管理员返佣码")
     s, b = req("POST", "/api/register",
-               {"email": "buyer@e2e.example.com", "password": "secret123",
+               {"email": "buyere2e@gmail.com", "password": "secret123",
                 "invite_code": admin_aff})
     check("带返佣码注册成功", s == 200, f"{s} {b}")
     buyer_tok = b["token"]
@@ -244,7 +244,7 @@ def run():
     s, b = req("GET", "/api/billing", token=buyer_tok)
     before = b["balance"]
     s, b = req("POST", "/v1/chat/completions",
-               {"model": "demo-nonexistent-model",
+               {"model": "kg-nonexistent-model",
                 "messages": [{"role": "user", "content": "hi"}]}, key=user_key)
     # 模型不存在 → 网关 4xx/5xx,但鉴权+预检必须先通过(不能 401/402)
     check("有余额时鉴权与预检通过(非 401/402)", s not in (401, 402), f"{s} {b}")
@@ -255,7 +255,7 @@ def run():
     check("管理员调额清零", s == 200 and abs(b.get("balance", 1)) < 1e-6, f"{s} {b}")
     time.sleep(0.3)  # 等鉴权缓存失效
     s, b = req("POST", "/v1/chat/completions",
-               {"model": "demo-nonexistent-model",
+               {"model": "kg-nonexistent-model",
                 "messages": [{"role": "user", "content": "hi"}]}, key=user_key)
     detail = b.get("detail") if isinstance(b, dict) else {}
     check("余额为 0 时返回 402", s == 402, f"{s} {b}")

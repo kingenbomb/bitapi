@@ -15,7 +15,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "pr.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -107,6 +106,7 @@ class ProtocolsTest(unittest.TestCase):
         db_path = os.path.join(_TMP, "pr-ep.db")
         config.DB_PATH = db_path
         fresh = UserDB(db_path)
+        fresh.upsert_pricing("pr-*", billing_mode="free")
         billing = Billing(fresh, pricing=portal_state.PRICING)
         for mod in (portal_state, server, portal_routes):
             mod.USER_DB = fresh
@@ -114,7 +114,7 @@ class ProtocolsTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com", "password": "secret123"})
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com", "password": "secret123"})
         assert r.status_code == 200, r.text
         cls.uid = r.json()["user_id"]
         h = {"Authorization": "Bearer " + r.json()["token"]}

@@ -3,7 +3,6 @@ import tempfile
 import unittest
 
 os.environ.setdefault("BITAPI_DB", os.path.join(tempfile.mkdtemp(), "m.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", "/tmp/noexist_m")
 
 from core import metering
 from core.adapter import BILL_UPSTREAM, BILL_ESTIMATE, BILL_PER_REQUEST

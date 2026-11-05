@@ -9,7 +9,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ["BITAPI_DB"] = os.path.join(_TMP, "gw.db")
-os.environ["BITAPI_GROK_AUTH_DIR"] = os.path.join(_TMP, "nx")
 os.environ["BITAPI_JWT_SECRET"] = "gw-secret"
 os.environ["BITAPI_API_KEY"] = "sk-gw-master"
 os.environ["BITAPI_PRICING_URL"] = ""
@@ -85,7 +84,7 @@ def setUpModule():
                        input_price=1, output_price=2)
     pricing.invalidate()
     gid = _DB.create_group(name="gw-paid", supported_models=["*"],
-                           billing_policy="balance", rpm_limit=0)
+                           billing_policy="balance", concurrency_limit=0)
     _UID = _DB.create_user("gw@example.com", auth.hash_password("secret123"),
                            "GWAFF001", group_id=gid)
     key = auth.generate_api_key()
@@ -124,6 +123,48 @@ class GatewayChargeTest(unittest.TestCase):
         self.assertEqual(log["billing_mode"], "token")
         self.assertEqual(log["pricing_snapshot"]["tier"], "official")
         self.assertEqual(log["pricing_snapshot"]["frt_ms"], log["duration_ms"])
+
+    def test_failed_stream_and_http_200_error_do_not_charge(self):
+        import json
+        from unittest.mock import patch
+        from core.adapter import get_adapter
+
+        usage = {"prompt_tokens": 1_000_000, "completion_tokens": 500_000}
+        partial = {"choices": [{"delta": {"content": "partial"}}], "usage": usage}
+        cases = [
+            ([partial], "eof"),
+            ([partial, {"error": {"message": "upstream failed"}}, "[DONE]"], "error"),
+            (["{broken", "[DONE]"], "scanner_error"),
+        ]
+        for path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/api/playground/chat"):
+            headers = (self.h if path.startswith("/v1/") else
+                       {"Authorization": "Bearer " + auth.issue_token(_UID)})
+            for frames, reason in cases:
+                with self.subTest(path=path, reason=reason):
+                    before, ledger_before = self._balance(), len(self._usage_entries())
+
+                    def proxy(_body, stream=False, on_sse=None):
+                        for frame in frames:
+                            on_sse("data: " + (frame if isinstance(frame, str) else json.dumps(frame)) + "\n\n")
+
+                    with patch.object(get_adapter("stub"), "proxy_chat", side_effect=proxy):
+                        response = self.client.post(path, headers=headers, json={
+                            "model": "stub-model", "stream": True, "max_tokens": 16,
+                            "input": "hi", "messages": [{"role": "user", "content": "hi"}]})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    log = _DB.recent_usage(_UID, limit=1)[0]
+                    self.assertEqual(log["pricing_snapshot"]["end_reason"], reason)
+                    self.assertEqual(log["actual_cost"], 0)
+                    self.assertEqual(self._balance(), before)
+                    self.assertEqual(len(self._usage_entries()), ledger_before)
+
+        before = self._balance()
+        with patch.object(get_adapter("stub"), "proxy_chat", return_value={
+            "error": {"message": "quota exceeded"}, "usage": usage}):
+            response = self.client.post("/v1/chat/completions", headers=self.h, json={
+                "model": "stub-model", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(self._balance(), before)
 
     def test_anthropic_nonstream_records_frt(self):
         r = self.client.post("/v1/messages", headers=self.h, json={
@@ -167,6 +208,64 @@ class GatewayChargeTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertAlmostEqual(self._balance(), before)
         self.assertEqual(len(self._usage_entries()), n)
+
+    def test_request_ip_reaches_logs_for_protocols_streams_and_playground(self):
+        from unittest.mock import patch
+
+        gid = _DB.create_group(name="ip-log-free", supported_models=["*"],
+                               billing_policy="free")
+        uid = _DB.create_user("ip-log@example.com", "h", "IPLOG001", group_id=gid)
+        key = auth.generate_api_key()
+        _DB.create_api_key(uid, key, name="ip-log")
+        bearer = {"Authorization": "Bearer " + key}
+        session = {"Authorization": "Bearer " + auth.issue_token(uid)}
+        with patch.object(config, "TRUST_PROXY_HEADERS", True):
+            for path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                for stream in (False, True):
+                    ip = "2001:db8::7" if stream else "203.0.113.7"
+                    with self.subTest(path=path, stream=stream):
+                        response = self.client.post(path, headers=dict(bearer, **{
+                            "X-Forwarded-For": "10.0.0.1, " + ip}), json={
+                                "model": "stub-model", "stream": stream, "max_tokens": 16,
+                                "input": "hi", "messages": [{"role": "user", "content": "hi"}]})
+                        self.assertEqual(response.status_code, 200, response.text)
+                        log = _DB.recent_usage(uid, limit=1)[0]
+                        self.assertEqual(log["pricing_snapshot"]["client_ip"], ip)
+            response = self.client.post("/api/playground/chat", headers=dict(session, **{
+                "X-Real-IP": "198.51.100.9"}), json={
+                    "model": "stub-model", "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(_DB.recent_usage(uid, limit=1)[0]["pricing_snapshot"]["client_ip"],
+                             "198.51.100.9")
+
+        # 关闭代理头信任时，记录直连地址，不能接受请求方伪造的地址。
+        with patch.object(config, "TRUST_PROXY_HEADERS", False):
+            direct = TestClient(server.app, client=("192.0.2.50", 50000))
+            response = direct.post("/v1/chat/completions", headers=dict(bearer, **{
+                "X-Forwarded-For": "203.0.113.99"}), json={
+                    "model": "stub-model", "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(response.status_code, 200, response.text)
+        rows = self.client.get("/api/usage", headers=session).json()["recent"]
+        self.assertEqual(rows[0]["pricing_snapshot"]["client_ip"], "192.0.2.50")
+        self.assertTrue(all("cache_read_tokens" in r["pricing_snapshot"] for r in rows))
+        self.assertEqual(len(rows), 8)
+
+    def test_unknown_model_is_rejected_before_streaming_and_not_billed(self):
+        before = self._balance()
+        entries = len(self._usage_entries())
+        logs = len(_DB.recent_usage(_UID, limit=99))
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self.client.post("/v1/chat/completions", headers=self.h,
+                                            json={"model": "no-such-model",
+                                                  "stream": stream,
+                                                  "messages": [{"role": "user",
+                                                                "content": "hi"}]})
+                self.assertEqual(response.status_code, 404, response.text)
+                self.assertEqual(response.json()["detail"], "unknown model: no-such-model")
+        self.assertEqual(self._balance(), before)
+        self.assertEqual(len(self._usage_entries()), entries)
+        self.assertEqual(len(_DB.recent_usage(_UID, limit=99)), logs)
 
     def test_drained_balance_returns_402(self):
         bal = self._balance()
@@ -275,7 +374,7 @@ class PlaygroundChatTest(unittest.TestCase):
         """广场按白名单裁过,体验也必须按同一份裁 —— 否则点得到、发得出,
         真接进去却 403。"""
         gid = _DB.create_group(name="pg-nostub", supported_models=["other-*"],
-                               billing_policy="balance", rpm_limit=0)
+                               billing_policy="balance", concurrency_limit=0)
         old = _DB.get_user(_UID)["group_id"]
         _DB.update_user(_UID, group_id=gid)
         server.BILLING.invalidate()

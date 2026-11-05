@@ -101,7 +101,8 @@ class EpayProvider(PaymentProvider):
         if not data:
             return None
         got = (data.get("sign") or "").lower()
-        if not got or got != _sign(data, S.epay_key()):
+        from core.security import secret_equal
+        if not secret_equal(got, _sign(data, S.epay_key())):
             return None
         if str(data.get("pid") or "") != S.epay_pid():
             # 别的商户号的回调。签名能对上只说明对方拿到了同一把 key,商户号不符

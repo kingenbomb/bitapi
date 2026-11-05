@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from core import db as dbmod
-from core.adapter import CAP_BALANCE
+from core.adapter import CAP_BALANCE, CAP_REFRESH
 from core.scheduler import _check_one, scan_once
 
 
@@ -29,7 +29,7 @@ class SchedulerScanPoolTest(unittest.IsolatedAsyncioTestCase):
         })
         self.assertTrue(any("号池测活" in line for line in logs))
 
-    def test_exhausted_balance_is_permanent_dead_for_channel_declaring_it(self):
+    def test_exhausted_magicpatterns_balance_is_permanent_dead(self):
         class BalanceAdapter:
             capabilities = [CAP_BALANCE]
             exhausted_is_dead = True
@@ -120,7 +120,7 @@ class SchedulerFailureVerdictTest(unittest.TestCase):
     """巡检里的失败判定 —— 2026-09-05 一轮扫描写死 1250 个好号那次的门禁。
 
     当时 fd 耗尽,进程连出站 socket 都开不出来(EMFILE),_check_one 的
-    except Exception → dead 把一整轮扫到的上千个号全部
+    except Exception → dead 把 kogo 107 / magicpatterns 104 / xai 1000 个号全部
     写成死号,事后抽样验证它们都还能登录。dead 不再被巡检、不再被取号、没有恢复
     接口 —— 所以「判不准」必须落 cooldown,不能落 dead。
     """
@@ -164,6 +164,55 @@ class SchedulerFailureVerdictTest(unittest.TestCase):
         result = _check_one(db, NoBalance(), {"id": 1}, 600, 0.05)
         self.assertEqual(result, dbmod.ST_COOLDOWN)
         self.assertEqual(db.status, dbmod.ST_COOLDOWN)
+
+
+class _RotatingAdapter:
+    """xai 的形状:只声明 CAP_REFRESH,刷新时会轮换 refresh_token。"""
+
+    capabilities = [CAP_REFRESH]
+    exhausted_is_dead = False
+
+    def has(self, capability):
+        return capability in self.capabilities
+
+    def refresh_token(self, _acct):
+        return {"token": "tok-new", "token_exp": 9_999_999_999,
+                "secret": {"refresh_token": "rt-new"}}
+
+
+class _RecordingDB:
+    def __init__(self):
+        self.fields = {}
+
+    def update_account(self, _acct_id, **fields):
+        self.fields.update(fields)
+
+    def set_status(self, _acct_id, status):
+        self.fields["status"] = status
+
+
+class RotatedCredentialWritebackTest(unittest.TestCase):
+    """巡检刷新后,轮换出来的 refresh_token 必须落库。
+
+    2026-09-03~06 那次:adapters/xai.py 一直把轮换后的 refresh_token 放在返回值的
+    secret 里(它自己的门禁全绿),但两个调用方都只写 token/token_exp,secret 被丢了。
+    库里留的是一支已经作废的 refresh_token,下次拿它去换只有 invalid_grant —— 而
+    invalid_grant 是终态,号当场判死,号本身却还是好的。3923 个就是这么没的。
+    """
+
+    def test_refreshed_secret_is_persisted(self):
+        db = _RecordingDB()
+        _check_one(db, _RotatingAdapter(),
+                   {"id": 1, "token": "tok-old", "token_exp": 0}, 600, 0.05)
+        self.assertEqual(db.fields["secret"], {"refresh_token": "rt-new"})
+        self.assertEqual(db.fields["token"], "tok-new")
+
+    def test_in_memory_acct_also_carries_the_new_secret(self):
+        """同一个 acct 对象紧接着要拿去调上游,内存里也得是新凭据。"""
+        db = _RecordingDB()
+        acct = {"id": 1, "token": "tok-old", "token_exp": 0}
+        _check_one(db, _RotatingAdapter(), acct, 600, 0.05)
+        self.assertEqual(acct["secret"], {"refresh_token": "rt-new"})
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ SQLite 单写者天然够用,不需要 Redis 锁。顺序:先占用,后发放。
 邀请码 —— 后者不入账、面额恒 0,只在 /api/register 消耗一次(见 routers/portal.py)。
 """
 import secrets
+import math
 import string
 import time
 
@@ -46,7 +47,7 @@ def generate_codes(db, count, value, expires_at=0, notes=None, type="balance"):
     count = int(count)
     if count < 1 or count > MAX_BATCH:
         raise RedeemError("INVALID_COUNT", f"count must be 1..{MAX_BATCH}")
-    if type == TYPE_BALANCE and value == 0:
+    if not math.isfinite(float(value)) or (type == TYPE_BALANCE and value == 0):
         raise RedeemError("INVALID_VALUE", "value must not be zero")
     out = []
     for _ in range(count):

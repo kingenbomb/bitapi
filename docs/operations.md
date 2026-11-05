@@ -13,25 +13,18 @@
 | 余额负债 | 所有用户 `balance` 之和 —— 这是你对用户的负债，不是收入 |
 | 钱的去向 | `credit_ledger` 按 `reason` 求和：`recharge` 充值、`redeem` 兑码、`plan` 套餐（购买是负数，取反）、`usage` 消费（取反）、赠出 = `checkin + signup + affiliate + admin(正数)` |
 | 活跃 / 新增用户 | 有用量记录的去重用户数 / `users.created_at` |
+| 全站总 Token 数 | 所有历史 `usage_logs` 的输入 + 输出 + 缓存（沿用用量明细 `total_ctx` 口径），不受趋势图时间范围影响 |
 
 管理控制台 → **日志**：全站用量明细，按邮箱（精确）、模型（支持 `kg-*`）、渠道、时间区间、只看异常检索，点用户名可只看该用户，可导出 CSV（单次上限 10000 行，CSV 里把快照的首字延迟 / 结束原因 / 档位平铺成列）。
 
 对应端点：`GET /api/admin/stats?days=14`、`GET /api/admin/usage`、`GET /api/admin/usage/export.csv`、`GET /api/admin/users?q=`。
-
-## 注册验证码与邀请奖励
-
-首次邮箱注册（包括管理员）前先配置 SMTP，样例见 [`.env.example`](../.env.example)；已有管理员可在「站点设置 → 邮件设置」配置并发送测试邮件。SMTP 未配置时 `POST /api/register/code` 返回 `503`，发送失败返回 `502`，不会建立可使用的验证码。验证码 15 分钟有效、60 秒冷却、最多校验错误 5 次，库内仅保存加盐哈希。`BITAPI_AUTH_REGISTER_MAIL_PER_IP` / `BITAPI_AUTH_REGISTER_MAIL_PER_EMAIL` 限制每小时验证码发信，默认 10 / 3 次。
-
-在「站点设置 → 注册邀请奖励」独立保存开关、每人美元金额和每位邀请人的奖励人数上限，`0` 表示不限。页面预览是假设同一邀请人此前未获奖的模拟值，不会实际发奖。排查时用 `GET /api/invite` 核对生效规则及已奖励人数，再从钱包流水中查「有效注册奖励」（`reason=affiliate`、`meta.kind=fixed_invite`）。超过上限、重复注册、旧账号登录或绑定、历史邀请均不新增本项奖励；社区注册仍需要原有一次性邀请码。
-
-Token 榜位于 `/portal#/leaderboard`，接口 `GET /api/leaderboard?range=7d&page=1&page_size=20` 需要用户会话；支持 `all`、`7d`、`30d`。按启用账号的输入与输出 Token 合计排名，缓存不计入排名，无用量账号也参与展示。只返回脱敏名字及用量，不公开其他用户的邮箱、ID、余额。
 
 ## 备份与恢复
 
 库文件（`bitapi.db` / 旧名 `poolgate.db`）是用户、密钥、余额、订单、号池的唯一副本。
 
 - 用 `sqlite3` 的 backup API（`core/backup.py`）而不是 copy 文件：WAL 模式下直接拷主文件拿到的是不含最近写入的半份。
-- 默认每 24 小时一份、保留 7 份、放在**库文件旁边**的 `backups/`（不是代码目录 —— deploy 是 tar 解压覆盖，这个目录得跟着库走）。
+- 默认每 24 小时一份、保留 7 份、放在**库文件旁边**的 `backups/`（不是代码目录 —— deploy 是 tar 解压覆盖，这个目录得跟着库走）。线上因库已到 818 MB，实际改成 `KEEP=1`，理由见下面「磁盘占用与清理」。
 - 到期判断看目录里最新一份的**文件年龄**，不是进程内计时：重启不归零，停了三天再起来第一跳（10 分钟内）就补一份。
 - 先写 `.tmp` 再改名：进程中途被杀留下的是一眼能认出的临时文件，不是缺页的 `.db`。
 - 清理按份数不按天数（份数是确定的磁盘上界），且只删本模块命名的 `bitapi-*.db`。
@@ -66,22 +59,24 @@ BITAPI_PASSWORD_RESET_TTL=1800  # 找回链接有效期(秒)
 
 配好先点「发测试邮件」—— 失败会把 SMTP 的原话显示出来（「认证失败」和「连不上 465」是两种要改的东西）。
 
-靠它的三条路：
+依赖邮件服务的流程：
 
 - **找回密码**：登录页「忘记密码」→ `POST /api/password/forgot` → 邮件里的链接 `/portal#/reset?token=…` → `POST /api/password/reset`。令牌只存 SHA-256、30 分钟有效、一次性、重发即作废旧的；邮箱不存在也回 ok（不可枚举）；SMTP 没配回 503 明说。
 - **邮箱验证**：个人资料页发 6 位验证码；没配 SMTP 时退回「写服务端日志」并如实返回 `sent: false`。
+- **注册验证码**：注册页 → `POST /api/register/code` → 填写邮件中的 6 位验证码 → `POST /api/register`。仅支持数字 QQ 邮箱及无点号、无加号的 Gmail 主地址；SMTP 必须真实发出，15 分钟有效、错误 5 次即失效，重发间隔 60 秒。验证码只存加盐哈希，建号成功后删除，不写验证码日志。
 - **改密作废旧会话**：自助改密、找回、管理员重置都走 `UserDB.set_password`，推进 `users.password_changed_at`；JWT 的 `iat` 早于它的一律 401。自助改密的响应带新 token，前端换上，不掉线。
 
 发信失败 emit `mail.failed`。同步发送、10 秒超时：找回密码这条路上「发不出去」必须立刻告诉用户，而不是让人守着收件箱等一封永远不来的信。
 
 ## 登录 / 注册限速
 
-进程内滑动窗口（`core/throttle.py`），依赖单 worker（与 RPM 限流、巡检同一前提）。
+进程内滑动窗口（`core/throttle.py`），依赖单 worker（与用户并发限制、巡检同一前提）。
 
 | 入口 | 计什么 | 默认 |
 |---|---|---|
 | 登录 | 只记**失败**，IP 与邮箱各一道 | IP 20 次 / 10 分钟，邮箱 8 次 / 10 分钟 |
 | 注册 | 按 IP 计**成功**次数（被邀请码挡回的不计） | 5 个 / 小时 |
+| 注册验证码邮件 | 按 IP 与邮箱计发送请求；另有每邮箱 60 秒重发间隔 | IP 10 次 / 小时，邮箱 3 次 / 小时 |
 | 找回密码 | 邮箱与 IP 各一道 | 邮箱 3 次 / 小时，IP 10 次 / 小时 |
 
 两道缺一不可：邮箱那道防「定向撞一个账号」，IP 那道防「一个 IP 扫一批账号」。不存在的邮箱也记账，否则「不限速 = 邮箱不存在」能枚举出注册过的邮箱。成功登录清掉该邮箱的失败计数。超限回 429 + `Retry-After`，同时 emit `auth.throttled`。
@@ -89,6 +84,10 @@ BITAPI_PASSWORD_RESET_TTL=1800  # 找回链接有效期(秒)
 反代部署必须信任 `X-Forwarded-For`（`BITAPI_TRUST_PROXY_HEADERS=1`，默认开），否则全站共享 nginx 那个 127.0.0.1 一个桶，一个人撞库全站登不上；直接暴露公网时关掉，因为客户端能伪造这个头。
 
 阈值：`BITAPI_AUTH_LOGIN_FAILS_PER_IP` / `AUTH_LOGIN_FAILS_PER_EMAIL` / `AUTH_LOGIN_WINDOW` / `AUTH_REGISTER_PER_IP` / `AUTH_REGISTER_WINDOW` / `AUTH_RESET_PER_EMAIL` / `AUTH_RESET_PER_IP` / `AUTH_RESET_WINDOW`，0 = 不限。
+
+注册发信阈值：`BITAPI_AUTH_REGISTER_MAIL_PER_IP` / `BITAPI_AUTH_REGISTER_MAIL_PER_EMAIL`。
+部署时启动自动新增 `registration_codes` 表；已有用户、邮箱验证记录与邀请码保留。
+注册与累计 Token 回放由 CI 的 `python -m pytest tests/ -q` 执行，见 `tests/test_registration.py`。
 
 ## 二次验证(TOTP)
 
@@ -131,3 +130,92 @@ BITAPI_ALERT_WEBHOOK_URL='https://api.telegram.org/bot<token>/sendMessage?chat_i
 ## 单 worker
 
 限流、限速、渠道开关、告警去重全是进程内状态，`uvicorn --workers 1` 是前提。要横向扩就得把这些搬进外部存储，那不是这个项目的方向（见 README「设计目标」）。
+
+## 磁盘占用与清理
+
+线上 `/root/bit-api` 的体积**几乎全部是数据，不是代码**。2026-11-05 清理前后：
+
+| | 清理前 | 清理后 |
+|---|---|---|
+| 项目目录 | 4.9 GB | **2.2 GB** |
+| 磁盘占用 | 19G / 30G (67%) | **16G / 30G (57%)** |
+
+清理后 2.2 GB 的构成：
+
+| 条目 | 大小 | 说明 |
+|---|---|---|
+| `bitapi.db` | 818 MB | 主库，随用量日志增长 |
+| `backups/` | 818 MB | 1 份备份（见下） |
+| `bitapi.db-wal` | 423 MB | WAL，长期运行会涨 |
+| `venv/` | 153 MB | 依赖 |
+| `data/` | 7.0 MB | 价格数据 |
+| `static/` | 4.9 MB | 前端资源 |
+| `run.log*` | ~5.6 MB | 7 份轮转日志 |
+
+**代码本身只有约 6 MB**（`core` 1.6M + `tests` 1.2M + `routers` 448K + `adapters` 280K + `docs` 288K + `scripts` 188K）。看到目录大先去查上面那几个，别怀疑代码。
+
+### 清掉过什么（别再攒回来）
+
+- **`bitapi.db.pre-channel-rename-*`（302 MB）** —— 改名前的库快照。改名完成后就是纯冗余，且是**整库明文副本**，留着等于多一份凭据泄露面。
+- **`xai-auths-migrated/` + `xai-auths-residual/`（4652 个文件，19 MB）** —— 明文 xAI `access_token`。xai 渠道删除后库里 `channel='xai'` 已是 0 条，代码零引用。这类**含凭据的历史目录**用完就该删，不要长期躺着。
+- **`*.bak` / `server.py.bak-*`** —— 有 git 之后，文件级 `.bak` 只是噪音。
+- **`.env.local.bak*`** —— 5 份减到 1 份，只留「最近一次改动前」的那份当回滚点。多份旧配置的价值是零，泄密面是实打实的。
+- **`diag/`** —— 一次性排障输出，排完即删。
+
+### 备份保留份数
+
+默认 `BACKUP_KEEP=7`。库长到 818 MB 之后，7 份就是 **3.2 GB** ——比整个项目其余部分加起来还大。
+
+线上已改成 **`BITAPI_BACKUP_KEEP=1`**（`.env.local`，systemd 的 `EnvironmentFile`）。理由：这个库的灾难恢复靠「最新一份 + 上游数据可重建」，不需要 7 天历史；真要长期留存应该走 `BITAPI_BACKUP_DIR` 指到异地对象存储，而不是堆在同一块盘上。
+
+> 改完必须重启服务才生效。验证方式：`tr '\0' '\n' < /proc/$(systemctl show bit-api -p MainPID --value)/environ | grep BACKUP` —— **不要**用 `systemctl show -p Environment`，`EnvironmentFile` 加载的变量不出现在那个属性里，会误判成没生效。
+
+### 两个别乱动的东西
+
+- **`bitapi.db-wal`（423 MB）** —— `PRAGMA wal_checkpoint(TRUNCATE)` 能收，但要短暂持写锁，得挑低峰期，且停服后收最干净。日常让它自己 checkpoint 就行。
+- **`run.log*`** —— 正常轮转，会自己滚，不用手动删。
+
+### 清理时的通用纪律
+
+这些库和配置**都在活跃使用中**，删任何东西之前：
+
+1. `grep` 确认代码零引用；
+2. `lsof +D <目录>` 确认没有进程占用；
+3. 库类文件先 `PRAGMA integrity_check` + 核对关键表行数；
+4. 改 `.env.local` 前先 `cp` 一份带时间戳的备份。
+
+2026-11-05 那次清理里，`BACKUP_KEEP` 第一版是往文件末尾**追加**，结果和原有的第 27 行重复定义了两个值。虽然 shell 通常后者覆盖前者，但重复配置是隐患 —— 正确做法是 `sed -i` 直接改原值。
+
+## 代码结构：两个大文件是怎么拆的
+
+2026-11-05 之前 `server.py`（3247 行）和 `routers/portal.py`（2931 行）合计占了源码的四分之一。当时拆成下面这样，**路由数一条没变**（`server` 41 条 + `/api` 94 条，测试 1088 项全绿）：
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `server.py` | 2656 | 网关路由 + 中间件 + 装配 |
+| `routers/portal.py` | 2006 | 用户侧 `/api/*` |
+| `routers/portal_admin.py` | 741 | 管理端 `/api/admin/*` 与随管理端暴露的几组端点 |
+| `routers/portal_shared.py` | 318 | router 实例、登录依赖、双方共用的模型与辅助函数 |
+| `core/protocol/anthropic.py` | 345 | Anthropic ↔ OpenAI 格式翻译（纯函数） |
+| `core/protocol/responses.py` | 321 | Responses ↔ Chat 格式翻译（纯函数） |
+
+### 三条不许破的规矩
+
+**1. `/api` 的 router 只在 `portal_shared.py` 建一次。** 子模块一律 `from routers.portal_shared import router` 往同一个实例上注册。谁自己新建 `APIRouter`，谁的 `prefix="/api"` 和 `route_class=SessionRoute`（CSRF / Origin 校验）就都没了 —— 而且**不报错**，只是那条路由不再带会话鉴权。
+
+**2. 别在新模块里缓存 `USER_DB` / `BILLING`。** 换库有两条路径：`portal_state.rebind(db)` 和测试里直接 `mod.USER_DB = db`。模块级缓存一份自己的引用，第二条路径就会漏掉，表现是「写进去了但读不到」。`portal_shared._db()` 和 `portal_admin._db()` 每次从 `portal_state` 现取，是这个原因。
+
+> 拆完第一版就是栽在这里：`portal_admin` 直接用了模块级 `USER_DB`，全量测试 342 项失败。注意 `USER_DB.xxx` 好改，**把 `USER_DB` 当参数传出去**的（`generate_codes(USER_DB, ...)`）最容易漏。
+
+**3. 按行号搬代码时，装饰器算在块内。** `@router.post(...)` 在 `def` 的上一行，只按 `def` 切会把装饰器留在原地，函数搬走了却不再注册成路由。这次 `server.py` 就这么丢过一条 `POST /v1/messages/count_tokens` —— 路由比对才发现。
+
+### 怎么验证拆对了
+
+```bash
+# 路由清单比对（重构前后各存一份）
+python -c "import server; print(len(server.portal_router.routes))"   # 应为 94
+python -m pytest tests/ -q -p no:cacheprovider                       # 1088 passed
+python scripts/check_dead_code.py                                    # exit 0
+```
+
+> 别用 `app.routes` 数 `/api` 路由：这个 FastAPI 版本用 `_IncludedRouter` 惰性挂载，`include_router` 不在 `app.routes` 里摊平子路由，数出来只有 1 条 —— 是观测方式不对，不是路由丢了。

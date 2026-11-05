@@ -6,29 +6,39 @@
   const P = window.BitPortal;
   const { api, msg, dlg, copy, nf, usd, kf, fmt, MONO, SUBSTY, absTime, dayTime,
     relTime, st, POLICY, MODE, tag, money, reasonOf, ic, Ic, C, CT, tipRow, wrapTip,
-    subline, stack, box, modelChip, costChip, timeRow, Pills, StatCard,
-    BarChart, Donut, prov, provIcon, Avatar, shrinkAvatar,
-    elapsedLv, frtLv, tpsOf, kindOf, normUsage, END_TEXT, EXPIRY_PRESETS,
+    subline, stack, box, modelChip, Pills, StatCard,
+    prov, provIcon, Avatar, shrinkAvatar,
+    tpsOf, normUsage, usageColumns, END_TEXT, EXPIRY_PRESETS,
     planDur, planKind, planLeft,
     CCSWITCH_APPS, ccServerAddress, buildCCSwitchURL, ccLoadModels, go,
     BASE, token, setToken, qs, download } = P;
 
   const dash = (v) => (v == null ? "—" : v);
   const pxCell = (v) => (v == null ? "—" : "$" + Number(v).toFixed(4));
-  /* 对外的 API 端点就是本站自己。写死域名会让换了域名的部署复制出一个打不通的地址,
-     所以和 ccServerAddress 一样从 location 算。 */
-  const API_ENDPOINT = (location.origin + BASE).replace(/\/+$/, "") + "/";
+  const API_ENDPOINT = "https://ai.baipiao.co/";
   const MONO_ATTR = { style: MONO };
 
   /* 页面级加载/报错壳:一处写好,7 个页面不各写一遍 spin 和空态。 */
   const Load = {
     props: ["loading", "error", "onRetry"],
+    setup(props) {
+      const loaded = ref(!props.loading);
+      watch(() => props.loading, (busy) => { if (!busy) loaded.value = true; });
+      return { loaded };
+    },
     render() {
       if (this.error)
         return h(naive.NResult, { status: "error", title: "加载失败",
           description: String(this.error) }, { footer: () =>
             h(naive.NButton, { onClick: this.onRetry }, () => "重试") });
-      return h(naive.NSpin, { show: !!this.loading, style: "width:100%" },
+      if (this.loading && !this.loaded)
+        return h("div", { class: "console-loading", role: "status", "aria-label": "正在加载数据", "aria-busy": "true" }, [
+          h("span", { class: "console-sr-only" }, "正在加载数据"),
+          h("div", { class: "console-loading-head", "aria-hidden": "true" }),
+          h("div", { class: "console-loading-value", "aria-hidden": "true" }),
+          h("div", { class: "console-loading-grid", "aria-hidden": "true" }, [1, 2, 3].map(() => h("div", { class: "console-loading-block" }))),
+        ]);
+      return h(naive.NSpin, { show: !!this.loading, style: "width:100%", "aria-busy": !!this.loading },
         () => h("div", { style: this.loading ? "min-height:220px" : null },
           this.$slots.default ? this.$slots.default() : null));
     },
@@ -49,7 +59,7 @@
     return { loading, error, reload: run };
   }
   const Dashboard = {
-    components: { Load, StatCard, Pills, BarChart, Donut, Ic },
+    components: { Load, StatCard, Pills, Ic, ModelCachePanel: P.ModelCachePanel },
     setup() {
       const o = ref({});
       const sum = ref({});
@@ -89,10 +99,13 @@
           (n < all ? "(" + n + "/" + all + " 条可算)" : "");
       };
 
-      /* 八张卡按 4×2 排:第一行「钱与量」,第二行「Token 与性能」。
-         性能指标合并成一张双行卡(RPM/TPM),不再单开一块面板。 */
+      /* 账户摘要置顶，调用与性能指标单独成组。 */
       const cards = computed(() => {
         const list = [];
+        const cacheTokens = total.value.cache_tokens;
+        const totalInput = cacheTokens == null || total.value.input_tokens == null ? null
+          : Number(total.value.input_tokens) + Number(cacheTokens);
+        const cacheKnown = (total.value.cache_rows || 0) > 0 && totalInput > 0;
         if (policy.value === "balance")
           list.push({ label: "余额", value: "$" + fmt(o.value.balance),
             sub: "累计消费 $" + fmt(o.value.total_spent),
@@ -101,11 +114,11 @@
           list.push({ label: "计费策略", value: POLICY[policy.value] || policy.value,
             sub: o.value.group ? "分组 " + o.value.group : "未分配分组",
             color: "#3f6b8a", icon: "tag" });
-        list.push({ label: "API 密钥", value: nf(keys.value.total),
+        list.push({ label: "API 密钥", value: nf(keys.value.total), animate: true,
           sub: keys.value.active + " 启用 · " +
             (keys.value.total - keys.value.active) + " 失效",
           color: "#4a6fa5", icon: "key" });
-        list.push({ label: "今日请求", value: nf(today.value.requests || 0),
+        list.push({ label: "今日请求", value: nf(today.value.requests || 0), animate: true,
           sub: "累计 " + nf(total.value.requests || 0),
           color: "#3f6b8a", icon: "bars" });
         /* 原价与实扣并排:倍率不为 1 时两者不同,只显示一个会让人对不上账。 */
@@ -114,15 +127,23 @@
           value2: "$" + fmt(today.value.cost || 0),
           sub: "累计 $" + fmt(total.value.actual_cost || 0) +
             " / $" + fmt(total.value.cost || 0),
-          color: "#6b5b95", icon: "dollar", tint: true });
-        list.push({ label: "今日 Token", value: kf(tokOf(today.value)),
+          color: "#6b5b95", icon: "dollar", tone: "accent" });
+        list.push({ label: "今日 Token", value: kf(tokOf(today.value)), animate: true,
           sub: "输入 " + kf(today.value.input_tokens || 0) + " · 输出 " +
             kf(today.value.output_tokens || 0) + " · " + cacheNote(today.value),
           color: "#a17a10", icon: "cube" });
-        list.push({ label: "累计 Token", value: kf(tokOf(total.value)),
+        list.push({ label: "累计 Token", value: kf(tokOf(total.value)), animate: true,
           sub: "输入 " + kf(total.value.input_tokens || 0) + " · 输出 " +
             kf(total.value.output_tokens || 0) + " · " + cacheNote(total.value),
           color: "#6b5b95", icon: "coins" });
+        list.push({ label: "缓存率",
+          value: cacheKnown ? fmt(Number(cacheTokens) / totalInput * 100, 1) + "%" : "—",
+          sub: "个人累计 · 缓存 ÷ 总输入，不含输出",
+          sub2: cacheKnown ? "缓存 " + kf(cacheTokens) + " / 总输入 " + kf(totalInput) +
+            ((total.value.cache_rows || 0) < (total.value.requests || 0)
+              ? " · " + total.value.cache_rows + "/" + total.value.requests + " 条缓存可算" : "")
+            : "暂无可计算的缓存记录",
+          color: "#4a6fa5", icon: "database" });
         /* 速率小于 10 时给两位小数:演示量级下 round 成整数会一律显示 0 或 1,
            看不出差别;上到几百以后小数没意义,改千分位。 */
         const rate = (v) => (v < 10 ? fmt(v, 2) : nf(Math.round(v)));
@@ -137,6 +158,7 @@
             ? fmt((perf.value.avg_ms || 0) / 1000, 2) + "s" : "—",
           sub: perf.value.samples ? perf.value.samples + " 次有耗时记录"
             : "暂无耗时样本",
+          tone: perf.value.samples ? P.elapsedLv((perf.value.avg_ms || 0) / 1000) : null,
           color: "#b91c1c", icon: "clock" });
         return list;
       });
@@ -170,44 +192,15 @@
             pct: Math.min(100, Math.round((x[1].used / x[1].limit) * 100)) }));
       });
 
-      /* ---- 图表 ---- */
-      const series = computed(() => o.value.series || []);
-      const metric = ref("tokens");
-      const METRICS = [{ label: "Token", value: "tokens" },
-        { label: "请求", value: "requests" }, { label: "消费", value: "cost" }];
-      const METRIC_COLOR = { tokens: "#6b5b95", requests: "#3f6b8a",
-        cost: "#a17a10" };
-      const bars = computed(() => series.value.map((d) => {
-        const v = d[metric.value] || 0;
-        return { label: d.label, value: v,
-          text: metric.value === "cost" ? "$" + fmt(v)
-            : metric.value === "tokens" ? nf(v) + " tok" : nf(v) + " 次" };
-      }));
-      const barSum = computed(() => bars.value.reduce((a, x) => a + x.value, 0));
-      const activeDays = computed(() =>
-        bars.value.filter((x) => x.value > 0).length);
-
-      /* 环形图用供应商色而不是一串固定色板:同一家的模型在别处也是这个颜色,
-         图例和模型牌能对上。 */
-      const pie = computed(() => {
-        const rows = o.value.by_model || [];
-        return rows.map((r) => ({ label: r.model, value: r.tokens || 0,
-          text: nf(r.tokens || 0) + " tok",
-          color: r.model.indexOf("其他") === 0 ? "#94a3b8" : prov(r.model).c,
-          requests: r.requests || 0, cost: r.cost || 0 }));
-      });
-      const pieTotal = computed(() =>
-        pie.value.reduce((a, x) => a + x.value, 0));
-
-      /* 套餐卡要显示完整:分组、状态、计费、倍率、RPM、限额口径、
+      /* 套餐卡要显示完整:分组、状态、计费、倍率、并发、限额口径、
          可用模型、余额/累计消费。原先只有 4 行,可用模型与余额都看不到。 */
       const planRows = computed(() => {
         const rows = [["分组", o.value.group || "未分配"],
           ["计费方式", POLICY[policy.value] || policy.value]];
         if (o.value.rate_multiplier != null)
           rows.push(["倍率", "×" + o.value.rate_multiplier]);
-        rows.push(["RPM 上限",
-          o.value.rpm_limit ? o.value.rpm_limit + " 次/分" : "不限"]);
+        rows.push(["并发上限",
+          o.value.concurrency_limit ? o.value.concurrency_limit + " 个请求" : "不限"]);
         rows.push(["限额口径",
           o.value.limit_unit === "tokens" ? "Token" : "请求次数"]);
         return rows;
@@ -216,110 +209,76 @@
 
       return Object.assign({ cards, byModel, cols, quota, o, policy, sum,
         checkin, checkingIn, doCheckin,
-        series, metric, METRICS, METRIC_COLOR, bars, barSum, activeDays,
-        pie, pieTotal, planRows, models, nf, kf, fmt, MONO,
+        planRows, models, keys, nf, kf, fmt, MONO,
         go: P.go }, s);
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
-<n-card size="small" style="margin-bottom:14px">
-  <div style="display:flex;align-items:center;justify-content:space-between;
-    gap:14px;flex-wrap:wrap">
-    <n-space align="center" :wrap="false">
-      <div class="bindicon" style="background:rgba(21,128,61,.10);color:#15803d">
-        <Ic name="gift" :size="20"/>
-      </div>
-      <div>
-        <div style="font-size:14px;font-weight:650">每日签到</div>
-        <n-text depth="3" style="font-size:11.5px">
-          <template v-if="checkin.checked_in">
-            今日已领取 \${{ fmt(checkin.reward, 4) }}，明天再来
-          </template>
-          <template v-else>
-            今日可随机领取 \${{ fmt(checkin.range && checkin.range.min, 4) }}
-            ～ \${{ fmt(checkin.range && checkin.range.max, 4) }}
-          </template>
-        </n-text>
-      </div>
-    </n-space>
-    <n-button type="primary" size="small" :loading="checkingIn"
-      :disabled="!!checkin.checked_in" @click="doCheckin">
-      {{ checkin.checked_in ? '今日已签到' : '立即签到' }}
-    </n-button>
+<div class="console-page-stack">
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">{{ cards[0].label }}</div>
+    <div class="console-hero-title"><MetricValue :value="o.group ? cards[0].value : '未分配分组'"/></div>
+    <p class="console-hero-note">{{ o.group ? cards[0].sub : '联系管理员分配分组，或查看可购买的套餐。' }}</p>
+    <div class="console-hero-actions">
+      <n-button type="primary" @click="go('#/keys')">管理 API 密钥</n-button>
+      <n-button secondary @click="go(policy === 'balance' ? '#/wallet' : '#/billing')">
+        {{ policy === 'balance' ? '充值余额' : '查看计费与套餐' }}</n-button>
+    </div>
   </div>
-</n-card>
-<n-grid :cols="'1 500:2 900:4'" :x-gap="14" :y-gap="14" responsive="self">
-  <n-gi v-for="c in cards" :key="c.label">
+  <aside class="console-hero-aside">
+    <div class="console-section-title">每日签到</div>
+    <p class="console-section-note">
+      <template v-if="checkin.checked_in">今日已领取 \${{ fmt(checkin.reward, 4) }}，明天再来。</template>
+      <template v-else>今日可随机领取 \${{ fmt(checkin.range && checkin.range.min, 4) }}
+        ～ \${{ fmt(checkin.range && checkin.range.max, 4) }}。</template>
+    </p>
+    <n-button secondary :loading="checkingIn" :disabled="!!checkin.checked_in" @click="doCheckin">
+      {{ checkin.checked_in ? '今日已签到' : '立即签到' }}</n-button>
+  </aside>
+</section>
+<section>
+  <div class="console-section-heading">
+    <div><h2 class="console-section-title">调用概况</h2>
+      <p class="console-section-note">近 24 小时用量、累计消耗与实际响应表现。</p></div>
+    <n-button text type="primary" @click="go('#/usage')">查看使用记录 →</n-button>
+  </div>
+<n-grid :cols="'1 340:2 560:3'" :x-gap="14" :y-gap="14" responsive="self">
+  <n-gi v-for="c in cards.slice(2, 5)" :key="c.label">
     <StatCard v-bind="c"/>
   </n-gi>
 </n-grid>
+</section>
 
-<n-grid :cols="'1 1000:3'" :x-gap="16" :y-gap="16" responsive="self"
-        style="margin-top:16px">
-  <n-gi :span="2">
-    <n-card size="small" title="近 14 天趋势">
-      <template #header-extra>
-        <n-space align="center" :size="10">
-          <n-text depth="3" style="font-size:11.5px">
-            {{ activeDays }}/14 天有调用
-          </n-text>
-          <n-radio-group v-model:value="metric" size="small">
-            <n-radio-button v-for="m in METRICS" :key="m.value"
-              :value="m.value">{{ m.label }}</n-radio-button>
-          </n-radio-group>
-        </n-space>
-      </template>
-      <BarChart :items="bars" :color="METRIC_COLOR[metric]" :height="132"/>
-      <n-text depth="3" style="font-size:11.5px;display:block;margin-top:10px">
-        合计
-        <n-text :style="MONO">{{ metric === 'cost' ? '$' + fmt(barSum)
-          : nf(barSum) }}</n-text>
-        · 按本地日历日分桶,空白日表示当天没有调用(不是断线)。
-      </n-text>
-    </n-card>
-  </n-gi>
-  <n-gi>
-    <n-card size="small" title="模型占比 · 累计">
-      <div v-if="pieTotal" style="display:flex;align-items:center;gap:16px">
-        <Donut :items="pie" :center="kf(pieTotal)" sub="Tokens"/>
-        <n-space vertical :size="6" style="flex:1;min-width:0">
-          <n-tooltip v-for="p in pie" :key="p.label" placement="left">
-            <template #trigger>
-              <div class="legrow">
-                <span class="legdot" :style="{background:p.color}"></span>
-                <span style="flex:1;min-width:0;overflow:hidden;
-                  text-overflow:ellipsis;white-space:nowrap">{{ p.label }}</span>
-                <span :style="MONO" style="opacity:.6">
-                  {{ Math.round(p.value / pieTotal * 100) }}%</span>
-              </div>
-            </template>
-            <div style="font-size:11.5px">
-              <div :style="MONO">{{ p.label }}</div>
-              <div style="opacity:.75;margin-top:3px">
-                {{ nf(p.value) }} tok · {{ nf(p.requests) }} 次 ·
-                \${{ fmt(p.cost) }}
-              </div>
-            </div>
-          </n-tooltip>
-        </n-space>
-      </div>
-      <n-empty v-else description="还没有调用记录" size="small"
-        style="padding:20px 0"/>
-    </n-card>
-  </n-gi>
+<n-grid :cols="'1 560:2 980:4'" :x-gap="14" :y-gap="14" responsive="self">
+  <n-gi v-for="c in cards.slice(5)" :key="c.label"><StatCard v-bind="c"/></n-gi>
 </n-grid>
+<ModelCachePanel/>
+<section>
+  <div class="console-section-heading">
+    <div><h2 class="console-section-title">继续你的工作</h2>
+      <p class="console-section-note">{{ nf(keys.active) }} 把有效密钥 · {{ nf(keys.total) }} 把密钥总计 · 当前分组 {{ o.group || '未分配' }}。</p></div>
+  </div>
+  <div class="console-action-grid">
+    <a class="console-action-card" href="#/keys"><Ic name="key" :size="22"/>
+      <strong>接入应用</strong><span>创建密钥，复制 API 地址，配置使用限制。</span></a>
+    <a class="console-action-card" href="#/plaza"><Ic name="cube" :size="22"/>
+      <strong>探索模型</strong><span>按供应商和计费方式查找可用模型。</span></a>
+    <a class="console-action-card" href="#/playground"><Ic name="response" :size="22"/>
+      <strong>在线体验</strong><span>发起真实对话，查看回答与 token 用量。</span></a>
+  </div>
+</section>
 
-<n-grid :cols="'1 1000:3'" :x-gap="16" :y-gap="16" responsive="self"
-        style="margin-top:16px">
-  <n-gi :span="2">
+<div class="console-workspace-grid">
+  <div>
     <n-card title="今日模型分布" size="small">
-      <n-data-table :columns="cols" :data="byModel" :bordered="false" size="small"/>
+      <n-data-table :columns="cols" :data="byModel" :bordered="false" size="small" :scroll-x="580"/>
       <template #footer v-if="!byModel.length">
         <n-text depth="3" style="font-size:12px">今日还没有调用记录。</n-text>
       </template>
     </n-card>
-  </n-gi>
-  <n-gi>
+  </div>
+  <div>
     <n-card size="small" :title="policy === 'quota' ? '额度用量与套餐' : '当前套餐'">
       <template #header-extra>
         <n-tag v-if="o.group" size="small" round :bordered="false" type="info">
@@ -344,7 +303,7 @@
         <n-descriptions :column="1" size="small" label-placement="left"
           :label-style="{opacity:.6,width:'72px'}">
           <n-descriptions-item v-for="r in planRows" :key="r[0]" :label="r[0]">
-            <span :style="r[0] === '倍率' || r[0] === 'RPM 上限' ? MONO : null">
+            <span :style="r[0] === '倍率' || r[0] === '并发上限' ? MONO : null">
               {{ r[1] }}</span>
           </n-descriptions-item>
           <n-descriptions-item v-if="policy === 'balance'" label="可用余额">
@@ -358,7 +317,7 @@
 
         <div>
           <n-text depth="3" style="font-size:12px;display:block;margin-bottom:6px">
-            可用模型 · {{ models.length }} 项
+            模型授权范围 · {{ models.length }} 条规则
           </n-text>
           <n-space :size="4">
             <n-tag v-for="m in models.slice(0, 8)" :key="m" size="small" round
@@ -381,8 +340,9 @@
           @click="go('#/billing')">查看套餐与单价 →</n-button>
       </n-space>
     </n-card>
-  </n-gi>
-</n-grid>
+  </div>
+</div>
+</div>
 </Load>`,
   };
   /* 密钥列的空态一律渲染「意思」而不是留白:留白会被读成「不允许」或
@@ -726,49 +686,60 @@
         CCSWITCH_APPS: CCSWITCH_APPS, base: ccServerAddress() }, s);
     },
     template: `
-<n-grid :cols="'1 560:2 1000:4'" :x-gap="14" :y-gap="14" responsive="self"
-  style="margin-bottom:14px">
-  <n-gi v-for="c in cards" :key="c.label">
-    <StatCard :label="c.label" :value="c.value" :sub="c.sub" :color="c.color"
-      :icon="c.icon" :tint="c.tint"/>
-  </n-gi>
-</n-grid>
-
-<n-card size="small" style="margin-bottom:14px" content-style="padding:14px 15px">
-  <n-space align="center" :size="10" style="row-gap:10px">
+<div class="console-page-stack">
+<section class="console-workspace-grid">
+  <n-card class="console-panel" size="small" title="连接你的应用">
+    <template #header-extra><n-button type="primary" @click="openCreate">创建密钥</n-button></template>
+    <p class="console-section-note">将 API 端点与一把密钥填入应用。已有密钥可在下方复制，或直接导入 CC Switch。</p>
+    <n-form label-placement="top">
+      <n-form-item label="API 端点" :show-feedback="false">
+        <n-input-group>
+          <n-input :value="endpoint" readonly :input-props="{'aria-label':'API 端点'}"/>
+          <n-button secondary aria-label="复制 API 端点" @click="copyEndpoint">
+            <template #icon><Ic name="copy" :size="15"/></template>复制</n-button>
+        </n-input-group>
+      </n-form-item>
+    </n-form>
+    <p class="console-section-note">需要让 AI 搜索、读取网页？<n-button tag="a" href="/mcp-guide" text type="primary" style="min-height:44px">查看 MCP 接入指南 →</n-button></p>
+  </n-card>
+  <n-card class="console-panel" size="small" title="访问范围">
+    <div class="console-inline-stat"><span class="console-inline-stat-label">当前分组</span>
+      <strong class="console-inline-stat-value">{{ grp.name || '未分配' }}</strong></div>
+    <p class="console-section-note">分组提供 {{ grp.models.length }} 个可选模型。每把密钥可以进一步设置额度、模型及 IP 限制。</p>
+    <a href="#/billing">查看分组计费规则 →</a>
+  </n-card>
+</section>
+<div class="console-resource-strip">
+  <div class="console-inline-stat" v-for="c in cards" :key="c.label">
+    <span class="console-inline-stat-label">{{ c.label }}</span>
+    <strong class="console-inline-stat-value"><MetricValue :value="c.value"/></strong>
+    <span class="console-section-note">{{ c.sub }}</span>
+  </div>
+</div>
+<section class="console-table-card">
+  <div class="console-section-heading">
+    <div><h2 class="console-section-title">我的密钥</h2>
+      <p class="console-section-note">名称用于识别应用；密钥只显示首尾片段，复制时获取完整值。</p></div>
+    <n-button secondary :loading="loading" @click="reload">刷新</n-button>
+  </div>
+  <div class="console-toolbar">
     <n-input v-model:value="q" clearable placeholder="搜索名称或密钥尾号…"
       style="width:250px">
       <template #prefix><Ic name="search" :size="14"/></template>
     </n-input>
     <n-select v-model:value="fstatus" :options="statusOpts" style="width:148px"/>
-    <n-text depth="3" style="font-size:11.5px">API 端点</n-text>
-    <n-tag size="small" round :bordered="false" :style="MONO">
-      {{ endpoint }}</n-tag>
-    <n-button size="small" secondary aria-label="复制 API 端点"
-      @click="copyEndpoint">
-      <template #icon><Ic name="copy" :size="14"/></template>
-      复制
-    </n-button>
-    <div style="flex:1"></div>
-    <n-button size="small" secondary @click="reload">刷新</n-button>
-    <n-button type="primary" size="small" @click="openCreate">
-      <template #icon><Ic name="key" :size="15"/></template>
-      创建密钥</n-button>
-  </n-space>
-</n-card>
-
-<n-card size="small" content-style="padding:0">
+    <n-text depth="3">{{ view.length }} 条匹配密钥</n-text>
+  </div>
   <Load :loading="loading" :error="error" :on-retry="reload">
     <n-data-table :columns="cols" :data="view" :bordered="false" size="small"
-      :scroll-x="1112" :row-key="(r) => r.id" :pagination="pagination"/>
+      :scroll-x="1112" :row-key="(r) => r.id" :pagination="pagination">
+      <template #empty><n-empty :description="q || fstatus ? '没有匹配的密钥，请调整筛选条件' : '还没有密钥，创建后即可接入应用'"/></template>
+    </n-data-table>
   </Load>
-</n-card>
-<n-text depth="3" style="font-size:11.5px;display:block;margin:10px 2px 0">
-  密钥只显示首尾片段,点复制按钮取完整明文(避免截图与投屏时整表泄露)。
-  分组每行相同 —— 密钥不能改分组;「可用模型」为空表示跟随分组白名单,
-  鼠标悬停可看分组允许的全部模型。
-</n-text>
-<n-drawer v-model:show="dr.show" :width="520" placement="right">
+</section>
+<p class="console-section-note">密钥不能更改所属分组。「可用模型」为空时跟随分组白名单，悬停可查看完整范围。</p>
+</div>
+<n-drawer v-model:show="dr.show" width="min(520px, 100vw)" placement="right">
   <n-drawer-content closable :native-scrollbar="false"
     :title="dr.mode === 'create' ? '创建 API 密钥' : '编辑 API 密钥'">
     <n-text depth="3" style="font-size:12.5px;display:block;margin:-4px 0 4px">
@@ -923,7 +894,7 @@
 </n-modal>`,
   };
   const Usage = {
-    components: { Load, Pills, Ic, StatCard },
+    components: { Load, UsageMetrics: P.LiveUsageMetrics, Ic, StatCard },
     setup() {
       const rows = ref([]);
       const total = ref(0);
@@ -938,7 +909,7 @@
       const f = reactive({ span: null, model: "all", key: "all", failed: false });
 
       /* 列表、统计卡、导出三处用同一份条件:卡片说 40 次而翻页翻出 43 条,
-         用户会先怀疑账。时间上自选区间优先,没选就按上面的今日/7 天/30 天。 */
+         用户会先怀疑账。时间上自选区间优先,没选就按近 24 小时/7 天/30 天。 */
       const params = () => {
         const span = f.span && f.span.length === 2 ? f.span : null;
         return { range: range.value, model: f.model, api_key_id: f.key,
@@ -1007,119 +978,19 @@
             sub: "输入 " + kf(a.input_tokens || 0) + " / 输出 " +
               kf(a.output_tokens || 0) + " / 缓存 " + kf(a.cache_tokens || 0),
             color: "#a06a2c", icon: "cube" },
-          { label: "总消费", value: "$" + (a.actual_cost || 0).toFixed(4),
+          { label: "所选范围消费", value: "$" + (a.actual_cost || 0).toFixed(4),
             sub: "长上下文 " + (a.long || 0) + " 次 · 失败 " + (a.failed || 0) + " 次",
-            color: "#15803d", icon: "dollar", tint: true },
+            color: "#15803d", icon: "dollar", tone: "accent" },
           { label: "平均耗时", value: ((a.avg_ms || 0) / 1000).toFixed(2) + "s",
             sub: a.frt_ms == null ? "无首字记录"
               : "首字均 " + (a.frt_ms / 1000).toFixed(2) + "s",
+            tone: a.requests ? P.elapsedLv((a.avg_ms || 0) / 1000) : null,
             color: "#6b5b95", icon: "clock" },
         ];
       });
-      const stats = computed(() => [
-        ["用量", usd(totals.value.actual_cost || 0), C.cost],
-        ["请求", nf(totals.value.requests || 0), C.ctx],
-        ["失败", nf(totals.value.failed || 0),
-          totals.value.failed ? C.err : "#94a3b8"],
-      ]);
-      const cols = [
-        { title: "时间", key: "t", width: 152, render: (r) => {
-            const k = kindOf(r);
-            return stack(
-              h("span", { style: Object.assign({ fontSize: "12px" }, MONO) },
-                absTime(r.t)),
-              h("span", { style: { fontSize: "11px", color: k[1],
-                opacity: k[1] ? 0.9 : 0.5 } }, k[0])); } },
-        { title: "密钥", key: "key", width: 148, render: (r) => stack(
-            box([ic("key", 12, undefined, 2),
-                 h("span", { style: { whiteSpace: "nowrap" } }, r.key)],
-                { fontWeight: 550 }),
-            r.ratio != null && r.ratio !== 1 ? "倍率 " + r.ratio + "x" : null) },
-        { title: "模型", key: "model", width: 190,
-          render: (r) => modelChip(r.model) },
-        { title: "流", key: "stream", width: 72, render: (r) => {
-            const sp = tpsOf(r);
-            return stack(
-              h("span", { style: { fontSize: "12px", fontWeight: 600,
-                color: r.stream ? C.ctx : undefined,
-                opacity: r.stream ? 1 : 0.5 } }, r.stream ? "流" : "非流"),
-              sp ? h("span", { style: Object.assign({ fontSize: "11px",
-                opacity: 0.5 }, MONO) }, sp + " t/s") : null); } },
-        /* 缓存读写没有单独落列,只能显示由判定量反推出的合计。 */
-        { title: "Tokens", key: "i", width: 156, render: (r) => {
-            const tot = r.i + r.o + (r.cache || 0);
-            const cache = r.cache ? h("span", { style: Object.assign(
-              { fontSize: "10.5px", opacity: 0.5, whiteSpace: "nowrap" }, MONO) },
-              "缓存 " + nf(r.cache)) : null;
-            return wrapTip(h("div", { style: { display: "flex",
-              flexDirection: "column", alignItems: "flex-start", gap: "2px",
-              cursor: "help" } }, [
-              h("span", { style: Object.assign({ fontSize: "12px",
-                fontWeight: 600, whiteSpace: "nowrap" }, MONO) },
-                nf(r.i) + " / " + nf(r.o)),
-              cache,
-            ]), [
-              tipRow("输入", nf(r.i), CT.in),
-              tipRow("输出", nf(r.o), CT.out),
-              r.cache ? tipRow("缓存合计", nf(r.cache), CT.cr) : null,
-              r.ctx == null ? null
-                : tipRow("判定 ctx", nf(r.ctx) + (r.thr ? " / " + nf(r.thr) : ""),
-                  CT.ctx),
-              tipRow("合计", nf(tot), undefined, true),
-            ]); } },
-        { title: "费用", key: "cost", width: 112, render: (r) => {
-            const chip = r.free ? costChip("免费", "#15803d")
-              : costChip(usd(r.cost).slice(1));
-            const rows = [];
-            if (r.px) {
-              rows.push(tipRow("输入价", pxCell(r.px.i) + " /M", CT.in));
-              rows.push(tipRow("输出价", pxCell(r.px.o) + " /M", CT.out));
-              if (r.px.cr != null)
-                rows.push(tipRow("缓存读价", pxCell(r.px.cr) + " /M", CT.cr));
-              if (r.px.cw != null)
-                rows.push(tipRow("缓存写价", pxCell(r.px.cw) + " /M", CT.cw));
-              rows.push(tipRow("档位", r.tier === "long" ? "长上下文" : "标准",
-                r.tier === "long" ? CT.cw : undefined));
-            } else if (r.perReq) {
-              rows.push(tipRow("按次单价", pxCell(r.perPrice), CT.cost));
-              rows.push(tipRow("次数", nf(r.units || 1)));
-            } else {
-              rows.push(tipRow("计费", "免费策略 · 无单价快照", CT.in));
-            }
-            if (r.ratio != null) rows.push(tipRow("分组倍率", r.ratio + "x"));
-            rows.push(tipRow("实际扣费", usd(r.cost), CT.cost, true));
-            return wrapTip(chip, rows); } },
-        { title: "耗时", key: "ms", width: 116, render: (r) => {
-            return h("div", { style: { display: "flex", flexDirection: "column",
-              gap: "2px" } }, [
-              timeRow("首字", r.frt == null ? "—"
-                : (r.frt / 1000).toFixed(1) + "s",
-                r.frt == null ? null : frtLv(r.frt / 1000)),
-              timeRow("耗时", (r.ms / 1000).toFixed(1) + "s",
-                elapsedLv(r.ms / 1000)),
-            ]); } },
-        { title: "详情", key: "rid", minWidth: 186, render: (r) => {
-            const long = r.tier === "long";
-            const txt = r.free ? "免费策略 · 不计费"
-              : r.perReq ? "按次 · " + pxCell(r.perPrice) + "/次"
-              : r.px ? (long ? "长档" : "标准") + " · " + pxCell(r.px.i) +
-                  " / " + pxCell(r.px.o) + "/M"
-              : "无定价快照";
-            return h("div", { style: { display: "flex", alignItems: "center",
-              gap: "5px" } }, [
-              !r.ok ? h(naive.NTooltip, { placement: "left" }, {
-                trigger: () => h("span", { style: { display: "flex",
-                  cursor: "help", color: C.err } }, ic("alert", 13)),
-                default: () => END_TEXT[r.end] || r.end }) : null,
-              long ? ic("fire", 12, C.cw) : null,
-              h("span", { class: "dtl", style: Object.assign({ fontSize: "11.5px",
-                whiteSpace: "nowrap", color: long ? C.cw : undefined,
-                opacity: long ? 1 : 0.72 }, MONO),
-                onClick: () => { detail.value = r; } }, txt),
-            ]); } },
-      ];
+      const cols = usageColumns((r) => { detail.value = r; });
       const rowClass = (r) => (!r.ok ? "row-err" : "");
-      return Object.assign({ rows, cols, rowClass, stats, cards, detail,
+      return Object.assign({ rows, cols, rowClass, cards, detail,
         range, f, modelOpts, keyOpts, reset, query, nf, usd, kf, fmt, MONO,
         tpsOf, C, dash, pxCell, absTime, END_TEXT, MODE, POLICY,
         total, page, pageSize, jump, resize, exportCsv, exporting,
@@ -1128,18 +999,24 @@
       }, s);
     },
     template: `
+<div class="console-page-stack">
+<div class="console-section-heading">
+  <div><h2 class="console-section-title">追踪每一次调用</h2>
+    <p class="console-section-note">按时间、模型和密钥查看用量；打开记录可核对响应表现与计费快照。</p></div>
+  <n-button secondary :loading="exporting" @click="exportCsv">导出当前结果</n-button>
+</div>
 <n-grid :cols="'1 640:2 1180:4'" :x-gap="12" :y-gap="12" responsive="self"
-        style="margin-bottom:14px">
+        >
   <n-gi v-for="c in cards" :key="c.label">
     <StatCard :label="c.label" :value="c.value" :sub="c.sub" :color="c.color"
-      :icon="c.icon" :tint="c.tint"/>
+      :icon="c.icon" :tint="c.tint" :tone="c.tone"/>
   </n-gi>
 </n-grid>
 
-<n-card size="small" title="通用日志" :segmented="{content:true}"
+<n-card class="console-table-card" size="small" title="请求记录" :segmented="{content:true}"
         :content-style="'padding:14px 15px'">
   <n-grid :cols="'1 700:2 1100:5'" :x-gap="8" :y-gap="8" responsive="self">
-    <n-gi :span="2"><n-date-picker v-model:value="f.span" type="datetimerange"
+    <n-gi span="1 700:2"><n-date-picker v-model:value="f.span" type="datetimerange"
       clearable size="small" style="width:100%"/></n-gi>
     <n-gi><n-select size="small" v-model:value="f.model" filterable
       :options="modelOpts"/></n-gi>
@@ -1151,16 +1028,14 @@
 
   <n-space align="center" justify="space-between" :size="10" wrap
     style="margin-top:10px">
-    <Pills :items="stats"/>
+    <UsageMetrics/>
     <n-space :size="7" align="center">
       <n-radio-group v-model:value="range" size="small" :disabled="!!f.span">
-        <n-radio-button value="day">今日</n-radio-button>
+        <n-radio-button value="day">近 24 小时</n-radio-button>
         <n-radio-button value="week">7 天</n-radio-button>
         <n-radio-button value="month">30 天</n-radio-button>
       </n-radio-group>
       <n-button size="small" secondary @click="reset">重置</n-button>
-      <n-button size="small" secondary :loading="exporting" @click="exportCsv">
-        导出 CSV</n-button>
       <n-button size="small" type="primary" :loading="loading" @click="query">
         查询</n-button>
     </n-space>
@@ -1168,13 +1043,13 @@
 
   <template #footer>
     <Load :loading="loading" :error="error" :on-retry="reload">
-      <n-data-table :columns="cols" :data="rows" :bordered="false" size="small"
-        :row-class-name="rowClass" :scroll-x="1132" :row-key="(r) => r.id"/>
+      <n-data-table class="usage-table" table-layout="fixed" :columns="cols" :data="rows" :bordered="false" size="small"
+        :row-class-name="rowClass" :scroll-x="1280" :row-key="(r) => r.id"/>
       <n-space justify="space-between" align="center" style="margin-top:10px" wrap>
         <n-text depth="3" style="font-size:11.5px">
-          自选时间区间优先于右上的今日 / 7 天 / 30 天;统计卡与列表始终是同一组条件。
+          自选时间区间优先于右上的近 24 小时 / 7 天 / 30 天;统计卡与列表始终是同一组条件。
         </n-text>
-        <n-pagination :page="page" :page-size="pageSize" :item-count="total"
+        <n-pagination class="usage-pagination" :page="page" :page-size="pageSize" :item-count="total"
           :page-slot="6" show-size-picker :page-sizes="[20,50,100,200]"
           @update:page="jump" @update:page-size="resize">
           <template #prefix>共 {{ nf(total) }} 条</template>
@@ -1183,8 +1058,9 @@
     </Load>
   </template>
 </n-card>
+</div>
 
-<n-drawer :show="!!detail" :width="470" placement="right"
+<n-drawer class="usage-drawer" :show="!!detail" width="min(470px, 100vw)" placement="right"
   @update:show="v=>{ if(!v) detail=null }">
   <n-drawer-content v-if="detail" title="请求详情" closable
     :native-scrollbar="false">
@@ -1218,6 +1094,9 @@
             <n-text :style="MONO" style="font-size:12.5px">
               {{ dash(detail.tokenSource) }}</n-text>
           </n-descriptions-item>
+          <n-descriptions-item label="请求 IP">
+            <span :style="MONO">{{ detail.ip || '未记录' }}</span>
+          </n-descriptions-item>
         </n-descriptions>
       </div>
       <div>
@@ -1231,9 +1110,13 @@
           <n-descriptions-item label="输出 token">
             <span :style="MONO" style="color:#6b5b95;font-weight:650">
               {{ nf(detail.o) }}</span></n-descriptions-item>
-          <n-descriptions-item label="缓存 token 合计">
+          <n-descriptions-item label="缓存读取 token">
             <span :style="MONO" style="color:#3f6b8a;font-weight:650">
-              {{ detail.cache == null ? '—' : nf(detail.cache) }}</span>
+              {{ detail.cacheRead == null ? '—' : nf(detail.cacheRead) }}</span>
+          </n-descriptions-item>
+          <n-descriptions-item label="缓存写入 token">
+            <span :style="MONO" style="color:#97882f;font-weight:650">
+              {{ detail.cacheWrite == null ? '—' : nf(detail.cacheWrite) }}</span>
           </n-descriptions-item>
           <n-descriptions-item label="判定量 ctx">
             <span :style="MONO" style="color:#4a6fa5;font-weight:650">
@@ -1241,6 +1124,14 @@
             <n-text depth="3" v-if="detail.thr" style="font-size:11px">
               &nbsp;/ {{ nf(detail.thr) }}</n-text>
           </n-descriptions-item>
+          <n-descriptions-item v-if="detail.cacheWrite30m != null" label="写入 · 30 分钟 token">
+            {{ nf(detail.cacheWrite30m) }}</n-descriptions-item>
+          <n-descriptions-item v-if="detail.cacheWrite12h != null" label="写入 · 12 小时 token">
+            {{ nf(detail.cacheWrite12h) }}</n-descriptions-item>
+          <n-descriptions-item v-if="detail.cacheWriteUnclassified" label="写入 · 未分档 token">
+            {{ nf(detail.cacheWriteUnclassified) }}</n-descriptions-item>
+          <n-descriptions-item v-if="detail.cacheWriteTTLValid === false" label="写入分档">
+            上游分档不完整或合计不符，按合计和基础写入价结算</n-descriptions-item>
           <n-descriptions-item label="总耗时">
             <span :style="MONO" style="font-weight:650">
               {{ (detail.ms/1000).toFixed(2) }}s</span></n-descriptions-item>
@@ -1251,9 +1142,10 @@
               &nbsp;· {{ tpsOf(detail) }} tok/s</n-text>
           </n-descriptions-item>
         </n-descriptions>
-        <n-text depth="3" v-if="detail.cache != null"
+        <n-text depth="3" v-if="!detail.cacheSplit"
           style="font-size:11px;display:block;margin-top:5px">
-          日志未分列缓存读/写,此处由「判定量 ctx − 输入」反推合计。
+          此记录未保存缓存读写明细。<template v-if="detail.cache != null">
+            缓存合计 {{ nf(detail.cache) }} token。</template>
         </n-text>
       </div>
 
@@ -1286,6 +1178,10 @@
             <n-descriptions-item label="缓存写价" v-if="detail.px.cw != null">
               <span :style="MONO">{{ pxCell(detail.px.cw) }} /M</span>
             </n-descriptions-item>
+            <n-descriptions-item label="写入 · 30 分钟价" v-if="detail.px.cw30 != null">
+              <span :style="MONO">{{ pxCell(detail.px.cw30) }} /M</span></n-descriptions-item>
+            <n-descriptions-item label="写入 · 12 小时价" v-if="detail.px.cw12 != null">
+              <span :style="MONO">{{ pxCell(detail.px.cw12) }} /M</span></n-descriptions-item>
           </template>
           <n-descriptions-item label="按次单价" v-else-if="detail.perReq">
             <span :style="MONO">{{ pxCell(detail.perPrice) }} × {{
@@ -1335,8 +1231,15 @@
       const providers = ref([]);
       const inv = ref({ earned: 0 });
       const amount = ref(10);
-      const provider = ref("mock");
+      const provider = ref(null);
       const minTopup = ref(1);
+      const maoRate = ref(1);
+      const maoQuote = computed(() => {
+        // 与两位美元金额、四位比例输入对应，避免浮点乘法把整数误向上进位。
+        const cents = Math.round(Number(amount.value || 0) * 100);
+        const rateUnits = Math.round(Number(maoRate.value) * 10000);
+        return Math.ceil(cents * rateUnits / 1000000);
+      });
       const code = ref("");
       const busy = reactive({ pay: false, redeem: false });
       // 付款窗口开着的那笔单。轮询它直到 completed —— 用户在新标签页付完款回来,
@@ -1355,13 +1258,13 @@
         orders.value = r[1].orders || [];
         providers.value = (r[2].providers || []).map((p) =>
           ({ label: p.display_name || p.name, value: p.name }));
+        maoRate.value = r[2].mao_per_usd || 1;
         if (r[2].min_topup) {
           minTopup.value = r[2].min_topup;
           if (amount.value < r[2].min_topup) amount.value = r[2].min_topup;
         }
-        if (providers.value.length &&
-            !providers.value.some((p) => p.value === provider.value))
-          provider.value = providers.value[0].value;
+        if (!providers.value.some((p) => p.value === provider.value))
+          provider.value = providers.value[0]?.value || null;
         inv.value = r[3];
       }));
 
@@ -1393,6 +1296,8 @@
       onUnmounted(stopWatch);
 
       const pay = () => {
+        if (!providers.value.some((p) => p.value === provider.value))
+          return msg.warning("暂无可用支付方式，请稍后再试");
         if (!(amount.value >= minTopup.value))
           return msg.warning("单笔最低充值 " + usd(minTopup.value));
         busy.pay = true;
@@ -1432,7 +1337,7 @@
           render: (r) => h("span", MONO_ATTR, r.balance_after == null
             ? "—" : "$" + fmt(r.balance_after, 2)) },
         { title: "幂等键", key: "idem_key", minWidth: 190, render: (r) =>
-            h(naive.NText, { depth: 3, style: SUBSTY }, () => r.meta && r.meta.kind === "fixed_invite" ? "有效注册奖励" : r.idem_key || "—") },
+            h(naive.NText, { depth: 3, style: SUBSTY }, () => r.idem_key || "—") },
       ];
       const OST = { pending: ["warning", "待支付"], paid: ["info", "已支付"],
         recharging: ["info", "到账中"], completed: ["success", "已完成"],
@@ -1443,7 +1348,11 @@
               r.out_trade_no) },
         { title: "金额", key: "amount", align: "right", width: 96,
           render: (r) => h("span", MONO_ATTR, "$" + fmt(r.amount, 2)) },
-        { title: "渠道", key: "provider", width: 104 },
+        { title: "渠道", key: "provider", width: 132,
+          render: (r) => r.provider === "baipiao" ? "白嫖社区毛支付" : r.provider },
+        { title: "应付", key: "pay_amount_mao", width: 108,
+          render: (r) => r.pay_amount_mao != null ? r.pay_amount_mao + " 毛"
+            : r.pay_amount_cny != null ? "¥" + fmt(r.pay_amount_cny, 2) : "—" },
         { title: "状态", key: "status", width: 96, render: (r) => {
             const m = OST[r.status] || ["default", r.status];
             return tag(m[0], m[1]); } },
@@ -1452,24 +1361,29 @@
               absTime(r.created_at)) },
       ];
       return Object.assign({ bal, entries, orders, providers, inv, amount,
-        provider, code, busy, lcols, ocols, pay, doRedeem, fmt, usd,
-        minTopup, watching }, s);
+        provider, code, busy, lcols, ocols, pay, doRedeem, fmt, usd, go,
+        minTopup, watching, maoRate, maoQuote }, s);
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
-<n-grid :cols="'1 640:3'" :x-gap="12" :y-gap="12" responsive="self">
-  <n-gi><StatCard label="可用余额" :value="'$' + fmt(bal.balance, 2)"
-    sub="消费按次实时扣减" color="#a8613c" icon="wallet" :tint="true"/></n-gi>
-  <!-- 消费额不锁 2 位:小额消费在两位小数下会显示成 $0.00,与概览页对不上。 -->
-  <n-gi><StatCard label="累计消费" :value="'$' + fmt(bal.total_spent)"
-    sub="请求扣费与买卡合计" color="#6b5b95" icon="dollar"/></n-gi>
-  <n-gi><StatCard label="累计返佣" :value="'$' + fmt(inv.earned, 4)"
-    :sub="'已邀请 ' + (inv.invitees || 0) + ' 人'" color="#a06a2c" icon="gift"/></n-gi>
-</n-grid>
-
-<n-grid :cols="'1 900:2'" :x-gap="14" :y-gap="14" responsive="self"
-        style="margin-top:14px">
-  <n-gi><n-card size="small" title="充值">
+<div class="console-page-stack">
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">可用余额 · 美元</div>
+    <div class="console-hero-title"><MetricValue :value="'$' + fmt(bal.balance, 2)"/></div>
+    <p class="console-hero-note">充值、兑换与返佣计入同一账户，余额变动按实际计费结果记录。</p>
+    <div class="console-hero-actions"><n-button secondary @click="go('#/billing')">查看套餐与单价</n-button></div>
+  </div>
+  <aside class="console-hero-aside">
+    <div class="console-inline-stat"><span class="console-inline-stat-label">累计消费 · 含请求与套餐</span>
+      <strong class="console-inline-stat-value"><MetricValue :value="'$' + fmt(bal.total_spent)"/></strong></div>
+    <div class="console-inline-stat"><span class="console-inline-stat-label">累计返佣 · 已邀请 {{ inv.invitees || 0 }} 人</span>
+      <strong class="console-inline-stat-value"><MetricValue :value="'$' + fmt(inv.earned, 2)"/></strong></div>
+  </aside>
+</section>
+<div class="console-workspace-grid">
+  <n-card class="console-panel" size="small" title="充值余额">
+    <p class="console-section-note">选择金额与支付方式，支付完成后自动更新账户余额。单笔最低 {{ usd(minTopup) }}。</p>
     <n-space vertical :size="14">
       <n-radio-group v-model:value="amount" size="small">
         <n-radio-button :value="5">$5</n-radio-button>
@@ -1480,10 +1394,15 @@
       <n-input-number v-model:value="amount" :min="minTopup" :precision="2"
         style="width:100%"><template #prefix>$</template></n-input-number>
       <n-select v-model:value="provider" :options="providers"
-        placeholder="支付渠道"/>
+        :disabled="!providers.length"
+        :placeholder="providers.length ? '请选择支付方式' : '暂无可用支付方式'"/>
+      <n-alert v-if="provider === 'baipiao'" type="info" :bordered="false" :show-icon="false">
+        购买 {{ '$' + fmt(amount, 2) }} API 余额，预计需 {{ maoQuote }} 毛。
+        每 $1 需 {{ maoRate }} 毛，不足一毛向上取整；下单后以该订单报价为准。
+      </n-alert>
       <n-alert v-if="!providers.length" type="warning" :bordered="false"
         :show-icon="false" style="font-size:12.5px">
-        站点未启用任何支付渠道,请联系管理员配置 BITAPI_PAYMENT_PROVIDERS。</n-alert>
+        在线充值暂未开放，请稍后再试或联系站长。</n-alert>
       <n-alert v-if="watching" type="info" :bordered="false"
         :show-icon="false" style="font-size:12.5px">
         <n-space align="center" :size="8">
@@ -1493,31 +1412,40 @@
       </n-alert>
       <n-button type="primary" block :loading="busy.pay"
         :disabled="!providers.length" @click="pay">
-        去支付 \${{ fmt(amount, 2) }}</n-button>
+        {{ !providers.length ? '暂未开放在线充值' : (provider === 'baipiao' ? '用毛购买 ' : '去支付 ') + '$' + fmt(amount, 2) }}</n-button>
     </n-space>
-  </n-card></n-gi>
-  <n-gi><n-card size="small" title="兑换码">
+  </n-card>
+  <n-card class="console-panel" size="small" title="兑换额度">
+    <p class="console-section-note">已有兑换码，可在这里将额度计入当前账户。</p>
     <n-space vertical :size="14">
       <n-input v-model:value="code" placeholder="XXXX-XXXX-XXXX-XXXX"
         @keyup.enter="doRedeem"/>
       <n-alert type="default" :bordered="false" style="font-size:12.5px">
-        兑换后额度立即计入余额,可在下方流水按来源筛选。充值到账同样走内部兑换码,
-        因此充值流水的来源显示为「充值到账」。</n-alert>
+        兑换后额度立即计入余额，下方流水记录每笔变动。在线充值的流水来源显示为「充值到账」。</n-alert>
       <n-button block :loading="busy.redeem" @click="doRedeem">兑换</n-button>
     </n-space>
-  </n-card></n-gi>
-</n-grid>
-
-<n-card size="small" title="余额流水" style="margin-top:14px">
-  <n-data-table :columns="lcols" :data="entries" :bordered="false" size="small"
-    :scroll-x="792" :row-key="(r) => r.id"
-    :pagination="{pageSize:10,pageSlot:5,prefix:({itemCount})=>'总计 '+itemCount}"/>
-</n-card>
-<n-card size="small" title="我的订单" style="margin-top:14px">
-  <n-data-table :columns="ocols" :data="orders" :bordered="false" size="small"
-    :scroll-x="636" :row-key="(r) => r.id"
-    :pagination="{pageSize:10,pageSlot:5,prefix:({itemCount})=>'总计 '+itemCount}"/>
-</n-card>
+  </n-card>
+</div>
+<section class="console-table-card">
+  <div class="console-section-heading">
+    <div><h2 class="console-section-title">账户记录</h2>
+      <p class="console-section-note">核对余额变动，或查看在线充值订单的支付与到账状态。</p></div>
+    <n-button secondary :loading="loading" @click="reload">刷新记录</n-button>
+  </div>
+  <n-tabs class="console-tabs" type="line" default-value="ledger" animated>
+    <n-tab-pane name="ledger" tab="余额流水">
+      <n-data-table :columns="lcols" :data="entries" :bordered="false" size="small"
+        :scroll-x="792" :row-key="(r) => r.id"
+        :pagination="{pageSize:10,pageSlot:5,prefix:({itemCount})=>'总计 '+itemCount}"/>
+    </n-tab-pane>
+    <n-tab-pane name="orders" tab="充值订单">
+      <n-data-table :columns="ocols" :data="orders" :bordered="false" size="small"
+        :scroll-x="772" :row-key="(r) => r.id"
+        :pagination="{pageSize:10,pageSlot:5,prefix:({itemCount})=>'总计 '+itemCount}"/>
+    </n-tab-pane>
+  </n-tabs>
+</section>
+</div>
 </Load>`,
   };
   const Leaderboard = {
@@ -1548,15 +1476,15 @@
       onUnmounted(() => { requestVersion += 1; });
       const cols = [
         { title: "排名 / 用户", key: "name", minWidth: 130, render: (r) =>
-          h("div", { class: "rank-identity" }, [
-            h("span", { class: ["rank-number", r.rank && r.rank <= 3 ? "is-leading" : ""] }, r.rank || "—"),
-            h("div", { class: "rank-user" }, [
-              h("div", {}, [h("strong", {}, r.name), r.is_me ? h("span", { class: "rank-me" }, "我") : null]),
-              h("span", { class: "rank-note" }, nf(r.requests) + " 次请求"),
+          h("div", { class: "console-rank-identity" }, [
+            h("span", { class: ["console-rank-number", r.rank && r.rank <= 3 ? "is-leading" : ""] }, r.rank || "—"),
+            h("div", { class: "console-rank-user" }, [
+              h("div", {}, [h("strong", {}, r.name), r.is_me ? h("span", { class: "console-rank-me" }, "我") : null]),
+              h("span", { class: "console-section-note" }, nf(r.requests) + " 次请求"),
             ]),
           ]) },
         { title: "Token 消耗", key: "total_tokens", align: "right", minWidth: 150,
-          render: (r) => h("div", { class: "rank-tokens" }, [
+          render: (r) => h("div", { class: "console-rank-tokens" }, [
             h("strong", {}, nf(r.total_tokens)),
             h("span", {}, "输入 " + nf(r.input_tokens)),
             h("span", {}, "输出 " + nf(r.output_tokens)),
@@ -1571,31 +1499,41 @@
       const rangeLabel = computed(() => (ranges.find((r) => r.value === result.value.range) || ranges[0]).label);
       return { result, range, ranges, page, loading, error, reload, setRange,
         cols, pagination, rangeLabel, nf, absTime, go,
-        rowClass: (r) => r.is_me ? "rank-current" : "" };
+        rowClass: (r) => r.is_me ? "console-rank-current" : "" };
     },
     template: `
-<div class="rank-page">
-  <div class="rank-toolbar">
+<div class="console-page-stack">
+  <div class="console-toolbar console-rank-toolbar">
     <n-radio-group :value="range" @update:value="setRange" aria-label="排行榜统计范围">
       <n-radio-button v-for="r in ranges" :key="r.value" :value="r.value">{{ r.label }}</n-radio-button>
     </n-radio-group>
     <n-button secondary :loading="loading" @click="reload">刷新榜单</n-button>
   </div>
   <Load :loading="loading" :error="error" :on-retry="reload">
-    <n-card class="rank-summary" size="small" :bordered="false">
-      <div class="rank-note">{{ rangeLabel }} · 我的 Token 消耗</div>
-      <div class="rank-total">{{ result.me ? nf(result.me.total_tokens) : '—' }}<span>Token</span></div>
-      <p>{{ result.me && result.me.rank ? '当前排名第 ' + nf(result.me.rank) + ' 名' : '这个范围内还没有 Token 用量' }}<template v-if="result.total_users != null"> · 共 {{ nf(result.total_users) }} 位启用用户</template></p>
-      <n-button secondary @click="go('#/usage')">查看我的使用记录</n-button>
-    </n-card>
-    <n-card class="rank-table" size="small" title="Token 消耗排行">
-      <p class="rank-note">按输入与输出 Token 合计排名，缓存另列且不计入排名。相同用量并列，无用量用户位于末尾，禁用账号不参与。</p>
-      <p class="rank-note">{{ rangeLabel }}合计 {{ result.total_tokens != null ? nf(result.total_tokens) : '—' }} Token。用户名已脱敏，仅登录后可查看。{{ result.as_of ? '更新于 ' + absTime(result.as_of) : '' }}</p>
-      <p class="rank-note">「缓存未提供」或「部分记录」表示缓存统计不完整。</p>
-      <n-data-table :columns="cols" :data="result.rows" :row-key="r => r.position" :row-class-name="rowClass" :bordered="false" :pagination="pagination" remote size="small">
-        <template #empty><n-empty description="暂时没有可展示的用户"/></template>
-      </n-data-table>
-    </n-card>
+    <div class="console-page-stack">
+      <section class="console-hero">
+        <div class="console-hero-copy">
+          <div class="console-eyebrow">{{ rangeLabel }} · 我的 Token 消耗</div>
+          <div class="console-hero-title console-rank-total">{{ result.me ? nf(result.me.total_tokens) : '—' }}<span>Token</span></div>
+          <p class="console-hero-note">{{ result.me && result.me.rank ? '当前排名第 ' + nf(result.me.rank) + ' 名' : '这个范围内还没有 Token 用量' }}<template v-if="result.total_users != null"> · 共 {{ nf(result.total_users) }} 位启用用户</template></p>
+          <div class="console-hero-actions"><n-button secondary @click="go('#/usage')">查看我的使用记录</n-button></div>
+        </div>
+        <aside class="console-hero-aside">
+          <div class="console-section-title">每一次使用，都有记录</div>
+          <p class="console-section-note">按输入、输出和缓存 Token 的合计降序排列，与概览用量口径一致。相同用量并列，无用量的用户显示在榜单末尾。</p>
+          <p class="console-section-note">缓存只计入可计算的记录；「缓存未提供」或「部分记录」表示该用户的缓存统计不完整。</p>
+          <p class="console-section-note">用户名已脱敏，仅登录后可查看。{{ result.as_of ? '更新于 ' + absTime(result.as_of) : '' }}</p>
+        </aside>
+      </section>
+      <section class="console-table-card console-rank-table">
+        <div class="console-section-heading"><div><h2 class="console-section-title">Token 消耗排行</h2>
+          <p class="console-section-note">{{ rangeLabel }}合计 {{ result.total_tokens != null ? nf(result.total_tokens) : '—' }} Token · 已禁用的账号不参与展示</p></div></div>
+        <n-data-table :columns="cols" :data="result.rows" :row-key="r => r.position"
+          :row-class-name="rowClass" :bordered="false" :pagination="pagination" remote size="small">
+          <template #empty><n-empty description="暂时没有可展示的用户"/></template>
+        </n-data-table>
+      </section>
+    </div>
   </Load>
 </div>`,
   };
@@ -1617,62 +1555,160 @@
             h("span", { style: Object.assign({ fontSize: "12px" }, MONO) },
               absTime(r.created_at)) },
         { title: "返佣", key: "amount", align: "right", width: 110,
-          render: (r) => h("span", { style: MONO },
-            (r.amount >= 0 ? "+$" : "-$") + fmt(Math.abs(r.amount), 4)) },
+          render: (r) => money(r.amount) },
         { title: "触发", key: "idem_key", minWidth: 210, render: (r) =>
             h(naive.NText, { depth: 3, style: SUBSTY }, () =>
               r.meta && r.meta.kind === "fixed_invite" ? "有效注册奖励" : r.idem_key || "—") },
       ];
-      return Object.assign({ inv, affRows, cols, link, fmt,
+      return Object.assign({ inv, affRows, cols, link, fmt, go,
         copyCode: () => copy(inv.value.aff_code || "", "已复制返佣码"),
         copyLink: () => copy(link.value, "已复制邀请链接") }, s);
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
-<n-grid :cols="'1 900:2'" :x-gap="14" :y-gap="14" responsive="self">
-  <n-gi><n-card size="small" title="我的返佣码">
+<div class="console-page-stack">
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">邀请带来的累计返佣</div>
+    <div class="console-hero-title"><MetricValue :value="'$' + fmt(inv.earned, 4)"/></div>
+    <p class="console-hero-note">{{ inv.invitees || 0 }} 位用户已绑定邀请关系，返佣按实际入账累计。</p>
+    <div class="console-hero-actions"><n-button type="primary" @click="copyLink">复制邀请链接</n-button>
+      <n-button secondary @click="go('#/wallet')">查看钱包</n-button></div>
+  </div>
+  <aside class="console-hero-aside">
+    <div class="console-section-title">分享后，查看实际入账</div>
+    <p class="console-section-note">返佣金额以每笔到账记录为准。邀请关系绑定后持续有效。</p>
+  </aside>
+</section>
+<div class="console-workspace-grid">
+  <n-card class="console-panel" size="small" title="分享邀请">
     <n-space vertical :size="14">
+      <div class="console-eyebrow">我的返佣码</div>
       <n-input-group>
         <n-input :value="inv.aff_code || ''" readonly/>
         <n-button type="primary" ghost @click="copyCode">复制</n-button>
       </n-input-group>
+      <div class="console-eyebrow">专属邀请链接</div>
       <n-input-group>
         <n-input :value="link" readonly/>
         <n-button ghost @click="copyLink">复制链接</n-button>
       </n-input-group>
-      <n-text depth="3" style="font-size:12.5px;line-height:1.6">
-        注册邀请奖励规则见下方说明；其他返佣由启用的插件决定，以实际到账流水为准。
-        开放注册时邀请人一次绑定后终身有效；站点开启邀请制后,本码不能替代
-        管理端发放的一次性注册邀请码。</n-text>
     </n-space>
-  </n-card></n-gi>
-  <n-gi><n-grid :cols="2" :x-gap="12" :y-gap="12">
-    <n-gi><StatCard label="已邀请" :value="String(inv.invitees || 0)"
-      sub="成功注册人数" color="#3f6b8a" icon="user"/></n-gi>
-    <n-gi><StatCard label="返佣总额" :value="'$' + fmt(inv.earned, 4)"
-      sub="已计入可用余额" color="#a06a2c" icon="gift" :tint="true"/></n-gi>
-    <n-gi :span="2"><n-alert type="default" :bordered="false"
-      :show-icon="false" style="font-size:12.5px">
-      接口只提供邀请人数与返佣总额,不返回被邀请人名单,因此这里不展示被邀请人明细,
-      改为列出每一笔返佣入账。</n-alert></n-gi>
-  </n-grid></n-gi>
-</n-grid>
-
-  <n-card class="invite-policy" style="margin-top:14px" size="small" title="邀请规则">
-    <template v-if="inv.reward_policy && inv.reward_policy.enabled">
-      <div class="invite-stat"><span class="invite-stat-label">每位新用户有效注册后</span><strong class="invite-cost">\${{ fmt(inv.reward_policy.amount, 4) }}</strong></div>
-      <p class="rank-note">奖励自动记入邀请人的钱包。已获得 {{ inv.rewarded_invitees }} 人的注册奖励；{{ inv.reward_policy.max_invitees ? '每位邀请人最多奖励 ' + inv.reward_policy.max_invitees + ' 人' : '奖励人数不限' }}。</p>
-      <p v-if="inv.reward_policy.max_invitees && inv.rewarded_invitees >= inv.reward_policy.max_invitees" class="rank-note">已达到奖励人数上限，后续邀请仍会绑定关系，本项奖励不再发放。</p>
-    </template>
-    <p v-else class="rank-note">当前未开启注册邀请奖励。仍可分享链接记录新用户邀请关系，已有入账保留。</p>
-    <p class="rank-note">邮箱注册须完成邮件验证；邀请制开启时仍须使用管理员的一次性注册邀请码，个人返佣码不能代替它。社区注册也保留现有邀请码要求。</p>
-    <p class="rank-note">仅新账号首次注册绑定邀请人，老账号登录或绑定社区不会新增邀请，也不会重复发奖。奖励按注册时生效的规则结算；新设置不补发历史邀请。</p>
   </n-card>
-<n-card size="small" title="返佣入账" style="margin-top:14px">
+  <n-card class="console-panel" size="small" title="邀请规则">
+    <template v-if="inv.reward_policy && inv.reward_policy.enabled">
+      <div class="console-inline-stat"><span class="console-inline-stat-label">每位新用户有效注册后</span><strong class="console-inline-stat-value">\${{ fmt(inv.reward_policy.amount, 4) }}</strong></div>
+      <p class="console-section-note">奖励自动记入邀请人的钱包。已获得 {{ inv.rewarded_invitees }} 人的注册奖励；{{ inv.reward_policy.max_invitees ? '每位邀请人最多奖励 ' + inv.reward_policy.max_invitees + ' 人' : '奖励人数不限' }}。</p>
+      <p v-if="inv.reward_policy.max_invitees && inv.rewarded_invitees >= inv.reward_policy.max_invitees" class="console-section-note">已达到奖励人数上限，后续邀请仍会绑定关系，本项奖励不再发放。</p>
+    </template>
+    <p v-else class="console-section-note">当前未开启注册邀请奖励。仍可分享链接记录新用户邀请关系，已有入账保留。</p>
+    <p v-if="inv.registration_policy && inv.registration_policy.community_only" class="console-section-note">新用户须通过白嫖社区授权、达到 Lv{{ inv.registration_policy.community_min_level }} 及以上并核验邮箱；邀请关系不改变注册门槛。</p>
+    <p v-else class="console-section-note">邮箱注册须完成邮件验证；邀请制开启时仍须使用管理员的一次性注册邀请码，个人返佣码不能代替它。</p>
+    <p class="console-section-note">仅新账号首次注册绑定邀请人，老账号登录或绑定社区不会新增邀请，也不会重复发奖。奖励按注册时生效的规则结算；新设置不补发历史邀请。</p>
+  </n-card>
+</div>
+<n-card class="console-table-card" size="small" title="返佣入账">
   <n-data-table :columns="cols" :data="affRows" :bordered="false" size="small"
     :scroll-x="470" :row-key="(r) => r.id"
     :pagination="{pageSize:10,pageSlot:5,prefix:({itemCount})=>'总计 '+itemCount}"/>
 </n-card>
+</div>
+</Load>`,
+  };
+  /* 共享 Key:把自己的上游 key 交上来换余额奖励。
+     规则与「我交过哪些」都来自 /api/share/keys;提交走 POST /api/share/keys,
+     服务端会先拿这把 key 真发一次请求验活,通过才入库并按把发奖。 */
+  const Share = {
+    components: { Load, StatCard },
+    setup() {
+      const info = ref({});
+      const rows = ref([]);
+      const form = reactive({ channel: "", key: "" });
+      const busy = ref(false);
+      const s = useFetch(() => api("GET", "/share/keys").then((r) => {
+        info.value = r;
+        rows.value = r.items || [];
+        if (!form.channel && (r.channels || []).length) form.channel = r.channels[0];
+      }));
+      const options = computed(() =>
+        (info.value.channels || []).map((c) => ({ label: c, value: c })));
+      const submit = () => {
+        if (!info.value.enabled) return msg.warning("站点当前未开启共享");
+        if (!form.channel) return msg.warning("先选一个渠道");
+        const key = String(form.key || "").trim();
+        if (key.length < 8) return msg.warning("粘贴完整的 key");
+        busy.value = true;
+        api("POST", "/share/keys", { channel: form.channel, key })
+          .then((r) => {
+            msg.success("已收录，奖励 $" + Number(r.reward).toFixed(4) + " 已入账");
+            form.key = "";
+            return s.reload();
+          })
+          .catch((e) => msg.error(e.message))
+          .then(() => { busy.value = false; });
+      };
+      const cols = [
+        { title: "渠道", key: "channel", width: 120 },
+        { title: "标识", key: "identity", minWidth: 190, render: (r) =>
+            h("span", { style: Object.assign({ fontSize: "12px" }, MONO) },
+              r.identity || "—") },
+        { title: "验活模型", key: "probe_model", minWidth: 150, render: (r) =>
+            h("span", { style: Object.assign({ fontSize: "12px" }, MONO) },
+              r.probe_model || "—") },
+        { title: "状态", key: "status", width: 100 },
+        { title: "时间", key: "shared_at", width: 150, render: (r) =>
+            h("span", { style: Object.assign({ fontSize: "12px" }, MONO) },
+              absTime(r.shared_at)) },
+      ];
+      return Object.assign({ info, rows, form, busy, options, submit, cols, fmt, go }, s);
+    },
+    template: `
+<Load :loading="loading" :error="error" :on-retry="reload">
+<div class="console-page-stack">
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">共享带来的累计奖励</div>
+    <div class="console-hero-title"><MetricValue :value="'$' + fmt(info.earned, 4)"/></div>
+    <p class="console-hero-note">已收录 {{ info.rewarded_count || 0 }} 把 key，奖励按每把入账累计。</p>
+    <div class="console-hero-actions"><n-button secondary @click="go('#/wallet')">查看钱包</n-button>
+      <n-button secondary @click="go('#/keys')">我的 API 密钥</n-button></div>
+  </div>
+  <aside class="console-hero-aside">
+    <div class="console-section-title">先验活，再计奖</div>
+    <p class="console-section-note">提交后系统会拿这把 key 真发一次请求。上游拒收的不入库、不发奖。</p>
+  </aside>
+</section>
+<div class="console-workspace-grid">
+  <n-card class="console-panel" size="small" title="提交一把 key">
+    <n-space vertical :size="14">
+      <n-form-item label="渠道" :show-feedback="false">
+        <n-select v-model:value="form.channel" :options="options"
+          :disabled="!info.enabled || !options.length"
+          placeholder="该站点暂无可共享的渠道" aria-label="选择渠道"/>
+      </n-form-item>
+      <n-form-item label="API Key" :show-feedback="false">
+        <n-input v-model:value="form.key" type="password" show-password-on="click"
+          placeholder="粘贴上游的 key" aria-label="要共享的 key"/>
+      </n-form-item>
+      <n-button type="primary" :loading="busy" :disabled="!info.enabled" @click="submit">提交并验活</n-button>
+    </n-space>
+  </n-card>
+  <n-card class="console-panel" size="small" title="规则">
+    <template v-if="info.enabled">
+      <div class="console-inline-stat"><span class="console-inline-stat-label">每把有效 key</span><strong class="console-inline-stat-value">\${{ fmt(info.amount, 4) }}</strong></div>
+      <p class="console-section-note">可共享的渠道：{{ (info.channels || []).join('、') || '全部' }}。</p>
+      <p class="console-section-note">{{ info.max_per_user ? '每位用户最多拿 ' + info.max_per_user + ' 把的奖励；' : '每人可拿奖励的把数不限；' }}同一把 key 全站只发一次奖。</p>
+    </template>
+    <p v-else class="console-section-note">站点当前未开启共享 Key。</p>
+    <p class="console-section-note">你交的 key 会被当作本站上游号池使用。只交你愿意共享的 key，并确认它允许这样使用。</p>
+  </n-card>
+</div>
+<n-card class="console-table-card" size="small" title="我提交的 key">
+  <n-data-table :columns="cols" :data="rows" :bordered="false" size="small"
+    :scroll-x="760" :row-key="(r) => r.channel + r.identity"
+    :pagination="{pageSize:10,pageSlot:5,prefix:({itemCount})=>'总计 '+itemCount}"/>
+</n-card>
+</div>
 </Load>`,
   };
   const Profile = {
@@ -1715,7 +1751,7 @@
           .catch((e) => msg.error(e.message)).then(() => { busy.totp = false; });
       };
       /* 只打 /me:分组与计费策略搬到「计费与套餐」页与顶栏下拉,
-         rpm_limit 已随 /me 一起返回,不必再要一次 /billing。 */
+         concurrency_limit 已随 /me 一起返回,不必再要一次 /billing。 */
       const s = useFetch(() => api("GET", "/me").then((r) => {
         me.value = r;
         form.name = r.display_name || "";
@@ -1824,17 +1860,21 @@
       return Object.assign({ me, pw, bind, busy, savePw, send,
         verify, bindCommunity, absTime, relTime, go, fmt, MONO,
         form, dirty, shown, initial, regMonth, pickFile, saveProfile,
-        dropAvatar, copy, tf, totpSetup, totpEnable, totpDisable }, s);
+        dropAvatar, copy, tf, totpSetup, totpEnable, totpDisable,
+        focusSection: (id) => {
+          const section = document.getElementById(id);
+          if (section) { section.scrollIntoView({ block: "start" }); section.focus({ preventScroll: true }); }
+        } }, s);
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
-<n-card size="small" class="hero" style="margin-bottom:14px"
-  content-style="padding:20px 22px">
-  <div class="herorow">
-    <Avatar :src="me.avatar" :text="initial" :size="72" radius="18px"/>
-    <div style="flex:1;min-width:0">
+<div class="console-page-stack">
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">个人账户</div>
+    <div class="console-hero-title">{{ shown }}</div>
+    <p class="console-hero-note">{{ me.email }} · {{ regMonth }} 加入</p>
       <n-space align="center" :size="8" style="margin-bottom:3px">
-        <span class="heroname">{{ shown }}</span>
         <n-tag size="small" round :bordered="false"
           :type="me.role === 'admin' ? 'warning' : 'default'">
           {{ me.role === 'admin' ? '管理员' : '用户' }}</n-tag>
@@ -1842,33 +1882,28 @@
           :type="me.status === 'active' ? 'success' : 'error'">
           {{ me.status === 'active' ? '启用' : '已禁用' }}</n-tag>
       </n-space>
-      <div class="herosub">{{ me.email }}</div>
-    </div>
   </div>
-  <n-grid :cols="'1 640:2 900:4'" :x-gap="12" :y-gap="12" responsive="self"
-    style="margin-top:16px">
-    <n-gi><div class="herocell">
-      <div class="herok">账户余额</div>
-      <div class="herov" :style="MONO">\${{ fmt(me.balance) }}</div>
-    </div></n-gi>
-    <n-gi><div class="herocell">
-      <div class="herok">累计消费</div>
-      <div class="herov" :style="MONO">\${{ fmt(me.total_spent) }}</div>
-    </div></n-gi>
-    <n-gi><div class="herocell">
-      <div class="herok">速率上限</div>
-      <div class="herov" :style="MONO">
-        {{ me.rpm_limit ? me.rpm_limit : '不限'
-        }}<span v-if="me.rpm_limit" class="herou"> 次/分</span></div>
-    </div></n-gi>
-    <n-gi><div class="herocell">
-      <div class="herok">注册时间</div>
-      <div class="herov" style="font-size:17px">{{ regMonth }}</div>
-    </div></n-gi>
-  </n-grid>
-</n-card>
-
-<n-card size="small" style="margin-bottom:14px">
+  <aside class="console-hero-aside"><Avatar :src="me.avatar" :text="initial" :size="80" radius="24px"/></aside>
+</section>
+<div class="console-resource-strip">
+  <div class="console-inline-stat"><span class="console-inline-stat-label">账户余额</span>
+    <strong class="console-inline-stat-value"><MetricValue :value="'$' + fmt(me.balance)"/></strong></div>
+  <div class="console-inline-stat"><span class="console-inline-stat-label">累计消费</span>
+    <strong class="console-inline-stat-value"><MetricValue :value="'$' + fmt(me.total_spent)"/></strong></div>
+  <div class="console-inline-stat"><span class="console-inline-stat-label">并发上限</span>
+    <strong class="console-inline-stat-value">{{ me.concurrency_limit ? me.concurrency_limit + ' 个请求' : '不限' }}</strong></div>
+  <div class="console-inline-stat"><span class="console-inline-stat-label">邮箱验证</span>
+    <strong class="console-inline-stat-value">{{ me.email_verified ? '已验证' : '未验证' }}</strong></div>
+</div>
+<div class="console-profile-layout">
+  <nav class="console-anchor-nav" aria-label="资料分区">
+    <button type="button" @click="focusSection('profile-identity')">资料与头像</button>
+    <button type="button" @click="focusSection('profile-login')">登录方式</button>
+    <button v-if="me.has_password" type="button" @click="focusSection('profile-password')">登录密码</button>
+    <button v-if="me.has_password" type="button" @click="focusSection('profile-security')">二次验证</button>
+  </nav>
+  <div class="console-page-stack">
+<n-card id="profile-identity" class="console-anchor-section" tabindex="-1" size="small">
   <SectionHead icon="user" title="资料与头像"
     sub="维护公开展示信息,并保持头像与昵称风格一致" color="#4a6fa5"/>
   <n-grid :cols="'1 900:2'" :x-gap="14" :y-gap="14" responsive="self"
@@ -1912,7 +1947,7 @@
   </n-grid>
 </n-card>
 
-<n-card size="small" style="margin-bottom:14px">
+<n-card id="profile-login" class="console-anchor-section" tabindex="-1" size="small">
   <SectionHead icon="mail" title="登录方式绑定"
     sub="查看当前绑定状态,并把更多登录方式关联到这个账号" color="#15803d"/>
   <div class="bindrow" style="margin-top:16px">
@@ -1976,7 +2011,7 @@
   </div>
 </n-card>
 
-<n-card v-if="me.has_password" size="small">
+<n-card v-if="me.has_password" id="profile-password" class="console-anchor-section" tabindex="-1" size="small">
   <SectionHead icon="shield" title="安全" sub="修改登录密码" color="#b91c1c"/>
   <n-form label-placement="top" style="margin-top:16px">
     <n-grid :cols="'1 760:3'" :x-gap="12" :y-gap="12" responsive="self">
@@ -2003,7 +2038,7 @@
   当前账号仅使用白嫖社区登录，无需填写本站密码。
 </n-alert>
 
-<n-card v-if="me.has_password" size="small" style="margin-top:14px">
+<n-card v-if="me.has_password" id="profile-security" class="console-anchor-section" tabindex="-1" size="small">
   <SectionHead icon="key" title="二次验证(TOTP)"
     :sub="me.totp_enabled ? '已开启:登录要密码 + authenticator 里的 6 位码' : '未开启。管理员账号建议开启 —— 管理台管的是钱'"
     :color="me.totp_enabled ? '#15803d' : '#a17a10'"/>
@@ -2048,6 +2083,9 @@
     </template>
   </div>
 </n-card>
+</div>
+</div>
+</div>
 </Load>`,
   };
   /* 定价表:同一行既要能看普通档,又要能看长文本档,所以按「普通 → 长档」上下两行排。 */
@@ -2132,7 +2170,7 @@
             .map((x) => x[0] + " " + nf(x[1]) + unit);
           rows.push(["额度", lim.length ? lim.join(" · ") : "未设上限"]);
         }
-        rows.push(["速率", pl.rpm_limit ? pl.rpm_limit + " RPM" : "不限 RPM"]);
+        rows.push(["并发", pl.concurrency_limit ? pl.concurrency_limit + " 个请求" : "不限"]);
         if (Number(pl.rate_multiplier) !== 1)
           rows.push(["倍率", "×" + pl.rate_multiplier]);
         const ms = pl.supported_models || [];
@@ -2194,28 +2232,32 @@
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
+<div class="console-page-stack">
 <n-alert v-if="!b.group" type="warning" :bordered="false"
   style="font-size:12.5px;margin-bottom:14px">
   这个账号还没有绑定计费分组,现在调用会被拒绝。买一张下面的套餐可以立刻用起来,
   也可以联系管理员分配默认分组。
 </n-alert>
 
-<n-grid :cols="'1 700:3'" :x-gap="14" :y-gap="14" responsive="self"
-  style="margin-bottom:14px">
-  <n-gi><StatCard label="可用余额" :value="'$' + fmt(bal)"
-    :sub="bal > 0 ? '买套餐与按量扣费都从这里出' : '余额不足将拒绝请求'"
-    color="#a8613c" icon="wallet" tint/></n-gi>
-  <n-gi><StatCard label="累计消费" :value="'$' + fmt(b.total_spent)"
-    sub="请求扣费与买卡合计" color="#6b5b95" icon="dollar"/></n-gi>
-  <n-gi><StatCard :label="onPlan ? '套餐剩余' : '当前计费'"
-    :value="onPlan ? left : '按量计费'"
-    :sub="onPlan
-      ? cur.name + (cur.expires_at ? ' · ' + absTime(cur.expires_at) + ' 到期' : '')
-      : (p.base_group ? '默认分组 ' + p.base_group : '未分配分组')"
-    color="#3f6b8a" icon="tag"/></n-gi>
-</n-grid>
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">{{ b.group ? '当前分组 · ' + (POLICY[policy] || policy) : '尚未分配计费分组' }}</div>
+    <div class="console-hero-title">{{ b.group || '尚未分配分组' }}</div>
+    <p class="console-hero-note" v-if="onPlan">{{ cur.name }} · 剩余 {{ left }}
+      <template v-if="cur.expires_at"> · {{ absTime(cur.expires_at) }} 到期</template></p>
+    <p class="console-hero-note" v-else>{{ p.base_group ? '使用默认分组 ' + p.base_group : '请购买套餐或联系管理员分配分组' }}</p>
+    <div class="console-hero-actions"><n-button type="primary" @click="go('#/wallet')">充值余额</n-button>
+      <n-button secondary @click="go('#/plaza')">查看模型价格</n-button></div>
+  </div>
+  <aside class="console-hero-aside">
+    <div class="console-inline-stat"><span class="console-inline-stat-label">可用余额</span>
+      <strong class="console-inline-stat-value"><MetricValue :value="'$' + fmt(bal)"/></strong></div>
+    <div class="console-inline-stat"><span class="console-inline-stat-label">累计消费 · 请求与套餐合计</span>
+      <strong class="console-inline-stat-value"><MetricValue :value="'$' + fmt(b.total_spent)"/></strong></div>
+  </aside>
+</section>
 
-<n-card size="small" title="订阅套餐" style="margin-bottom:14px">
+<n-card class="console-panel" size="small" title="订阅套餐">
   <template #header-extra><n-space :size="10" align="center">
     <n-text depth="3" style="font-size:11.5px">余额 \${{ fmt(bal, 2) }}</n-text>
     <n-button size="tiny" secondary @click="go('#/wallet')">充值</n-button>
@@ -2293,6 +2335,10 @@
 </n-card>
 
 <template v-if="b.group">
+  <div class="console-section-heading"><div>
+    <h2 class="console-section-title">当前生效规则</h2>
+    <p class="console-section-note">本分组决定计费方式、调用额度、速率和可用模型。</p>
+  </div></div>
   <n-grid :cols="'1 1000:2'" :x-gap="14" :y-gap="14" responsive="self">
     <n-gi><n-card size="small" title="套餐详情">
       <template #header-extra><n-tag size="small" round :bordered="false"
@@ -2312,8 +2358,8 @@
         <n-descriptions-item label="倍率">
           <span :style="MONO">×{{ b.rate_multiplier }}</span>
         </n-descriptions-item>
-        <n-descriptions-item label="RPM 上限">
-          <span :style="MONO">{{ b.rpm_limit || '不限' }}</span>
+        <n-descriptions-item label="并发上限">
+          <span :style="MONO">{{ b.concurrency_limit || '不限' }}</span>
         </n-descriptions-item>
         <n-descriptions-item label="限额口径">
           {{ unitText }}</n-descriptions-item>
@@ -2369,6 +2415,7 @@
           <n-text style="font-size:12.5px">
             单价以美元 / 1M token 计,输入、输出、缓存读、缓存写各算各的价,
             合计后再乘分组倍率 ×{{ b.rate_multiplier }}。
+            上游返回 30 分钟 / 12 小时写入分档时，分别按基础缓存写价 / 2 倍基础缓存写价计费。
           </n-text>
           <n-text style="font-size:12.5px" v-if="hasLong">
             带长文本阈值的模型按「整次跳档」计价:判定量
@@ -2383,8 +2430,8 @@
     </n-gi>
   </n-grid>
 
-  <n-card v-if="policy === 'balance'" size="small"
-    title="生效单价 · 美元 / 1M token" style="margin-top:14px">
+  <n-card v-if="policy === 'balance'" class="console-table-card" size="small"
+    title="生效单价 · 美元 / 1M token">
     <template #header-extra><n-text depth="3" style="font-size:11.5px">
       {{ prices.length }} 条</n-text></template>
     <n-alert v-if="!prices.length" type="default" :bordered="false">
@@ -2402,6 +2449,7 @@
     </template>
   </n-card>
 </template>
+</div>
 </Load>`,
   };
   /* 官方品牌图标要在模板里用,包一层组件;和 Ic 对 ICONS 的关系一样。 */
@@ -2422,7 +2470,7 @@
   /* 卡面价格摘要:一行说清这张卡怎么收钱。区间只在折叠卡里出现。 */
   function priceBrief(r) {
     if (r.billing_mode === "token")
-      return "$" + fmt(r.input_price) + " 入 · $" + fmt(r.output_price) + " 出";
+      return "$" + fmt(r.input_price) + " 入 · $" + fmt(r.output_price) + " 出 / 1M Token";
     if (r.billing_mode === "free") return "免费";
     const lo = r.per_request_price || 0;
     const hi = r.per_request_price_max;
@@ -2446,6 +2494,30 @@
       const s = useFetch(() => api("GET", "/models").then((r) => {
         d.value = r;
       }));
+      /* 巡检状态条(对话卡):绿=当天全部通过 红=有失败 黄=号池空 灰=没测。
+         生成类(图/视频)不巡检,卡片不带这一行。 */
+      const BAR_C = { 1: "#18a058", 0: "#de5764", 2: "#f0a020" };
+      const BAR_T = { 1: "正常", 0: "不能用", 2: "慢(>10s)" };
+      const SLOW_MS = 10000;
+      const gradeOfSt = (st) => st.ok == null ? null
+        : (st.ok !== 1 ? 0 : ((st.ttft_ms || st.latency_ms || 0) > SLOW_MS ? 2 : 1));
+      const ST_TYPE = { 1: "success", 2: "warning", 0: "error" };
+      const ST_TEXT = { 1: "正常", 2: "偏慢", 0: "故障" };
+      const ttftText = (ms) => !ms ? "—"
+        : ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
+      const hbSlots = (o) => (o && o.heartbeats && o.heartbeats.length)
+        ? o.heartbeats : (o && o.bars) || [];
+      const barsCell = (st) => h(naive.NSpace, { size: 2, wrap: false,
+        align: "center" }, () => hbSlots(st).map((b) =>
+        h(naive.NTooltip, {}, {
+          trigger: () => h("div", { style: {
+            width: "7px", height: "16px", borderRadius: "2px",
+            background: b.grade === null || b.grade === undefined
+              ? "#e0e0e6" : (BAR_C[b.grade] || "#e0e0e6") } }),
+          default: () => h("span", { style: MONO },
+            (b.label || b.date) + " " + (BAR_T[b.grade] || "没测")) })));
+      const mutedSmall = (t) => h("span", { style: Object.assign(
+        { fontSize: "11.5px" }, MONO) }, t);
       const q = ref("");
       const fv = ref(null);
       const fm = ref(null);
@@ -2535,6 +2607,8 @@
                 fontWeight: 600 }, MONO) }, r.model)]) },
         { title: "供应商", key: "vendor", width: 108,
           render: (r) => r.p.n },
+        { title: "状态", key: "status", width: 190, render: (r) =>
+            r.status ? barsCell(r.status) : mutedSmall("不巡检") },
         { title: "计费方式", key: "billing_mode", width: 104, render: (r) =>
             tag(MODE_TAG[r.billing_mode] || "default",
               MODE[r.billing_mode] || "混合计费") },
@@ -2547,6 +2621,10 @@
         { title: "规格", key: "variants", width: 74, align: "right",
           render: (r) => (r.variants.length
             ? h("span", MONO_ATTR, r.variants.length) : "—") },
+        { title: "", key: "actions", width: 88, render: (r) =>
+            h(naive.NButton, { text: true, type: "primary",
+              onClick: (e) => { e.stopPropagation(); detail.value = r; },
+              "aria-label": "查看 " + r.model + " 详情" }, () => "详情") },
       ];
       const rowProps = (r) => ({ style: "cursor:pointer",
         onClick: () => { detail.value = r; } });
@@ -2554,13 +2632,33 @@
       return Object.assign({ d, q, fv, fm, view, sort, detail, list, reset,
         vendorOpts, modeOpts, priceRows, callable, cols, rowProps,
         renderOpt, MODE, MODE_TAG, SRC_TEXT, SORT_OPTS, MONO, SUBSTY, fmt, copy,
-        priceBrief, total: computed(() => rows.value.length) }, s);
+        priceBrief, go, BAR_C, BAR_T, ST_TYPE, ST_TEXT, ttftText, barsCell,
+        gradeOfSt,
+        total: computed(() => rows.value.length) }, s);
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
-<n-card size="small" :bordered="false" style="margin-bottom:14px"
-  content-style="padding:12px 14px">
-  <n-space align="center" :size="10" style="row-gap:10px">
+<div class="console-page-stack">
+<section class="console-hero">
+  <div class="console-hero-copy">
+    <div class="console-eyebrow">当前可见的模型目录</div>
+    <div class="console-hero-title"><MetricValue :value="total + ' 项模型'" animate/></div>
+    <p class="console-hero-note">按供应商与计费方式探索。多种规格合并展示，可在详情中查看各规格的单价与调用名称。</p>
+    <div class="console-hero-actions"><n-button type="primary" @click="go(d.guest ? '#/login?next=playground' : '#/playground')">
+      {{ d.guest ? '登录/注册后体验' : '在线体验对话模型' }}</n-button>
+      <n-button secondary @click="go(d.guest ? '#/login?next=keys' : '#/keys')">
+        {{ d.guest ? '登录/注册后接入' : '获取 API 密钥' }}</n-button></div>
+  </div>
+  <aside class="console-hero-aside">
+    <div class="console-inline-stat"><span class="console-inline-stat-label">{{ d.guest ? '默认分组' : '当前分组' }}</span>
+      <strong class="console-inline-stat-value">{{ d.group || '—' }}</strong></div>
+    <p v-if="d.policy === 'free'" class="console-section-note">当前分组不计费，下方展示模型原始单价供参考。</p>
+    <p v-else-if="d.policy === 'quota'" class="console-section-note">当前分组按额度限额，下方展示模型原始单价供参考。</p>
+    <p v-else class="console-section-note">显示原始单价，结算再乘分组倍率 ×{{ d.rate_multiplier }}。</p>
+  </aside>
+</section>
+<section class="console-panel">
+  <div class="console-toolbar">
     <n-input v-model:value="q" clearable placeholder="搜模型 / 供应商"
       style="width:224px"/>
     <n-select v-model:value="fv" :options="vendorOpts" clearable
@@ -2568,17 +2666,9 @@
     <n-select v-model:value="fm" :options="modeOpts" clearable
       placeholder="计费方式" style="width:150px"/>
     <n-select v-model:value="sort" :options="SORT_OPTS" style="width:132px"/>
-    <n-radio-group v-model:value="view" size="small">
-      <n-radio-button value="card">卡片</n-radio-button>
-      <n-radio-button value="table">表格</n-radio-button>
-    </n-radio-group>
     <n-button v-if="q || fv || fm || sort !== 'name'" quaternary
       size="small" @click="reset">清空</n-button>
-    <n-text depth="3" style="font-size:11.5px">
-      {{ list.length }} / {{ total }} 个模型 ·
-      单价为原价,结算再乘分组倍率 ×{{ d.rate_multiplier }}
-    </n-text>
-  </n-space>
+  </div>
   <!-- 游客看的是默认分组的价与可见范围。不写出来的话,注册后落到别的组、
        价格对不上,只会被当成标错价。 -->
   <n-alert v-if="d.guest" type="default" :bordered="false" :show-icon="false"
@@ -2586,52 +2676,77 @@
     未登录,按默认分组「{{ d.group || '—' }}」的价格与可见范围显示。
     注册后如果被分到别的分组,单价与可用模型会跟着变。
   </n-alert>
-</n-card>
+</section>
 
-<n-empty v-if="!list.length" description="没有匹配的模型"
-  style="padding:52px 0"/>
-<n-grid v-else-if="view === 'card'" :cols="'1 620:2 940:3'" :x-gap="12"
-  :y-gap="12" responsive="self">
+<div class="console-section-heading">
+  <div><h2 class="console-section-title">{{ q || fv || fm ? '筛选结果' : '全部模型' }}</h2>
+    <p class="console-section-note">{{ list.length }} / {{ total }} 个模型 · 按 Token 与按次的价格单位不同，可按计费方式筛选后比较。</p></div>
+  <n-radio-group v-model:value="view" size="small">
+    <n-radio-button value="card">卡片</n-radio-button>
+    <n-radio-button value="table">表格</n-radio-button>
+  </n-radio-group>
+</div>
+
+<n-empty v-if="!list.length" :description="q || fv || fm ? '没有匹配的模型，请调整筛选条件' : '当前分组暂无可用模型'"
+  style="padding:52px 0"><template #extra><n-button v-if="q || fv || fm" secondary @click="reset">清空筛选</n-button></template></n-empty>
+<n-grid v-else-if="view === 'card'" :cols="'1 620:2 1060:3'" :x-gap="16"
+  :y-gap="16" responsive="self">
   <n-gi v-for="r in list" :key="r.model">
-    <n-card size="small" hoverable style="cursor:pointer;height:100%"
-      content-style="padding:13px 14px" @click="detail = r">
+    <n-card class="console-model-card" size="small" style="height:100%">
       <div style="display:flex;align-items:center;gap:8px">
-        <PIcon :model="r.model" :size="20"/>
+        <PIcon :model="r.model" :size="28"/>
         <div style="min-width:0;flex:1">
-          <div :style="[MONO, {fontSize:'13px',fontWeight:650,
-            whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}]"
+          <div :style="[MONO, {fontSize:'14px',fontWeight:650,overflowWrap:'anywhere'}]"
             :title="r.model">{{ r.model }}</div>
           <div :style="SUBSTY" style="opacity:.6;margin-top:2px">
             {{ r.p.n }}</div>
         </div>
-        <n-button quaternary circle size="tiny"
-          @click.stop="copy(r.variants.length ? r.variants[0].model : r.model,
-            '已复制模型名')">
-          <Ic name="copy" :size="14"/></n-button>
       </div>
-      <div style="display:flex;align-items:center;gap:7px;margin-top:11px">
+      <div class="console-model-meta">
         <n-tag size="small" round :bordered="false"
           :type="MODE_TAG[r.billing_mode] || 'default'">
           {{ MODE[r.billing_mode] || '混合计费' }}</n-tag>
-        <span v-if="r.billing_mode !== 'free'"
-          :style="[MONO, {fontSize:'12.5px',fontWeight:600}]">
-          {{ priceBrief(r) }}</span>
+        <strong v-if="r.billing_mode !== 'free'" :style="MONO">
+          {{ priceBrief(r) }}</strong>
         <n-text v-else-if="r.price_source === 'fallback'" depth="3"
           style="font-size:11.5px">未配单价</n-text>
       </div>
-      <div v-if="r.variants.length" :style="SUBSTY"
-        style="opacity:.55;margin-top:7px">{{ r.variants.length }} 种规格可选</div>
+      <div v-if="r.status" style="display:flex;align-items:center;gap:9px;margin-top:9px">
+        <n-space :size="3" :wrap="false" align="center">
+          <n-tooltip v-for="b in r.status.bars" :key="b.date">
+            <template #trigger>
+              <div :style="{ width: '9px', height: '16px', borderRadius: '2px',
+                background: b.grade === null ? '#e0e0e6' : (BAR_C[b.grade] || '#e0e0e6') }"/>
+            </template>
+            <span :style="MONO" style="font-size:12px">
+              {{ b.date + ' ' + (BAR_T[b.grade] || '没测') }}</span>
+          </n-tooltip>
+        </n-space>
+        <n-tag size="small" round :bordered="false"
+          :type="ST_TYPE[gradeOfSt(r.status)] || 'default'">
+          {{ ST_TEXT[gradeOfSt(r.status)] || '未检测' }}</n-tag>
+        <n-text v-if="r.status.ttft_ms" depth="3" :style="MONO"
+          style="font-size:11.5px">首字 {{ ttftText(r.status.ttft_ms) }}</n-text>
+      </div>
+      <p class="console-section-note">{{ r.variants.length ? r.variants.length + ' 种规格 · 查看对应调用名与单价' : '可直接使用模型名称接入' }}</p>
+      <template #action><n-space justify="space-between" align="center">
+        <n-button text type="primary" @click="detail = r" :aria-label="'查看 ' + r.model + ' 详情'">查看详情</n-button>
+        <n-button quaternary size="small" @click="copy(r.variants.length ? r.variants[0].model : r.model, '已复制模型名')">
+          <template #icon><Ic name="copy" :size="14"/></template>{{ r.variants.length ? '复制首个规格' : '复制名称' }}</n-button>
+      </n-space></template>
     </n-card>
   </n-gi>
 </n-grid>
 
 <n-data-table v-else :columns="cols" :data="list" :bordered="false" size="small"
-  :single-line="false" :scroll-x="830" :row-key="(r) => r.model"
+  :single-line="false" :scroll-x="1100" :row-key="(r) => r.model"
   :row-props="rowProps"
   :pagination="{pageSize:20,pageSlot:5,showSizePicker:true,
     pageSizes:[20,50,100],prefix:({itemCount})=>'总计 '+itemCount}"/>
 
-<n-drawer :show="!!detail" :width="500" placement="right"
+</div>
+
+<n-drawer :show="!!detail" width="min(500px, 100vw)" placement="right"
   @update:show="v => { if (!v) detail = null }">
   <n-drawer-content v-if="detail" closable :native-scrollbar="false"
     :title="detail.model">
@@ -2748,8 +2863,22 @@
       const models = ref([]);
       const model = ref("");
       const s = useFetch(() => api("GET", "/models").then((r) => {
-        /* 只留对话模型:chat 位由渠道的 CAP_CHAT 声明,图/视频渠道进不来。 */
-        models.value = (r.data || []).filter((m) => m.chat);
+        /* 只留对话模型:chat 位由渠道的 CAP_CHAT 声明,图/视频渠道进不来。
+           折叠卡的卡名不是可调用名 —— 有 variants 就展开成每个规格的调用名,
+           否则选中后发给 /api/playground/chat 会吃 404 unknown model。 */
+        const out = [];
+        const seen = new Set();
+        for (const m of (r.data || [])) {
+          if (!m.chat) continue;
+          const names = (m.variants && m.variants.length)
+            ? m.variants.map((v) => v.model) : [m.model];
+          for (const name of names) {
+            if (seen.has(name)) continue;
+            seen.add(name);
+            out.push(Object.assign({}, m, { model: name }));
+          }
+        }
+        models.value = out;
         if (!model.value && models.value.length)
           model.value = models.value[0].model;
       }));
@@ -2760,14 +2889,11 @@
       let abort = null;
 
       const opts = computed(() => models.value.map((m) => ({
-        value: m.model, label: m.model, icon: prov(m.model),
-        channel: m.channel })));
+        value: m.model, label: m.model, icon: prov(m.model) })));
       const renderOpt = (o) => (o && o.icon
         ? h("div", { style: { display: "flex", alignItems: "center",
             gap: "7px" } }, [provIcon(o.icon, 15),
-            h("span", null, o.label),
-            h("span", { style: { opacity: 0.45, fontSize: "11.5px" } },
-              o.channel)])
+            h("span", null, o.label)])
         : (o && o.label));
 
       const stop = () => { if (abort) abort.abort(); };
@@ -2794,7 +2920,7 @@
           const res = await fetch(BASE + "/api/playground/chat", {
             method: "POST", signal: abort.signal,
             headers: { "Content-Type": "application/json",
-                       Authorization: "Bearer " + token() },
+                       ...P.authHeaders() }, credentials: "same-origin",
             body: JSON.stringify({ model: model.value, messages: history }),
           });
           if (!res.ok) {
@@ -2821,38 +2947,59 @@
 
       onUnmounted(stop);
       return Object.assign({ models, model, opts, renderOpt, turns, draft,
-        busy, send, stop, clear, MONO, SUBSTY, kf, nf }, s);
+        busy, send, stop, clear, MONO, SUBSTY, kf, nf, go,
+        selected: computed(() => models.value.find((m) => m.model === model.value)),
+        priceBrief,
+        prompts: [
+          { label: "理解一个概念", note: "观察解释是否清晰、准确。", text: "请用一个具体例子解释什么是 API，以及它如何连接两个应用。" },
+          { label: "整理一段思路", note: "把输入变成清晰的执行步骤。", text: "我准备给应用接入 AI 对话功能，请帮我列出从原型到上线最关键的五个步骤。" },
+          { label: "检查一段代码", note: "粘贴代码，验证分析与建议。", text: "请帮我检查下面的代码，指出潜在错误并解释如何修改：\n\n" },
+        ] }, s);
     },
     template: `
 <Load :loading="loading" :error="error" :on-retry="reload">
-<n-card size="small" :bordered="false" style="margin-bottom:12px"
-  content-style="padding:11px 14px">
-  <n-space align="center" :size="10">
+<div class="console-page-stack">
+<n-card class="console-panel" size="small">
+  <div class="console-section-heading">
+    <div><h2 class="console-section-title">当前对话</h2>
+      <p class="console-section-note">选择模型后发送消息。每次发送为真实请求，按当前分组计费。</p></div>
+    <n-button secondary @click="go('#/usage')">查看使用记录</n-button>
+  </div>
+  <div class="console-toolbar">
     <n-select v-model:value="model" :options="opts" filterable
       :disabled="busy" placeholder="选择模型" style="width:300px"
       :render-label="renderOpt"/>
     <n-button size="small" quaternary :disabled="busy || !turns.length"
       @click="clear">清空对话</n-button>
-    <n-text depth="3" style="font-size:11.5px">
-      体验就是一次真实请求,按你当前分组的单价扣费,消费会进「使用记录」
-    </n-text>
-  </n-space>
+    <n-text v-if="selected" depth="3">原始单价 {{ priceBrief(selected) }}</n-text>
+  </div>
   <n-alert v-if="!models.length" type="warning" :bordered="false"
     :show-icon="false" style="margin-top:10px;font-size:12px">
     当前分组没有可用的对话模型。图片和视频模型走生成接口,不在这里体验。
   </n-alert>
 </n-card>
 
-<n-empty v-if="!turns.length" description="发一句试试" style="padding:64px 0"/>
-<n-space v-else vertical :size="12" style="margin-bottom:14px">
+<section class="console-playground-conversation" aria-label="对话内容">
+<div v-if="!turns.length" class="console-playground-empty">
+  <div class="console-eyebrow">从一个问题开始</div>
+  <h2 class="console-section-title">看看模型如何处理你的任务</h2>
+  <p class="console-section-note">选择下方示例填入输入框，也可以直接写下自己的问题。</p>
+  <div class="console-action-grid">
+    <button v-for="p in prompts" :key="p.label" type="button" class="console-action-card"
+      :disabled="!models.length" @click="draft = p.text">
+      <strong>{{ p.label }}</strong><span>{{ p.note }}</span>
+    </button>
+  </div>
+</div>
+<n-space v-else vertical :size="20">
   <div v-for="(t, i) in turns" :key="i"
     :style="{display:'flex', justifyContent: t.role === 'user'
       ? 'flex-end' : 'flex-start'}">
     <div :style="{maxWidth:'760px', minWidth:0}">
       <n-card size="small" :bordered="false"
         :content-style="'padding:11px 13px'"
-        :style="{background: t.role === 'user'
-          ? 'rgba(168,97,60,.09)' : 'rgba(127,127,127,.07)'}">
+        class="console-chat-message" :class="{'console-chat-user':t.role === 'user'}">
+        <div class="console-eyebrow" style="margin-bottom:8px">{{ t.role === 'user' ? '你' : '模型回复' }}</div>
         <n-collapse v-if="t.reasoning" style="margin:-4px 0 8px">
           <n-collapse-item title="思考过程" name="r">
             <div :style="[SUBSTY, {whiteSpace:'pre-wrap',opacity:.7}]"
@@ -2876,24 +3023,150 @@
     </div>
   </div>
 </n-space>
+</section>
 
-<n-card size="small" :bordered="false" content-style="padding:11px 12px">
+<n-card class="console-chat-composer" size="small" :bordered="false">
   <n-space vertical :size="8">
-    <n-input v-model:value="draft" type="textarea" :rows="3"
+    <n-input v-model:value="draft" type="textarea" :autosize="{minRows:3,maxRows:8}"
+      :disabled="!models.length" :input-props="{'aria-label':'对话消息'}"
       placeholder="说点什么… Ctrl/⌘ + Enter 发送"
       @keydown.ctrl.enter="send" @keydown.meta.enter="send"/>
-    <n-space justify="end" :size="8">
+    <n-space justify="space-between" align="center" :size="8">
+      <n-text depth="3" style="font-size:12px">多轮对话会携带此前消息，历史越长，输入用量越多。</n-text>
+      <n-space :size="8">
       <n-button v-if="busy" size="small" @click="stop">停止</n-button>
-      <n-button size="small" type="primary" :disabled="busy || !draft.trim()"
+      <n-button type="primary" :disabled="busy || !draft.trim() || !models.length"
         :loading="busy" @click="send">发送</n-button>
+      </n-space>
     </n-space>
   </n-space>
 </n-card>
+</div>
+</Load>`,
+  };
+
+  /* ---------------- 模型状态(用户侧) ---------------- */
+
+  const ModelStatus = {
+    components: { Load, StatCard },
+    setup() {
+      const rows = ref([]);
+      const interval = ref(3600);
+      const summary = ref({});
+      const filter = ref("");
+      const view = computed(() => {
+        const value = filter.value.trim().toLowerCase();
+        if (!value) return rows.value;
+        return rows.value.filter((r) =>
+          (r.model + " " + (r.channels || []).join(" ")).toLowerCase().includes(value));
+      });
+      const s = useFetch(() => api("GET", "/model-status").then((r) => {
+        rows.value = r.rows || [];
+        interval.value = r.interval || 3600;
+        summary.value = r.summary || {};
+      }));
+      /* 状态页看的就是「现在怎么样」,60 秒一刷保底;管理员在后台手动触发
+         一轮新检测时,这边也会在一分钟内跟上。 */
+      let timer;
+      onMounted(() => { timer = setInterval(() => s.reload(), 60000); });
+      onUnmounted(() => clearInterval(timer));
+      /* 状态条:红=不可用 黄=通过但首字超 10s 绿=正常 灰=没测(用户视角取最好) */
+      const SLOW_MS = 10000;
+      const gradeOf = (r) => r.ok == null ? null
+        : (r.ok !== 1 ? 0 : ((r.ttft_ms || r.latency_ms || 0) > SLOW_MS ? 2 : 1));
+      const stTag = (r) => {
+        const g = gradeOf(r);
+        if (g === 1) return tag("success", "正常");
+        if (g === 2) return tag("warning", "偏慢");
+        if (g === 0) return tag("error", "故障");
+        return tag("default", "未检测");
+      };
+      const BAR_C = { 1: "#18a058", 0: "#de5764", 2: "#f0a020" };
+      const barText = { 1: "正常", 0: "不可用", 2: "慢(>10s)" };
+      /* Plaza 里那份 hbSlots 是组件内局部函数,这里拿不到,必须自带一份;
+         漏了它就是 ReferenceError,整张表渲染不出来(24 小时格子全空)。 */
+      const hbSlots = (o) => (o && o.heartbeats && o.heartbeats.length)
+        ? o.heartbeats : (o && o.bars) || [];
+      const barsCell = (r) => h(naive.NSpace, { size: 2, wrap: false, align: "center" },
+        () => hbSlots(r).map((b) => h(naive.NTooltip, {}, {
+          trigger: () => h("div", { style: {
+            width: "7px", height: "16px", borderRadius: "2px",
+            background: b.grade === null || b.grade === undefined
+              ? "#e0e0e6" : (BAR_C[b.grade] || "#e0e0e6") } }),
+          default: () => h("span", { style: MONO },
+            (b.label || b.date) + " " + (barText[b.grade] || "没测")) })));
+      const latencyText = (ms) => !ms ? "—"
+        : ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
+      const cols = [
+        { title: "模型", key: "model", minWidth: 240,
+          render: (r) => h("span", { style: MONO }, r.model) },
+        { title: "渠道", key: "channels", width: 180, render: (r) =>
+            h(naive.NSpace, { size: 4, wrap: true }, () => (r.channels || []).length
+              ? r.channels.map((c) => h(naive.NTag, { size: "small", bordered: false }, () => c))
+              : [h("span", { style: MONO }, "—")]) },
+        { title: "状态", key: "ok", width: 100, render: stTag },
+        { title: "最近 24 小时", key: "heartbeats", minWidth: 190, render: barsCell },
+        { title: "首字 TTFT", key: "ttft_ms", width: 110, render: (r) =>
+            h("span", { style: MONO }, latencyText(r.ttft_ms)) },
+        { title: "总耗时", key: "latency_ms", width: 100, render: (r) =>
+            h("span", { style: MONO }, latencyText(r.latency_ms)) },
+        { title: "上次检测", key: "checked_at", width: 140, render: (r) => r.checked_at
+            ? h(naive.NTooltip, {}, {
+                trigger: () => h("span", { style: MONO }, relTime(r.checked_at)),
+                default: () => h("span", { style: MONO }, absTime(r.checked_at)) })
+            : h("span", { style: MONO }, "—") },
+        /* 失败原因:后端已脱敏(抹掉 key/token/上游地址),只在该模型整体失败时有值 */
+        { title: "失败原因", key: "error", minWidth: 240, render: (r) => {
+            if (!r.error) return h("span", { style: { color: "#9a9aa5" } }, "—");
+            return h(naive.NTooltip, { style: "max-width:520px" }, {
+              trigger: () => h("span", { style: Object.assign({ color: "#bf4038" }, MONO) },
+                String(r.error).slice(0, 48)),
+              default: () => h("span", { style: MONO }, r.error) });
+          } },
+      ];
+      return { loading: s.loading, reload: s.reload, rows, view, filter, summary,
+        interval, cols };
+    },
+    template: `
+<Load :loading="loading">
+<div class="console-page">
+<n-card size="small" style="margin-bottom:20px">
+  <n-space vertical :size="10">
+    <n-space align="center" :size="18">
+      <span>每小时自动检测一轮</span>
+      <n-space align="center" :size="14">
+        <span>正常 <n-text type="success" strong>{{ summary.ok || 0 }}</n-text></span>
+        <span>偏慢 <n-text :type="summary.slow ? 'warning' : 'default'"
+          strong>{{ summary.slow || 0 }}</n-text></span>
+        <span>故障 <n-text :type="summary.fail ? 'error' : 'default'"
+          strong>{{ summary.fail || 0 }}</n-text></span>
+        <span>未检测 <n-text depth="2">{{ summary.pending || 0 }}</n-text></span>
+      </n-space>
+      <n-button secondary size="small" :loading="loading" @click="reload">刷新</n-button>
+    </n-space>
+    <n-text depth="3" style="font-size:12px">
+      偏慢与故障的模型排在最前。每根状态条代表一次心跳(每小时巡检一轮,最近 24 个):
+      红=不可用 黄=通过但首字超 10s 绿=正常 灰=该小时没测。
+      多渠道故障切换时,该小时任一渠道能用就算绿。
+      失败原因只保留可读部分,上游地址与凭据已隐去。
+    </n-text>
+  </n-space>
+</n-card>
+<n-card class="console-table-card" size="small" title="检测结果">
+  <div class="console-toolbar">
+    <n-input v-model:value="filter" clearable placeholder="搜索模型 / 渠道" style="width:280px;max-width:100%"/>
+    <n-space align="center"><n-text depth="3">{{ view.length }} / {{ rows.length }} 个模型</n-text></n-space>
+  </div>
+  <n-data-table :columns="cols" :data="view" size="small" :bordered="false"
+    :single-line="false" :scroll-x="1100" :row-key="(r) => r.model"/>
+</n-card>
+</div>
 </Load>`,
   };
 
   window.BitPortalPages = { Load: Load, useFetch: useFetch,
     Dashboard: Dashboard, Keys: Keys, Usage: Usage, Wallet: Wallet,
-    Billing: Billing, Leaderboard: Leaderboard, Invite: Invite, Profile: Profile, Plaza: Plaza,
+    Billing: Billing, Invite: Invite, Share: Share, Leaderboard: Leaderboard,
+    Profile: Profile, Plaza: Plaza, ModelStatus: ModelStatus,
     Playground: Playground };
 })();

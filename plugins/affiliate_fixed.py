@@ -6,6 +6,7 @@
 注意:这种形态容易被小号刷,建议配合邮箱验证或人工审核使用。
 可选也给被邀请人一笔见面礼(双边奖励)。
 """
+import math
 from core.credit import REASON_AFFILIATE, credit
 from core.hooks import on
 
@@ -22,6 +23,11 @@ def on_registered(user, inviter, **_):
     from core import site_settings
     if site_settings.is_from_db("invite_rewards"):
         return  # 管理台规则已在注册事务中结算，不再叠加旧插件奖励。
+    for key in ("inviter_bonus", "invitee_bonus"):
+        if not math.isfinite(CONFIG[key]) or not 0 <= CONFIG[key] <= 100:
+            raise ValueError(key + " must be finite and between 0 and 100")
+    if not isinstance(CONFIG["max_invitees"], int) or CONFIG["max_invitees"] < 0:
+        raise ValueError("max_invitees must be a nonnegative integer")
     if not inviter:
         return
     if CONFIG["require_verified_email"] and not user.get("email_verified_at"):

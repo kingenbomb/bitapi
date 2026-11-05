@@ -8,7 +8,7 @@
 号池、巡检、渠道开关都不区分来源。
 
 reload() 是幂等的整体重放:先把上一次由本模块注册的都摘掉,再按表重新注册。
-只摘自己注册过的 —— 代码渠道不归这里管,不能因为表里没有就把它们摘了。
+只摘自己注册过的 —— 代码渠道不归这里管,不能因为表里没有就把代码渠道摘了。
 
 校验在写库之前(validate),口径:
   - name 是 [a-z0-9_-]{2,32},不能撞代码渠道(那会把 import 注册的顶掉),
@@ -48,6 +48,7 @@ def build(row):
         chat_path=row.get("chat_path") or "/chat/completions",
         models=row.get("models") or [], model_map=row.get("model_map") or {},
         headers=row.get("headers") or {}, timeout=row.get("timeout") or 0,
+        key_concurrency=row.get("key_concurrency") or 0,
         source="data", notes=row.get("notes") or "")
 
 
@@ -165,5 +166,14 @@ def validate(data, db, editing=None):
     if t < 0 or t > 3600:
         raise ChannelError("超时需在 0~3600 秒之间,0 = 用默认")
     out["timeout"] = t
+
+    kc = data.get("key_concurrency")
+    try:
+        kc = int(kc or 0)
+    except (TypeError, ValueError) as e:
+        raise ChannelError("每号并发需是整数") from e
+    if kc < 0 or kc > 1000:
+        raise ChannelError("每号并发需在 0~1000 之间,0 = 不限")
+    out["key_concurrency"] = kc
     out["notes"] = str(data.get("notes") or "").strip()[:500]
     return out

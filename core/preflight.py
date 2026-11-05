@@ -20,6 +20,7 @@ DEFAULTS = {
     "BITAPI_API_KEY": "sk-bitapi",
     "BITAPI_ADMIN_KEY": "adm-bitapi",
 }
+PLACEHOLDERS = {"换成 32 位以上随机串", "sk-换成内部主密钥", "adm-换成号池管理密钥"}
 
 
 def _loopback(host):
@@ -36,7 +37,8 @@ def default_secrets_in_use():
     current = {"BITAPI_JWT_SECRET": config.JWT_SECRET,
                "BITAPI_API_KEY": config.API_KEY,
                "BITAPI_ADMIN_KEY": config.ADMIN_KEY}
-    return [k for k, v in current.items() if v == DEFAULTS[k]]
+    return [k for k, v in current.items() if not (v or "").strip()
+            or v == DEFAULTS[k] or v in PLACEHOLDERS]
 
 
 def check(host=None, allow_default=None):
@@ -45,6 +47,11 @@ def check(host=None, allow_default=None):
     allow = (config.env_bool("ALLOW_DEFAULT_SECRETS", False)
              if allow_default is None else allow_default)
     bad = default_secrets_in_use()
+    empty = [k for k, v in (("BITAPI_JWT_SECRET", config.JWT_SECRET),
+                            ("BITAPI_API_KEY", config.API_KEY),
+                            ("BITAPI_ADMIN_KEY", config.ADMIN_KEY)) if not (v or "").strip()]
+    if empty:
+        return False, [f"{k} 不能为空" for k in empty]
     if not bad or _loopback(host) or allow:
         return True, []
     return False, [

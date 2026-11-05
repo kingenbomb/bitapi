@@ -20,6 +20,7 @@ class _StatusDB:
     """只记 set_status / update_account 的假库:门禁关心状态落点,不关心 SQLite。"""
 
     def __init__(self):
+        self.path = "status-fixture-" + str(id(self))
         self.status = None
         self.updates = []
 
@@ -28,6 +29,11 @@ class _StatusDB:
 
     def update_account(self, _acct_id, **fields):
         self.updates.append(fields)
+        if "status" in fields:
+            self.status = fields["status"]
+
+    def get_account(self, acct_id):
+        return {"id": acct_id, "secret": {}, "meta": {}, "status": self.status or "active"}
 
 
 class ClassifyFailureTest(unittest.TestCase):
@@ -80,6 +86,25 @@ class ClassifyFailureTest(unittest.TestCase):
 
 
 class MarkFailureTest(unittest.TestCase):
+    def test_gpt_capacity_overload_keeps_account_eligible_without_hiding_other_failures(self):
+        from types import SimpleNamespace
+        from adapters.openai_compat import UpstreamError
+        for channel, code, message, expected in (
+                ("gpt", 502, "Our servers are currently overloaded", "ratelimit"),
+                ("gpt", 503, "server_is_overloaded", "ratelimit"),
+                ("gpt", 502, "Bad Gateway", "ratelimit"),
+                ("gpt", 401, "unauthorized (overloaded)", dbmod.ST_COOLDOWN),
+                ("gpt", 402, "insufficient_quota", dbmod.ST_EXHAUSTED),
+                ("grok", 502, "server_is_overloaded", dbmod.ST_COOLDOWN)):
+            with self.subTest(channel=channel, code=code, message=message):
+                db = _StatusDB()
+                adapter = SimpleNamespace(name=channel, stateless_keys=False)
+                landed = Pool(db).mark_failure(1, UpstreamError(code, message), adapter=adapter)
+                self.assertEqual(landed, expected)
+                self.assertEqual(db.status, None if expected == "ratelimit" else expected)
+                if expected == "ratelimit":
+                    self.assertIn("last_check", db.updates[0])
+
     def test_transient_lands_cooldown_even_when_caller_says_dead(self):
         """事故的核心断言:dead=True 也不许把临时故障写成 dead。
 
@@ -166,7 +191,7 @@ class StatelessKeysTest(unittest.TestCase):
     def test_terminal_still_retires_the_key(self):
         """豁免只给「说不清的上游故障」。401/402/403 说的就是这把 key 本身不行,
         再留在池里每次取到它都白跑一趟。"""
-        for code, dead, want in ((401, False, dbmod.ST_EXHAUSTED),
+        for code, dead, want in ((401, False, dbmod.ST_COOLDOWN),
                                  (403, True, dbmod.ST_DEAD)):
             with self.subTest(code=code):
                 db = _StatusDB()
@@ -194,7 +219,7 @@ class _RotatingDB:
         self.rows = [{"id": i + 1, "identity": n, "last_check": 0}
                      for i, n in enumerate(names)]
 
-    def pick_active(self, _channel):
+    def pick_active(self, _channel, prefer=None, group_id=None, exclude=None):
         if not self.rows:
             return None
         return min(self.rows, key=lambda r: r["last_check"])
@@ -207,13 +232,6 @@ class _RotatingDB:
     def set_status(self, _acct_id, _status):
         pass
 
-    def touch_used(self, acct_id):
-        """真库在这时记一次 last_used(面板的「最近使用」)。它不参与
-        pick_active 的排序 —— 轮换的键始终是 last_check,所以这里照实记下即可。"""
-        for r in self.rows:
-            if r["id"] == acct_id:
-                r["last_used"] = 1
-
 
 class _BareAdapter:
     """没有任何 capability:不刷 token,也没有余额/存活检查。"""
@@ -223,7 +241,7 @@ class _BareAdapter:
 
 
 class _RefreshOnlyAdapter(_BareAdapter):
-    """只声明 CAP_REFRESH 的渠道形状。刷 token 只写 token/token_exp,
+    """designarena 的形状:只声明 CAP_REFRESH。刷 token 只写 token/token_exp,
     不碰 last_check —— 取号路径里没有任何东西会推进它,轮换就是这么断的。"""
 
     def has(self, cap):
@@ -234,10 +252,50 @@ class _RefreshOnlyAdapter(_BareAdapter):
 
 
 class _HealthOnlyAdapter:
-    """声明 CAP_HEALTH 但不声明 CAP_BALANCE 的渠道形状。"""
+    """声明 CAP_HEALTH 但不声明 CAP_BALANCE(oreate 那个形状)。"""
 
     def has(self, cap):
         return cap == CAP_HEALTH
+
+
+class _RotatingSecretAdapter(_BareAdapter):
+    """xai 的形状:刷新会轮换 refresh_token,新的那份在返回值的 secret 里。"""
+
+    def has(self, cap):
+        return cap == CAP_REFRESH
+
+    def refresh_token(self, _acct):
+        return {"token": "tok-new", "token_exp": 9_999_999_999,
+                "secret": {"refresh_token": "rt-new"}}
+
+
+class _RotatingMetaAdapter(_BareAdapter):
+    """designarena 的形状:轮换后的 refresh_token 放在 meta["_refresh_token"]。"""
+
+    def has(self, cap):
+        return cap == CAP_REFRESH
+
+    def refresh_token(self, _acct):
+        return {"token": "tok-new", "token_exp": 9_999_999_999,
+                "meta": {"_refresh_token": "rt-new"}}
+
+
+class RefreshWritebackTest(unittest.TestCase):
+    """取号路径刷新后,轮换出来的长期凭据必须落库(见 core.pool.apply_refresh)。
+
+    漏写等于把这号唯一能续命的凭据扔掉:下次拿旧的去换,上游回 invalid_grant,
+    而它在 classify_failure 里是终态 —— 号当场判死,号本身却还是好的。
+    """
+
+    def test_rotated_secret_is_persisted(self):
+        db = _RotatingDB(["a"])
+        Pool(db).get_valid_account("ch", _RotatingSecretAdapter())
+        self.assertEqual(db.rows[0]["secret"], {"refresh_token": "rt-new"})
+
+    def test_rotated_meta_is_persisted(self):
+        db = _RotatingDB(["a"])
+        Pool(db).get_valid_account("ch", _RotatingMetaAdapter())
+        self.assertEqual(db.rows[0]["meta"], {"_refresh_token": "rt-new"})
 
 
 class PickRotationTest(unittest.TestCase):
@@ -245,7 +303,7 @@ class PickRotationTest(unittest.TestCase):
 
     没有余额/存活检查的渠道在取号路径里不会推进 last_check,而 pick_active 是
     last_check ASC 排序 —— 不推就等于每次都返回同一个号,请求全堆在一个号上。
-    高频调用被上游封号是不可逆的,所以这条是门禁。
+    designarena 就是这么被上游封号的(高频调用,不可逆),所以这条是门禁。
     """
 
     def test_refresh_only_channel_rotates_across_accounts(self):

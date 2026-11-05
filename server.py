@@ -7,26 +7,30 @@ bit-api 统一网关 —— FastAPI:OpenAI 端点 + 管理 API + 上报。
   POST /v1/messages           Anthropic Messages 兼容(内部归一到 OpenAI 执行层)
   GET  /v1/models             聚合所有 channel 的模型
   GET  /admin/stats           各渠道号池统计
-  GET  /admin/accounts        账号列表(筛选 / 排序 / 分页)
+  GET  /admin/accounts        账号列表
   POST /admin/accounts        本地注册 worker 上报入库
-  POST /admin/accounts/bulk   批量启用/停用调度、重置状态、删除
-  POST /admin/accounts/import 通用凭据导入(各 adapter 自己解释 shape)
-  GET  /admin/accounts/export 导出 JSON(含凭据)
-  POST /admin/accounts/test   单账号发一条真请求,回上游原话
-  GET  /admin/accounts/stats  按账号的用量 / 余额 / 最近使用
 """
 import asyncio
 import json
+import copy
 import queue
 import random
+import re
 import secrets
 import string
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from anyio import CancelScope
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import config
 from core import auth
@@ -38,9 +42,20 @@ from core.adapter import (GenerationSubmittedError, all_adapters,
                           enabled_adapters, get_adapter, model_routes,
                           model_to_channel)
 from core.pool_state import DB, POOL, import_keys, parse_keys
-from core.pool import persist_runtime_meta
 from core.scheduler import scan_once, scanner_loop
-from core.portal_state import (BILLING, apply_channel_switches,
+from core import model_status
+from core import sse
+from core import portal_state
+# 协议翻译挪到 core/protocol/(纯函数,不依赖 FastAPI)。这里保留同名别名,
+# 本文件里的调用点不用跟着改;新代码建议直接 from core.protocol import ...
+from core.protocol.anthropic import (
+    _anthropic_event, _anthropic_message_from_openai, _anthropic_stop,
+    _anthropic_stream, _anthropic_to_openai, _anthropic_usage,
+    _content_text, _extract_output_text, _image_part, _user_content)
+from core.protocol.responses import (
+    _flatten_parts, _openai_to_response, _part_to_chat, _response_shell,
+    _responses_stream, _responses_to_openai, _responses_usage, _rid)
+from core.portal_state import (BILLING, PRICING, apply_channel_switches,
                                ensure_default_group,
                                init_pricing_catalog, load_data_channels,
                                load_payment_providers, load_plugins,
@@ -50,10 +65,8 @@ from routers.portal import (community_oauth_callback as portal_community_callbac
                             current_user as portal_current_user,
                             router as portal_router)
 
-# 触发 adapter 注册(import 即注册)。加渠道照 docs/adapters.md 往这里加一行。
-import adapters.grok  # noqa: F401  (xAI 官方接口,自持 OAuth 续期)
-import adapters.openai  # noqa: F401  (ChatGPT 订阅号,Codex Responses 端点)
-import adapters.claude  # noqa: F401  (Anthropic 订阅号,Messages 端点)
+# 触发 adapter 注册(import 即注册)
+import adapters.gpt  # noqa: F401  (原生 GPT/Codex OAuth 号池与 Responses 转换)
 
 
 @asynccontextmanager
@@ -100,24 +113,22 @@ async def lifespan(app):
     pays = load_payment_providers()
     if pays:
         print(f"[bitapi] 支付渠道: {', '.join(pays)}", flush=True)
-    # 启动时让声明了 sync_pool 的渠道同步一次外部号源,面板立即可见。
-    # 不写死渠道名:谁有这个能力谁同步,新增渠道不必回来改这里。
-    for _name, _ad in all_adapters().items():
-        if not hasattr(_ad, "sync_pool"):
-            continue
-        try:
-            print(f"[bitapi] {_name} 号池同步(full): {_ad.sync_pool(DB, full=True)}",
-                  flush=True)
-        except Exception as e:
-            print(f"[bitapi] {_name} 同步失败: {e}", flush=True)
     task = asyncio.create_task(scanner_loop(
         DB, config.SCAN_INTERVAL, config.SCAN_CONCURRENCY,
         config.REFRESH_MARGIN, config.MIN_BALANCE))
     print(f"[bitapi] 巡检器启动(每 {config.SCAN_INTERVAL}s,并发 {config.SCAN_CONCURRENCY})", flush=True)
+    status_task = asyncio.create_task(model_status.loop(
+        portal_state.USER_DB, POOL, DB, enabled_adapters,
+        config.MODEL_STATUS_INTERVAL))
+    print(f"[bitapi] 模型状态巡检启动(每 {config.MODEL_STATUS_INTERVAL}s)", flush=True)
     housekeeping = asyncio.create_task(_housekeeping_loop())
+    from core.account_management import scheduled_tests_loop
+    pool_tests = asyncio.create_task(scheduled_tests_loop())
     yield
     task.cancel()
+    status_task.cancel()
     housekeeping.cancel()
+    pool_tests.cancel()
 
 
 async def _housekeeping_loop():
@@ -162,25 +173,85 @@ async def _housekeeping_loop():
             emit("backup.failed", error=str(e))
 
 
-app = FastAPI(title="bit-api", lifespan=lifespan)
+class _ConcurrencyMiddleware:
+    """完整 ASGI 请求结束后释放名额,覆盖正常返回、校验失败与异常。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            release = scope.get("state", {}).get("billing_release")
+            if release:
+                release()
+
+
+class _BilledStreamingResponse(StreamingResponse):
+    """断连时显式关闭同步计费迭代器,排空并结算后才结束请求。"""
+
+    def __init__(self, content, **kwargs):
+        self._billing_iterator = content
+        super().__init__(content, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with CancelScope(shield=True):
+                await run_in_threadpool(self._billing_iterator.close)
+
+
+app = FastAPI(title="bit-api", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
+from core.security import secret_equal
+from core.request_limits import RequestLimitsMiddleware
+from core.session import SessionMiddleware
+from core.admin_audit import AdminAuditMiddleware
+from core import account_runtime  # noqa: E402
+app.add_middleware(account_runtime.AccountContextMiddleware)
+app.add_middleware(_ConcurrencyMiddleware)
+app.add_middleware(AdminAuditMiddleware)
+app.add_middleware(SessionMiddleware)
+app.add_middleware(RequestLimitsMiddleware)
 app.include_router(portal_router)
+from routers.admin_pool import router as admin_pool_router  # noqa: E402
+app.include_router(admin_pool_router)
+from routers.mcp import router as mcp_router, snapshot as mcp_snapshot  # noqa: E402
+app.include_router(mcp_router)
 
 
-@app.get("/oauth/community", include_in_schema=False)
-def community_oauth_callback(request: Request, code: str = "", state: str = ""):
-    return portal_community_callback(request, code=code, state=state)
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    from fastapi.responses import JSONResponse
+    # 不回显请求输入：其中可能包含凭据或无法序列化的 Infinity/NaN。
+    return JSONResponse(status_code=422, content={"detail": [
+        {key: error[key] for key in ("type", "loc", "msg") if key in error}
+        for error in exc.errors()]})
+
+
+@app.get("/oauth/baipiao-community", include_in_schema=False)
+def community_oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    return portal_community_callback(request, code=code, state=state, error=error)
 
 _STREAM_END = object()
 
 
 # ---- 鉴权 ----
 
+def _admin_authorization(authorization: str = Header(None),
+                         x_bitapi_admin_key: str = Header(None)):
+    """管理密钥使用独立请求头，让浏览器的 Basic Authorization 留给反代。"""
+    return x_bitapi_admin_key or authorization
+
+
 def _check(authorization, expected):
     """/admin/* 号池端点的鉴权:管理密钥(脚本、注册 worker 上报)或管理员 JWT
     (管理台)。原先只认密钥,管理台要操作号池得另配一份 nginx Basic Auth 注入密钥 ——
     那份配置不在仓里,缺了它面板外壳就是公开的。认 JWT 之后管理台自己就能用。"""
     tok = (authorization or "").replace("Bearer ", "").strip()
-    if tok == expected:
+    if secret_equal(tok, expected):
         return
     payload = auth.decode_session_token(tok) if tok else None
     if payload and payload.get("role") == "admin":
@@ -198,7 +269,7 @@ def _client_ip(request):
     return throttle.client_ip(request)
 
 
-def _authorize_gateway(authorization, model, x_api_key=None, request=None):
+def _authorize_gateway(authorization, model, x_api_key=None, *, request):
     """网关热路径鉴权 + 计费预检。返回 (user, group) 或 (None, None)(master key 兜底)。
 
     - master key(config.API_KEY): 内部/兜底,跳过用户体系与限流。
@@ -206,8 +277,9 @@ def _authorize_gateway(authorization, model, x_api_key=None, request=None):
       (分组 ∩ 密钥) → 按计费策略预检(含密钥额度)。
     超限抛 429,余额/密钥额度不足抛 402,无权限抛 403,未知 key 抛 401。
     """
+    model = _canonical_model(model)
     tok = (authorization or x_api_key or "").replace("Bearer ", "").strip()
-    if tok == config.API_KEY:
+    if secret_equal(tok, config.API_KEY):
         return None, None  # master key 兜底,不计费不限流
     resolved = BILLING.resolve_user_by_key(tok)
     if not resolved:
@@ -218,11 +290,11 @@ def _authorize_gateway(authorization, model, x_api_key=None, request=None):
     return user, group
 
 
-def _enforce_limits(user, group, model, api_key=None, request=None):
+def _enforce_limits(user, group, model, *, request, api_key=None):
     """IP 白名单 → 模型白名单 → 计费预检。网关与在线体验共用同一套判定。
 
     体验页走 JWT、没有 sk- key,api_key 传 None:IP 与密钥额度这两项本就是
-    密钥级收紧项,没有密钥就没有额外收紧;分组白名单、RPM、余额/额度照旧生效。
+    密钥级收紧项,没有密钥就没有额外收紧;分组白名单、并发、余额/额度照旧生效。
     抽出来是为了别让两条入口各写一套 —— 一旦分叉,「广场能点、体验能发、
     网关却 403」这类不一致就会长出来,而且只有用户会先撞上。
     """
@@ -233,7 +305,10 @@ def _enforce_limits(user, group, model, api_key=None, request=None):
         raise HTTPException(status_code=403,
                             detail=f"model not allowed for your plan: {model}")
     try:
+        if model and BILLING.pricing and model in model_to_channel():
+            BILLING.pricing.resolve(_canonical_model(model), (group or {}).get("id"))
         BILLING.precheck(user, group)
+        request.state.billing_release = BILLING.acquire_concurrency(user, group)
     except RateLimitError as e:
         raise HTTPException(status_code=429,
                             detail={"code": e.code, "message": e.detail}) from e
@@ -245,6 +320,8 @@ def _enforce_limits(user, group, model, api_key=None, request=None):
         raise HTTPException(status_code=402,
                             detail={"code": e.code, "message": e.detail,
                                     "balance": e.balance}) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ---- OpenAI 端点 ----
@@ -258,34 +335,87 @@ def _mid():
 
 
 def _canonical_model(model):
-    """允许 Claude CLI 使用 mp-fable-5[1M] 这样的展示名。"""
+    """允许 Claude CLI 使用 kg[1M] 这样的展示名,并兼容线上的大小写变体。"""
     models = model_to_channel()
     if model in models:
         return model
-    if isinstance(model, str) and model.endswith("]") and "[" in model:
-        base = model.rsplit("[", 1)[0]
-        if base in models:
-            return base
+    if isinstance(model, str):
+        lowered = model.lower()
+        if lowered != model:
+            for name in models:
+                if name.lower() == lowered:
+                    return name
+        if model.endswith("]") and "[" in model:
+            base = model.rsplit("[", 1)[0]
+            if base in models:
+                return base
+            for name in models:
+                if name.lower() == base.lower():
+                    return name
     return model
 
 
-# 需要把 function tools 编成文本协议的上游:纯文本渠道不认 tool_calls,只能把
-# 函数签名写进 prompt、再从回复里解析调用。仓库自带的渠道都原生支持 tools,
-# 所以这里是空的;接一个纯文本上游时把渠道名加进来。
-_VIRTUAL_TOOL_CHANNELS = set()
+def _virtual_tool_channels():
+    """读环境变量里的渠道白名单。**每次调用现读**,不在 import 时快照 ——
+    快照会让测试的模块级 env 设置失效(先 import server 的测试把值冻成空集),
+    生产上也让改环境变量必须重启进程才生效。"""
+    return {
+        name.strip().lower() for name in os.environ.get(
+            "BITAPI_VIRTUAL_TOOL_CHANNELS", "").split(",")
+        if name.strip()
+    }
+
+
 _TOOL_BEGIN = "<<<BITAPI_TOOLS>>>"
 _TOOL_END = "<<<END_BITAPI_TOOLS>>>"
 
 
-def _virtual_tooling_requested(channel, body):
-    return (channel in _VIRTUAL_TOOL_CHANNELS
+def _is_virtual_tool_channel(channel, adapter=None):
+    """渠道名可能是线上展示名,也可能是代码注册名。
+
+    优先认 adapter 自己声明的能力,名字只作为兼容兜底 —— 这样线上把渠道
+    改名都不会把桥接关掉。
+    """
+    if adapter is not None and getattr(adapter, "virtual_tools", False):
+        return True
+    return (channel or "").strip().lower() in _virtual_tool_channels()
+
+
+def _virtual_tooling_requested(channel, body, adapter=None):
+    return (_is_virtual_tool_channel(channel, adapter)
             and bool(body.get("tools"))
             and body.get("tool_choice") != "none")
 
 
-def _prepare_virtual_tool_request(channel, body):
+def _flatten_virtual_messages(messages):
+    """文本协议渠道不认 tool_calls / role=tool:把它们摊平成普通文本,多轮工具循环才跑得下去。"""
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role == "assistant" and m.get("tool_calls"):
+            parts = [content or ""]
+            for tc in m["tool_calls"] or []:
+                fn = (tc or {}).get("function") or {}
+                parts.append("[called %s(%s)]" % (fn.get("name") or "?", fn.get("arguments") or "{}"))
+            out.append({"role": "assistant",
+                        "content": " ".join(p for p in parts if p).strip()})
+        elif role == "tool":
+            name = m.get("name") or m.get("tool_call_id") or "tool"
+            out.append({"role": "user",
+                        "content": "[tool result %s] %s\n"
+                                   "This is the RESULT of the tool call above. Do not call it again; "
+                                   "use this result to answer the user." % (name, content or "")})
+        else:
+            out.append(m)
+    return out
+
+
+def _prepare_virtual_tool_request(channel, body, adapter=None):
     """Turn declared functions into a text protocol for text-only upstreams."""
-    if not _virtual_tooling_requested(channel, body):
+    if not _virtual_tooling_requested(channel, body, adapter):
         return body, None
 
     definitions = []
@@ -308,11 +438,33 @@ def _prepare_virtual_tool_request(channel, body):
         return body, None
 
     marker = "[[BITAPI-CALL-" + secrets.token_hex(6) + "]]"
+
+    def example_params(schema):
+        props = (schema or {}).get("properties") or {}
+        out = {}
+        for key, spec in props.items():
+            kind = (spec or {}).get("type") if isinstance(spec, dict) else None
+            out[key] = ("..." if kind == "string"
+                        else 0 if kind in ("integer", "number")
+                        else [] if kind == "array"
+                        else {})
+        return out
+
+    example = json.dumps(
+        [{"name": definitions[0]["name"],
+          "params": example_params(definitions[0]["parameters"])}],
+        ensure_ascii=False)
     directive = (
+        "You are a coding agent with access to the developer's local tools. "
         "You may call only the tools declared below. If a tool is needed, output the "
         f"marker {marker} followed immediately by { _TOOL_BEGIN } and a JSON array of "
         "objects with exactly name and params fields, then " + _TOOL_END + ". "
-        "params must be a JSON object. Do not describe this protocol or invent tool names.\n\n"
+        "params must be a JSON object. Do not describe this protocol or invent tool names. "
+        "If you need to inspect local files, run commands, or modify the workspace, you "
+        "MUST call a tool; never claim you did it without a call. "
+        "Do not build a website, do not create artifacts, do not write React code unless "
+        "the user explicitly asks.\n\n"
+        f"Example: {marker}{_TOOL_BEGIN}{example}{_TOOL_END}\n\n"
         "Declared tools:\n" + json.dumps(definitions, ensure_ascii=False)
     )
     choice = body.get("tool_choice")
@@ -326,10 +478,59 @@ def _prepare_virtual_tool_request(channel, body):
         directive += "\nCall no more than one tool."
 
     routed = dict(body)
-    routed["messages"] = [{"role": "system", "content": directive}, *(body.get("messages") or [])]
+    routed["messages"] = [{"role": "system", "content": directive},
+                          *_flatten_virtual_messages(body.get("messages") or [])]
     for field in ("tools", "tool_choice", "parallel_tool_calls"):
         routed.pop(field, None)
     return routed, {"marker": marker, "allowed": allowed}
+
+
+def _tool_call_items(blob):
+    """Parse a model-emitted tool-call array, tolerating fences and stray prose."""
+    text = (blob or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    try:
+        items = json.loads(text)
+    except json.JSONDecodeError:
+        start = min([i for i in (text.find("["), text.find("{")) if i >= 0], default=-1)
+        if start < 0:
+            return []
+        opener = text[start]
+        closer = "]" if opener == "[" else "}"
+        depth = 0
+        in_str = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        items = json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return []
+                    break
+        else:
+            return []
+    if isinstance(items, dict):
+        return [items]
+    return items if isinstance(items, list) else []
 
 
 def _parse_virtual_tool_calls(content, virtual):
@@ -344,21 +545,26 @@ def _parse_virtual_tool_calls(content, virtual):
     end = remainder.find(_TOOL_END, begin + len(_TOOL_BEGIN)) if begin >= 0 else -1
     if begin < 0 or end < 0:
         return prefix, []
-    try:
-        items = json.loads(remainder[begin + len(_TOOL_BEGIN):end].strip())
-    except json.JSONDecodeError:
-        return prefix, []
-    if isinstance(items, dict):
-        items = [items]
-    if not isinstance(items, list):
-        return prefix, []
+    items = _tool_call_items(remainder[begin + len(_TOOL_BEGIN):end])
 
     calls = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        name = item.get("name")
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        name = (item.get("name") or item.get("tool") or item.get("tool_name")
+                or function.get("name"))
         params = item.get("params")
+        for key in ("arguments", "parameters", "input"):
+            if params is None:
+                params = item.get(key)
+        if params is None:
+            params = function.get("arguments")
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except json.JSONDecodeError:
+                continue
         if name not in virtual["allowed"] or not isinstance(params, dict):
             continue
         calls.append({
@@ -370,12 +576,14 @@ def _parse_virtual_tool_calls(content, virtual):
 
 
 def _resolve_routes(body):
+    account_runtime.bind_request(body)
     """一次请求的候选渠道序列:(requested, effective, routed_body, [(channel, adapter), ...])。
 
     序列由 core/adapter.model_routes 按 priority / weight 排好;调用方从头试,
     没号 / 换遍号仍失败 / 上游限流就换下一个渠道。空序列 = 未知模型 → 404。"""
     requested = body.get("model", "")
     effective = _canonical_model(requested)
+    account_runtime.bind_request({**body, "model": effective})
     routes = [(name, get_adapter(name)) for name in model_routes(effective)]
     routes = [(n, ad) for n, ad in routes if ad is not None]
     if not routes:
@@ -385,24 +593,20 @@ def _resolve_routes(body):
     return requested, effective, routed, routes
 
 
-def _resolve_request(body):
-    """首选渠道那一条。给只认单渠道的路径用(生成型 / 虚拟工具判定)。"""
-    requested, effective, routed, routes = _resolve_routes(body)
-    channel, adapter = routes[0]
-    return requested, effective, channel, adapter, routed
-
-
 # 换渠道的信号:没号(503)、换遍号仍失败(502)、上游限流(429)。
 # 4xx 里的其它(400 请求体不对、403 无权)是这次请求本身的问题,换渠道也一样。
 _FAILOVER_STATUS = (502, 503, 429)
 
 
 @app.get("/v1/models")
-def list_models(authorization: str = Header(None), x_api_key: str = Header(None, alias="x-api-key")):
+def list_models(authorization: str = Header(None), x_api_key: str = Header(None, alias="x-api-key"), request: Request = None, client_version: str | None = None):
+    if client_version and request is not None:
+        from core.gpt_native import manifest
+        return manifest(sys.modules[__name__], request, authorization, x_api_key)
     tok = (authorization or x_api_key or "").replace("Bearer ", "").strip()
     group = None
     api_key = None
-    if tok != config.API_KEY:
+    if not secret_equal(tok, config.API_KEY):
         resolved = BILLING.resolve_user_by_key(tok)
         if not resolved:
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -417,7 +621,8 @@ def list_models(authorization: str = Header(None), x_api_key: str = Header(None,
     seen = set()
     primary = model_to_channel()
     for name, ad in enabled_adapters().items():
-        for m in ad.models:
+        models = [entry["slug"] for entry in ad.public_models((group or {}).get("id"))] if name == "gpt" else ad.models
+        for m in models:
             if m in seen:
                 continue
             # 用户 key:分组白名单 ∩ 密钥白名单;master key:全部。
@@ -425,18 +630,20 @@ def list_models(authorization: str = Header(None), x_api_key: str = Header(None,
             if group is not None and not BILLING.check_model_allowed(group, m, api_key):
                 continue
             seen.add(m)
+            # owned_by 过去直接回渠道名(galaxy/...)=把内部渠道摊给客户端看。
+            # 对外只给中性品牌名,渠道信息不出网关。
             data.append({"id": m, "object": "model", "created": now,
-                         "owned_by": primary.get(m, name)})
+                         "owned_by": "baipiao"})
     return {"object": "list", "data": data}
 
 
-def _nonstream_via(channel, adapter, routed, holder=None):
+def _nonstream_via(channel, adapter, routed):
     """在一个渠道上完成一次非流式请求。返回 (response, upstream_usage)。
 
     upstream_usage 只在上游真的给了 usage 时非空。响应体里的 usage 可能是估算值
     (合成响应),计量层不能拿它当真实值 —— 否则 token_source 记成 upstream 就撒谎了。
     失败以 HTTPException 抛出,由调用方决定换不换渠道。"""
-    routed, virtual = _prepare_virtual_tool_request(channel, routed)
+    routed, virtual = _prepare_virtual_tool_request(channel, routed, adapter)
     model = routed["model"]
     messages = routed.get("messages") or []
     if adapter.proxy:
@@ -445,14 +652,32 @@ def _nonstream_via(channel, adapter, routed, holder=None):
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"proxy error: {e}") from e
         return resp, (resp.get("usage") if isinstance(resp, dict) else None)
-    reply = _sync(adapter, channel, messages, model, routed, holder=holder)
+    reply = _sync(adapter, channel, messages, model, routed)
+    if virtual and reply.get("raw") and not (reply.get("content") or ""):
+        _r = reply["raw"]
+        try:
+            _m = ((_r.get("choices") or [{}])[0].get("message") or {})
+            reply["content"] = _m.get("content") or ""
+            reply["reasoning"] = reply.get("reasoning") or _m.get("reasoning_content")
+            reply["usage"] = reply.get("usage") or _r.get("usage")
+        except Exception:
+            pass
+    if virtual and os.environ.get("BITAPI_DEBUG_VTOOLS") not in (None, "", "0", "false", "False"):
+        _c = reply.get("content") or ""
+        print("[vtools-raw] len=%d head=%r" % (len(_c), _c[:220]), flush=True)
     if reply.get("raw") and not virtual:
-        raw = scrubmod.scrub_raw(reply["raw"])
+        raw = _strip_vendor(scrubmod.scrub_raw(reply["raw"]))
+        if isinstance(raw, dict) and raw.get("model") != model:
+            raw["model"] = model          # 上游模型名不出网关
         return raw, (raw.get("usage") if isinstance(raw, dict) else None)
     content = reply["content"]
     calls = []
     if virtual:
         content, calls = _parse_virtual_tool_calls(content, virtual)
+        if os.environ.get("BITAPI_DEBUG_VTOOLS") not in (None, "", "0", "false", "False"):
+            print(f"[vtools] channel={channel} tools={len(virtual['allowed'])} "
+                  f"calls={len(calls)} "
+                  f"marker={virtual['marker'] in (reply['content'] or '')}", flush=True)
     msg = {"role": "assistant", "content": scrubmod.scrub(content)}
     if reply.get("reasoning"):
         msg["reasoning_content"] = scrubmod.scrub(reply["reasoning"])
@@ -477,6 +702,7 @@ def _openai_nonstream(body, served=None):
     实际作答的 channel(计费要记真正花了钱的那个渠道,不是请求开始时猜的首选)与
     upstream_usage(上游真实 usage,没有就是 None —— 响应里的可能是估算值)。"""
     _, _, routed, routes = _resolve_routes(body)
+    _reject_prediction_chat(routed, routes)
     first_channel, first_adapter = routes[0]
     if getattr(first_adapter, "kind", None) == "generation":
         if served is not None:
@@ -486,14 +712,19 @@ def _openai_nonstream(body, served=None):
     last_exc = None
     for i, (channel, adapter) in enumerate(routes):
         try:
-            resp, upstream_usage = _nonstream_via(channel, adapter, routed, holder=served)
+            resp, upstream_usage = _nonstream_via(channel, adapter, routed)
+            if isinstance(resp, dict) and resp.get("error"):
+                raise HTTPException(status_code=502,
+                                    detail=_upstream_error_text(resp["error"]))
         except HTTPException as e:
-            if e.status_code in _FAILOVER_STATUS and i < len(routes) - 1:
+            if getattr(e, "pool_empty", False) and last_exc is not None:
+                e = last_exc
+            if (e.status_code in _FAILOVER_STATUS or getattr(e, "pool_upstream_failure", False)) and i < len(routes) - 1:
                 print(f"[route] {routed['model']} 在 {channel} 失败({e.status_code}),"
                       f"换 {routes[i + 1][0]}", flush=True)
                 last_exc = e
                 continue
-            raise
+            raise e
         if served is not None:
             served["channel"] = channel
             served["upstream_usage"] = upstream_usage
@@ -557,13 +788,14 @@ def _openai_stream(body, usage_holder=None):
       _proxy_stream 转发型,不经号池,不判失败,永远算作答
     usage_holder["channel"] 记下实际作答的渠道,结算按它记账。"""
     _, _, routed, routes = _resolve_routes(body)
+    _reject_prediction_chat(routed, routes)
     first_channel, first_adapter = routes[0]
     if getattr(first_adapter, "kind", None) == "generation":
         if usage_holder is not None:
             usage_holder["channel"] = first_channel
         yield from _gen_chat_stream(first_adapter, routed, usage_holder)
         return
-    if _virtual_tooling_requested(first_channel, routed):
+    if _virtual_tooling_requested(first_channel, routed, first_adapter):
         # virtual tool 会先跑完非流式请求、再在本地合成 SSE。合成帧也必须经过
         # 嗅探，否则客户端收到完整回答，结算侧却因为看不到终止帧而记成 eof。
         served = {}
@@ -574,8 +806,6 @@ def _openai_stream(body, usage_holder=None):
         if usage_holder is not None:
             if served.get("channel"):
                 usage_holder["channel"] = served["channel"]
-            if served.get("account_id"):
-                usage_holder["account_id"] = served["account_id"]
             if not served.get("upstream_usage"):
                 # 合成终止帧里的 usage 是给客户端看的估算值,不能冒充上游真实值;
                 # 计量层自己会算同一个估算数并如实标 estimate
@@ -586,29 +816,43 @@ def _openai_stream(body, usage_holder=None):
     messages = routed.get("messages") or []
     cid, created = _cid(), int(time.time())
     role_sent = False
+    err_holder = {}
     for i, (channel, adapter) in enumerate(routes):
         if adapter.proxy:
             inner = _proxy_stream(adapter, routed, usage_holder)
         elif getattr(adapter, "streaming", False):
-            inner = _stream_sse(adapter, channel, model, routed, usage_holder=usage_holder)
+            inner = _stream_sse(adapter, channel, model, routed, usage_holder=usage_holder,
+                              err_holder=err_holder)
         else:
             if not role_sent:
                 yield _role_chunk(cid, created, model)
                 role_sent = True
             inner = _stream(adapter, channel, messages, model, routed,
-                            usage_holder=usage_holder, cid=cid, created=created)
+                            usage_holder=usage_holder, cid=cid, created=created,
+                            err_holder=err_holder)
         ok = yield from inner
         if ok is not False:
             if usage_holder is not None:
                 usage_holder["channel"] = channel
             return
+        error = err_holder.get("last")
+        if error is not None and _is_deterministic_client_error(error):
+            if usage_holder is not None:
+                usage_holder["failed_reason"] = "error"
+            status = getattr(error, "code", None) or getattr(error, "status_code", 400)
+            yield "data: " + json.dumps({"error": {"message": _upstream_error_text(error),
+                "type": "invalid_request_error", "status_code": status}}) + "\n\n"
+            return
         if i < len(routes) - 1:
             print(f"[route] {model} 在 {channel} 一帧未出,换 {routes[i + 1][0]}", flush=True)
     # 全部候选都没出一帧:给客户端一个能解析的收尾,而不是空流
+    if usage_holder is not None:
+        usage_holder["failed_reason"] = "error"
     if not role_sent:
         yield _role_chunk(cid, created, model)
+    _msg = _upstream_error_text(err_holder.get("last")) or _no_account_error(model).detail
     payload = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-               "choices": [{"index": 0, "delta": {"content": f"[no available upstream for {model}]"},
+               "choices": [{"index": 0, "delta": {"content": _msg},
                             "finish_reason": None}]}
     yield "data: " + json.dumps(payload) + "\n\n"
     payload["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
@@ -627,8 +871,6 @@ def _billed_stream(inner, usage_holder, settle):
       - **客户端断连后不 break**,继续排空上游把 usage 合并完
         (否则上游照常计费而平台漏记)
       - 无论何种结局都在最后调 settle(结算幂等由 request_id 保证)
-      - 顺手把这次观察到的账号运行时状态(用量窗口)落盘 —— 与计费同一次收尾,
-        但两者互不依赖:没有 user 的请求(内部 master key)也要更新窗口
     """
     usage_holder["_t0"] = time.time()
     end_reason = "eof"
@@ -643,7 +885,7 @@ def _billed_stream(inner, usage_holder, settle):
                     for _rest in inner:
                         pass
                 except Exception:
-                    pass
+                    usage_holder["failed_reason"] = "scanner_error"
                 raise
         if usage_holder.get("terminal"):
             end_reason = "done"
@@ -655,6 +897,12 @@ def _billed_stream(inner, usage_holder, settle):
         raise
     finally:
         usage_holder.pop("_t0", None)
+        # 错误之后的 [DONE] 只是协议收尾，不能把失败改判为成功。
+        # 断连后仍排空上游；若上游也失败或未正常结束，按上游失败免单。
+        if usage_holder.get("failed_reason"):
+            end_reason = usage_holder["failed_reason"]
+        elif end_reason == "client_gone" and not usage_holder.get("terminal"):
+            end_reason = "eof"
         try:
             settle(end_reason)
         except Exception as e:
@@ -673,12 +921,16 @@ def chat_completions(body: dict, request: Request, authorization: str = Header(N
     cmodel = _canonical_model(model)
     channel = model_to_channel().get(cmodel)
     adapter = get_adapter(channel) if channel else None
+    if adapter is None:
+        raise HTTPException(status_code=404, detail=f"unknown model: {model}")
+    _reject_prediction_chat(dict(body, model=cmodel), [(channel, adapter)])
     started = time.time()
     request_id = _request_id()
 
     if stream:
         return _stream_chat_billed(body, user, group, channel, adapter,
-                                   messages, model, started, request_id)
+                                   messages, model, started, request_id,
+                                   client_ip=_client_ip(request))
 
     served = {}
     resp = _openai_nonstream(body, served=served)
@@ -697,8 +949,7 @@ def chat_completions(body: dict, request: Request, authorization: str = Header(N
             duration_ms=elapsed_ms,
             request_id=request_id, end_reason="done",
             # 非流协议在完整 JSON 返回前没有可见 token，首字即响应到达。
-            first_token_ms=elapsed_ms,
-            account_id=served.get("account_id"))
+            first_token_ms=elapsed_ms, client_ip=_client_ip(request))
     return resp
 
 
@@ -707,7 +958,7 @@ def _request_id():
 
 
 def _stream_chat_billed(body, user, group, channel, adapter, messages, model,
-                        started, request_id):
+                        started, request_id, client_ip=None):
     """流式对话 + 结算,网关与在线体验共用。
 
     两条入口只在「怎么认人」上不同(sk- key vs JWT),出字与记账必须是同一段
@@ -733,10 +984,9 @@ def _stream_chat_billed(body, user, group, channel, adapter, messages, model,
             stream=True,
             duration_ms=int((time.time() - started) * 1000),
             request_id=request_id, end_reason=end_reason,
-            first_token_ms=usage_holder.get("frt_ms"),
-            account_id=usage_holder.get("account_id"))
+            first_token_ms=usage_holder.get("frt_ms"), client_ip=client_ip)
 
-    return StreamingResponse(
+    return _BilledStreamingResponse(
         _billed_stream(_openai_stream(body, usage_holder), usage_holder, settle),
         media_type="text/event-stream",
         headers={"X-Request-Id": request_id})
@@ -757,7 +1007,6 @@ def playground_chat(body: dict, request: Request,
     塞进来只会从 adapter 里得到一个看不懂的错误,不如在门口说清楚。
     恒定流式:页面要逐字出,非流式那条路没有消费者。
     """
-    from core.adapter import CAP_CHAT
     from core.portal_state import USER_DB
 
     messages = body.get("messages") or []
@@ -768,7 +1017,7 @@ def playground_chat(body: dict, request: Request,
     adapter = get_adapter(channel) if channel else None
     if adapter is None:
         raise HTTPException(status_code=404, detail=f"unknown model: {model}")
-    if not adapter.has(CAP_CHAT):
+    if not adapter.supports_chat(model):
         raise HTTPException(
             status_code=400,
             detail=f"{model} 不是对话模型,不能在线体验(渠道 {channel})")
@@ -777,268 +1026,8 @@ def playground_chat(body: dict, request: Request,
     _enforce_limits(user, group, model, api_key=None, request=request)
     routed = dict(body, model=model, stream=True)
     return _stream_chat_billed(routed, user, group, channel, adapter,
-                               messages, model, time.time(), _request_id())
-
-
-def _extract_output_text(resp):
-    """从非流式 OpenAI 响应里取模型输出文本(估算 output token 用)。"""
-    if not isinstance(resp, dict):
-        return ""
-    try:
-        msg = (resp.get("choices") or [{}])[0].get("message") or {}
-        return msg.get("content") or ""
-    except Exception:
-        return ""
-
-
-# ---- Anthropic Messages 适配 ----
-
-def _content_text(content):
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    return "".join(block.get("text", "") for block in content
-                   if isinstance(block, dict) and block.get("type") == "text")
-
-
-def _image_part(block):
-    """Anthropic image block → OpenAI image_url part。base64 拼成 data URI,url 直传。
-    认不出的 source 形状返回 None(调用方跳过),不造一个坏的 part 送上游。"""
-    src = block.get("source") or {}
-    kind = src.get("type")
-    if kind == "base64" and src.get("data"):
-        media = src.get("media_type") or "image/png"
-        return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{src['data']}"}}
-    if kind == "url" and src.get("url"):
-        return {"type": "image_url", "image_url": {"url": src["url"]}}
-    return None
-
-
-def _user_content(blocks):
-    """user 消息的内容:纯文字给字符串(逆向渠道只认字符串);带图片才给多模态数组。
-    原先图片 block 被静默丢掉 —— 用户发了图,模型没看到,而且没有任何提示。"""
-    parts = []
-    has_image = False
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text" and block.get("text"):
-            parts.append({"type": "text", "text": block["text"]})
-        elif block.get("type") == "image":
-            part = _image_part(block)
-            if part:
-                parts.append(part)
-                has_image = True
-    if not has_image:
-        return "".join(p["text"] for p in parts)
-    return parts
-
-
-def _anthropic_to_openai(body):
-    messages = []
-    system = _content_text(body.get("system"))
-    if system:
-        messages.append({"role": "system", "content": system})
-    for source in body.get("messages") or []:
-        role = source.get("role")
-        content = source.get("content", "")
-        blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
-        text = _content_text(blocks)
-        if role == "assistant":
-            calls = []
-            for block in blocks:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    calls.append({"id": block.get("id") or _cid(), "type": "function",
-                                  "function": {"name": block.get("name", "tool"),
-                                               "arguments": json.dumps(block.get("input") or {})}})
-            message = {"role": "assistant", "content": text or None}
-            if calls:
-                message["tool_calls"] = calls
-            messages.append(message)
-            continue
-        user_content = _user_content(blocks)
-        if user_content:
-            messages.append({"role": role or "user", "content": user_content})
-        for block in blocks:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            result = _content_text(block.get("content", "")) or json.dumps(block.get("content", ""))
-            messages.append({"role": "tool", "tool_call_id": block.get("tool_use_id", ""),
-                             "content": result})
-    tools = []
-    for tool in body.get("tools") or []:
-        if not isinstance(tool, dict) or not tool.get("name"):
-            continue
-        tools.append({"type": "function", "function": {
-            "name": tool["name"], "description": tool.get("description", ""),
-            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
-        }})
-    out = {"model": body.get("model", ""), "messages": messages,
-           "stream": bool(body.get("stream", False)), "max_tokens": body.get("max_tokens")}
-    if tools:
-        out["tools"] = tools
-    choice = body.get("tool_choice")
-    if isinstance(choice, dict):
-        kind = choice.get("type")
-        if kind == "any":
-            out["tool_choice"] = "required"
-        elif kind == "tool" and choice.get("name"):
-            out["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
-        elif kind:
-            out["tool_choice"] = kind
-    return out
-
-
-def _anthropic_event(event, payload):
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _anthropic_usage(usage, fallback_in=0, fallback_out=0):
-    """OpenAI usage → Anthropic usage。上游没给真实值时用估算(与计量层同一套),
-    Claude Code 靠这两个数显示花费与上下文占用 —— 一直给 0 等于告诉用户「没花钱」。"""
-    u = usage if isinstance(usage, dict) and usage.get("total_tokens") else None
-    if u is None:
-        return {"input_tokens": int(fallback_in), "output_tokens": int(fallback_out)}
-    out = {"input_tokens": int(u.get("prompt_tokens") or 0),
-           "output_tokens": int(u.get("completion_tokens") or 0)}
-    cached = ((u.get("prompt_tokens_details") or {}).get("cached_tokens")
-              or u.get("cache_read_input_tokens") or 0)
-    if cached:
-        out["cache_read_input_tokens"] = int(cached)
-    if u.get("cache_creation_input_tokens"):
-        out["cache_creation_input_tokens"] = int(u["cache_creation_input_tokens"])
-    return out
-
-
-def _anthropic_stop(finish, has_tools):
-    if has_tools or finish in ("tool_calls", "function_call"):
-        return "tool_use"
-    if finish == "length":
-        return "max_tokens"
-    return "end_turn"
-
-
-def _anthropic_message_from_openai(response, requested_model, request_messages=None):
-    choice = (response.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    content = []
-    if message.get("reasoning_content") and config.ANTHROPIC_EXPOSE_REASONING:
-        content.append({"type": "thinking", "thinking": message["reasoning_content"]})
-    if message.get("content"):
-        content.append({"type": "text", "text": message["content"]})
-    for call in message.get("tool_calls") or []:
-        fn = call.get("function") or {}
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        content.append({"type": "tool_use", "id": call.get("id") or _cid(),
-                        "name": fn.get("name", "tool"), "input": args})
-    est = metering.estimate_usage(request_messages or [],
-                                  (message.get("reasoning_content") or "") + (message.get("content") or ""))
-    return {"id": _mid(), "type": "message", "role": "assistant", "model": requested_model,
-            "content": content,
-            "stop_reason": _anthropic_stop(choice.get("finish_reason"), bool(message.get("tool_calls"))),
-            "stop_sequence": None,
-            "usage": _anthropic_usage(response.get("usage"), est["prompt_tokens"], est["completion_tokens"])}
-
-
-def _anthropic_stream(openai_lines, requested_model, request_messages=None):
-    """OpenAI SSE → Anthropic SSE。
-
-    协议完整性(对齐 sub2api 的"确定性输出"):
-      - message_start 未发出时**不补任何结束事件** —— 宁可空流也不给残缺流
-      - 见到终止事件才算完整;上游断流时仍补齐 content_block_stop/message_delta/
-        message_stop,避免客户端永久挂起
-    usage:message_start 给输入估算(请求在手,不必等上游),message_delta 给最终值 ——
-    上游真实 usage 帧到了用它,没到用输出文字的估算,与计量层同一套。
-    """
-    message_id = _mid()
-    started = False
-    blocks, calls, next_index, stop_reason = {}, {}, 0, None
-    est_in = metering.estimate_usage(request_messages or [], "")["prompt_tokens"]
-    out_parts = []
-    usage = None
-
-    def start_block(kind, block):
-        nonlocal next_index
-        index = next_index
-        next_index += 1
-        blocks[index] = kind
-        return index, _anthropic_event("content_block_start", {
-            "type": "content_block_start", "index": index, "content_block": block})
-
-    def close_blocks():
-        for index in list(blocks):
-            yield _anthropic_event("content_block_stop", {"type": "content_block_stop", "index": index})
-            blocks.pop(index, None)
-
-    def message_start():
-        return _anthropic_event("message_start", {"type": "message_start", "message": {
-            "id": message_id, "type": "message", "role": "assistant",
-            "model": requested_model, "content": [], "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": est_in, "output_tokens": 0}}})
-
-    for line in openai_lines:
-        if not isinstance(line, str) or not line.startswith("data:"):
-            continue
-        raw = line[5:].strip()
-        if raw == "[DONE]":
-            break
-        try:
-            packet = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not started:
-            started = True
-            yield message_start()
-        if isinstance(packet.get("usage"), dict) and packet["usage"].get("total_tokens"):
-            usage = packet["usage"]        # 覆盖式:取最近一次
-        choice = (packet.get("choices") or [{}])[0]
-        delta = choice.get("delta") or {}
-        if delta.get("reasoning_content") and config.ANTHROPIC_EXPOSE_REASONING:
-            out_parts.append(delta["reasoning_content"])
-            index = next((i for i, kind in blocks.items() if kind == "thinking"), None)
-            if index is None:
-                index, event = start_block("thinking", {"type": "thinking", "thinking": ""})
-                yield event
-            yield _anthropic_event("content_block_delta", {"type": "content_block_delta", "index": index,
-                "delta": {"type": "thinking_delta", "thinking": delta["reasoning_content"]}})
-        if delta.get("content"):
-            out_parts.append(delta["content"])
-            index = next((i for i, kind in blocks.items() if kind == "text"), None)
-            if index is None:
-                index, event = start_block("text", {"type": "text", "text": ""})
-                yield event
-            yield _anthropic_event("content_block_delta", {"type": "content_block_delta", "index": index,
-                "delta": {"type": "text_delta", "text": delta["content"]}})
-        for pos, call in enumerate(delta.get("tool_calls") or []):
-            key = call.get("index", pos)
-            fn = call.get("function") or {}
-            if key not in calls:
-                call_id = call.get("id") or _cid()
-                index, event = start_block("tool_use", {"type": "tool_use", "id": call_id,
-                    "name": fn.get("name", "tool"), "input": {}})
-                calls[key] = index
-                yield event
-            arguments = fn.get("arguments")
-            if arguments:
-                yield _anthropic_event("content_block_delta", {"type": "content_block_delta",
-                    "index": calls[key], "delta": {"type": "input_json_delta", "partial_json": arguments}})
-        finish = choice.get("finish_reason")
-        if finish:
-            stop_reason = _anthropic_stop(finish, bool(calls))
-    if not started:
-        # message_start 从未发出 → 不补结束事件,宁可空流也不给残缺流
-        return
-    yield from close_blocks()
-    est_out = metering.estimate_usage([], "".join(out_parts))["completion_tokens"]
-    yield _anthropic_event("message_delta", {"type": "message_delta",
-        "delta": {"stop_reason": stop_reason or "end_turn", "stop_sequence": None},
-        "usage": _anthropic_usage(usage, est_in, est_out)})
-    yield _anthropic_event("message_stop", {"type": "message_stop"})
+                               messages, model, time.time(), _request_id(),
+                               client_ip=_client_ip(request))
 
 
 @app.post("/v1/messages/count_tokens")
@@ -1046,11 +1035,11 @@ def messages_count_tokens(body: dict, request: Request, authorization: str = Hea
                           x_api_key: str = Header(None, alias="x-api-key")):
     """Anthropic 的 count_tokens:Claude Code 每轮都调它算上下文占用,没有这个端点
     客户端会一直报 404。用与计费同一套估算(tiktoken cl100k),不问上游、不计费、
-    不占 RPM —— 它是每轮对话的伴随请求,占了 RPM 会把真实请求挤掉。
+    不占并发名额 —— 它是每轮对话的伴随请求,不问上游。
     鉴权仍要过(坏 key 401、模型不在白名单 403),否则这是个无鉴权的免费端点。"""
     model = _canonical_model(body.get("model", ""))
     tok = (authorization or x_api_key or "").replace("Bearer ", "").strip()
-    if tok != config.API_KEY:
+    if not secret_equal(tok, config.API_KEY):
         resolved = BILLING.resolve_user_by_key(tok)
         if not resolved:
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1075,6 +1064,7 @@ def messages_api(body: dict, request: Request, authorization: str = Header(None)
     cmodel = _canonical_model(model)
     channel = model_to_channel().get(cmodel)
     adapter = get_adapter(channel) if channel else None
+    _reject_prediction_chat(openai_body, [(channel, adapter)])
     req_messages = openai_body.get("messages") or []
     started = time.time()
     request_id = _request_id()
@@ -1093,10 +1083,9 @@ def messages_api(body: dict, request: Request, authorization: str = Header(None)
                 stream=True,
                 duration_ms=int((time.time() - started) * 1000),
                 request_id=request_id, end_reason=end_reason,
-                first_token_ms=usage_holder.get("frt_ms"),
-                account_id=usage_holder.get("account_id"))
+                first_token_ms=usage_holder.get("frt_ms"), client_ip=_client_ip(request))
 
-        return StreamingResponse(
+        return _BilledStreamingResponse(
             _billed_stream(
                 _anthropic_stream(_openai_stream(openai_body, usage_holder), model,
                                   request_messages=req_messages),
@@ -1116,8 +1105,7 @@ def messages_api(body: dict, request: Request, authorization: str = Header(None)
             stream=False,
             duration_ms=elapsed_ms,
             request_id=request_id, end_reason="done",
-            first_token_ms=elapsed_ms,
-            account_id=served.get("account_id"))
+            first_token_ms=elapsed_ms, client_ip=_client_ip(request))
     return _anthropic_message_from_openai(openai_resp, model, request_messages=req_messages)
 
 
@@ -1137,64 +1125,56 @@ def _upstream_failed(channel, model, error, kind="error"):
          kind=kind)
 
 
-def _remember_window(adapter, acct_id, headers=None, patch=None):
-    """把上游给的用量窗口落到这个号上。
-
-    **在观察到的当下写,不攒到请求结束** —— 请求失败时结算那段根本不会跑到,
-    而 429 的响应头恰恰是最该记的那一份(窗口打满上游才回 429)。攒到最后写
-    等于「越是想看清楚的号,面板上的数越旧」。
-
-    写库有节流(core.pool.persist_runtime_meta),所以一次请求重试六次也只落一次。
-    """
-    if not acct_id:
-        return
-    if patch is None:
-        if headers is None:
-            return
-        patch = adapter.window_meta(headers)
-    if patch:
-        persist_runtime_meta(DB, acct_id, patch)
+def _no_account_error(model):
+    exc = HTTPException(status_code=503, detail=f"当前没有可调度的账号（模型：{model}）")
+    exc.pool_empty = True
+    return exc
 
 
-def _sync(adapter, channel, messages, model, body=None, max_switch=6, holder=None):
-    """非流式:取号 → chat,空回复/失败切号重试。返回 {content, reasoning, raw}。
-
-    holder 传了就被写上实际作答的账号 id(计费与「按号统计」要记真正花了钱的
-    那个号,不是请求开始时猜的)。换号重试时后写的覆盖前写的,与 channel 同口径。
-    """
+def _sync(adapter, channel, messages, model, body=None, max_switch=None):
+    """非流式:取号 → chat,空回复/失败切号重试。返回 {content, reasoning, raw}。"""
     last_err = None
     last_kind = None
+    max_switch = max_switch if max_switch is not None else (config.GPT_MAX_ACCOUNT_SWITCHES + 1 if channel == "gpt" else 6)
+    excluded = []
+    first_timeout_count = 0
     for _ in range(max_switch):
-        acct = POOL.get_valid_account(channel, adapter)
+        acct = POOL.get_valid_account(channel, adapter, **({"exclude": excluded} if channel == "gpt" else {}))
         if not acct:
-            raise HTTPException(status_code=503, detail=f"no available account for {channel}")
-        if holder is not None:
-            holder["account_id"] = acct["id"]
+            if last_err is not None:
+                break
+            raise _no_account_error(model)
+        if channel == "gpt":
+            excluded.append(acct["id"])
         try:
-            result = adapter.chat(acct, messages, stream=False, model=model, body=body)
-            content, reasoning, raw, usage = _norm(result)
+            content, reasoning, raw, usage = _norm(
+                account_runtime.call(DB, adapter, "chat", acct, messages,
+                                     stream=False, model=model, body=body))
         except Exception as e:
-            last_err = str(e)
-            _remember_window(adapter, acct["id"], headers=getattr(e, "headers", None))
+            last_err = e
             last_kind = POOL.mark_failure(
                 acct["id"], e, dead=getattr(adapter, "exhausted_is_dead", False),
                 adapter=adapter)
+            if channel == "gpt":
+                from core.gpt_request_policy import can_switch
+                if isinstance(e, sse.FirstOutputTimeout):
+                    first_timeout_count += 1
+                if not can_switch(e, len(excluded), first_timeout_count):
+                    break
             continue
-        if isinstance(result, dict) and result.get("meta"):
-            _remember_window(adapter, acct["id"], patch=result["meta"])
         if content or raw:
-            return {"content": content, "reasoning": reasoning, "raw": raw,
-                    "usage": usage}
+            return {"content": content, "reasoning": reasoning, "raw": raw, "usage": usage}
         POOL.mark_exhausted(acct["id"], dead=getattr(adapter, "exhausted_is_dead", False),
                             adapter=adapter)  # 空回复,换号
-    # 全是上游限流时如实回 429:客户端 SDK 见 429 会自己退避重试,回 502 只会让它
-    # 当成我们坏了。号一个都没罚,上游一松就恢复。
+    # 保留上游状态码和正文；后续取号落空不能覆盖已经收到的真实错误。
     _upstream_failed(channel, model, last_err,
                      "ratelimit" if last_kind == "ratelimit" else "error")
-    if last_kind == "ratelimit":
-        raise HTTPException(status_code=429,
-                            detail=f"upstream rate limited: {last_err}")
-    raise HTTPException(status_code=502, detail=f"all retries failed: {last_err}")
+    code = getattr(last_err, "code", None) or getattr(last_err, "status", None)
+    status = code if isinstance(code, int) and 400 <= code < 600 else (429 if last_kind == "ratelimit" else 502)
+    exc = HTTPException(status_code=status,
+                        detail=_upstream_error_text(last_err) or "上游未返回内容")
+    exc.pool_upstream_failure = last_err is not None
+    raise exc
 
 
 def _sniff_usage(line, usage_holder):
@@ -1216,12 +1196,18 @@ def _sniff_usage(line, usage_holder):
     try:
         o = json.loads(payload)
     except Exception:
+        usage_holder["failed_reason"] = "scanner_error"
         return
     if not isinstance(o, dict):
+        usage_holder["failed_reason"] = "scanner_error"
         return
+    if o.get("error"):
+        usage_holder["failed_reason"] = "error"
     if o.get("usage"):
         usage_holder["usage"] = o["usage"]   # 覆盖式:取最近一次
     for ch in o.get("choices") or []:
+        if ch.get("finish_reason") in ("error", "failed"):
+            usage_holder["failed_reason"] = "error"
         if ch.get("finish_reason"):
             usage_holder["terminal"] = True
         delta = ch.get("delta") or {}
@@ -1233,91 +1219,206 @@ def _sniff_usage(line, usage_holder):
             usage_holder["text"] = usage_holder.get("text", "") + c
 
 
-def _scrub_sse(line):
-    """洗一条 OpenAI SSE 行里的 delta.content / reasoning_content(navos 真流式用)。"""
-    if not scrubmod._ON or not isinstance(line, str) or not line.startswith("data:"):
+def _strip_vendor(payload):
+    """删掉上游塞进响应体的非标准字段(计费/渠道信息),这些字段会暴露上游。"""
+    if not isinstance(payload, dict):
+        return payload
+    for k in ("spoe", "venice", "provider", "upstream", "channel"):
+        payload.pop(k, None)
+    return payload
+
+
+def _scrub_sse(line, public_model=None):
+    """洗一条 OpenAI SSE 行:delta.content / reasoning_content,并把 model 换回对外名。"""
+    if not isinstance(line, str) or not line.startswith("data:"):
         return line
     payload = line[5:].strip()
     if not payload or payload == "[DONE]":
         return line
     try:
         o = json.loads(payload)
+    except Exception:
+        return line
+    if not isinstance(o, dict):
+        return line
+    changed = False
+    for k in ("spoe", "venice", "provider", "upstream", "channel"):
+        if k in o:
+            o.pop(k, None)
+            changed = True
+    if public_model and o.get("model") != public_model:
+        o["model"] = public_model
+        changed = True
+    if scrubmod._ON:
         for ch in o.get("choices") or []:
             d = ch.get("delta") or {}
             for k in ("content", "reasoning_content"):
                 if isinstance(d.get(k), str):
                     d[k] = scrubmod.scrub(d[k], tidy=False)
-        return "data: %s\n\n" % json.dumps(o)
-    except Exception:
-        return line
+                    changed = True
+    return ("data: %s\n\n" % json.dumps(o, ensure_ascii=False)) if changed else line
 
 
-def _stream_sse(adapter, channel, model, body, max_switch=6, usage_holder=None):
+def _upstream_error_text(e):
+    """把最后一次上游异常格式化成可透传的文本（优先带上游状态码+响应体）。"""
+    if e is None:
+        return ""
+    code = getattr(e, "code", None) or getattr(e, "status", None)
+    body = getattr(e, "body", None)
+    if code and body:
+        txt = "upstream %s: %s" % (code, str(body))
+    else:
+        txt = str(e)
+    # 错误体里可能带上游模型名/渠道名,换回对外名再吐
+    for ad in all_adapters().values():
+        for pub, up in (getattr(ad, "model_map", {}) or {}).items():
+            if up and up != pub and up in txt:
+                txt = txt.replace(up, pub)
+    return txt
+
+
+def _is_deterministic_client_error(e):
+    """上游 4xx 里「换号也一样失败」的确定性错误(请求形状 / schema 校验)。
+
+    这类错误重试只会把同一个 400 再打 N 遍：客户端的等待被放大几倍，上游也被
+    无谓地打急。所以撞上就直接停，不做换号重试。
+    401/402/403 不在这里 —— 那是「这把号/这把 key 不行」，由 mark_failure 的
+    terminal 分支处理，该退场就退场。
+    """
+    code = getattr(e, "code", None) or getattr(e, "status", None)
+    if code in (400, 404, 405, 409, 413, 415, 422):
+        return True
+    s = str(e or "")
+    return any(("HTTP %d " % c) in s or ("HTTP %d:" % c) in s
+               for c in (400, 404, 405, 409, 413, 415, 422))
+
+
+def _stream_sse(adapter, channel, model, body, max_switch=None, usage_holder=None, err_holder=None):
     """流式(透传型 adapter):取号 → stream_chat 原样转上游 SSE,洗词后转发。
 
     返回 True = 至少转出了一帧(流已交给这个渠道);False = 一帧没出(没号 / 换遍号
     仍失败),且什么都没 yield —— 调用方据此换下一个渠道。"""
     last_err = None
+    max_switch = max_switch if max_switch is not None else (config.GPT_MAX_ACCOUNT_SWITCHES + 1 if channel == "gpt" else 6)
+    first_tt = getattr(config, "FIRST_TOKEN_TIMEOUT", 60)
+    total_tt = getattr(config, "STREAM_TOTAL_TIMEOUT", 90)
+    t_start = time.time()
+    excluded = []
+    first_timeout_count = 0
     for _ in range(max_switch):
-        acct = POOL.get_valid_account(channel, adapter)
+        acct = POOL.get_valid_account(channel, adapter, **({"exclude": excluded} if channel == "gpt" else {}))
         if not acct:
             return False
-        if usage_holder is not None:
-            usage_holder["account_id"] = acct["id"]
+        if channel == "gpt":
+            excluded.append(acct["id"])
         q = queue.Queue()
         err = {}
-        facts = {}      # worker 线程写、主线程读 —— 不直接改 usage_holder,免得两个线程同时碰它
 
-        def worker(acct=acct, q=q, err=err, facts=facts):
+        def worker(acct=acct, q=q, err=err):
             try:
-                r = adapter.stream_chat(acct, model, body, on_sse=lambda l: q.put(l))
-                if isinstance(r, dict) and r.get("meta"):
-                    facts["meta"] = r["meta"]
+                account_runtime.call(DB, adapter, "stream_chat", acct, model, body,
+                                     on_sse=lambda l: q.put(l))
             except Exception as e:
                 err["e"] = e
             finally:
                 q.put(_STREAM_END)
 
-        th = threading.Thread(target=worker, daemon=True)
+        th = threading.Thread(target=account_runtime.worker_target(worker), daemon=True)
         th.start()
         got = False
+        timed_out = False
+        idle_timeout = False
+        last_output = time.monotonic()
+        # 首帧必须在 first_tt 内出现;整次请求(含换号重试)共享 total_tt 预算。
+        # 首帧后只限制有效输出间隔，正常长回答可以一直继续。
         while True:
-            item = q.get()
+            if channel == "gpt":
+                # The GPT reader owns header/first-output/idle deadlines and
+                # cancels actual I/O. Do not abandon its worker at generic 60/90s.
+                item = q.get()
+            elif got:
+                left = config.STREAM_IDLE_TIMEOUT - (time.monotonic() - last_output)
+                if left <= 0:
+                    idle_timeout = True
+                    break
+                try:
+                    item = q.get(timeout=left)
+                except queue.Empty:
+                    idle_timeout = True
+                    break
+            else:
+                left = min(first_tt, t_start + total_tt - time.time())
+                if left <= 0:
+                    timed_out = True
+                    break
+                try:
+                    item = q.get(timeout=left)
+                except queue.Empty:
+                    timed_out = True
+                    break
             if item is _STREAM_END:
                 break
             got = True
+            if sse.is_output(item):
+                last_output = time.monotonic()
             if usage_holder is not None:
                 _sniff_usage(item, usage_holder)
-            yield _scrub_sse(item)
+            yield _scrub_sse(item, model)
         th.join(timeout=1)
         if got:
-            _remember_window(adapter, acct["id"], patch=facts.get("meta"))
+            if idle_timeout and usage_holder is not None:
+                usage_holder["failed_reason"] = "idle_timeout"
+            if err.get("e") is not None and usage_holder is not None:
+                usage_holder["failed_reason"] = "idle_timeout" if "stream idle timeout" in str(err["e"]) else "scanner_error"
             return True
+        if timed_out:
+            # 上游卡在首字:换号重试,别让客户端干等满 SEND_TIMEOUT。
+            print(f"[stream] {channel} 首字超时 {first_tt}s，换号重试", flush=True)
+            e = TimeoutError("first token timeout after %ss" % int(first_tt))
+            POOL.mark_failure(acct["id"], e, dead=False, adapter=adapter)
+            last_err = e
+            if err_holder is not None:
+                err_holder["last"] = last_err
+            if t_start + total_tt - time.time() <= 5:
+                break                      # 预算用完,不再换号
+            continue
         # 一个 SSE 都没吐:上游异常时按异常性质落状态(超时/5xx 只冷却),
         # 无异常的空流才算额度耗尽。
         dead = getattr(adapter, "exhausted_is_dead", False)
         if err.get("e") is not None:
             print(f"[stream] {channel} 上游异常: {err['e']}", flush=True)
-            _remember_window(adapter, acct["id"],
-                             headers=getattr(err["e"], "headers", None))
             POOL.mark_failure(acct["id"], err["e"], dead=dead, adapter=adapter)
             last_err = err["e"]
         else:
             POOL.mark_exhausted(acct["id"], dead=dead, adapter=adapter)
             last_err = "empty stream"
+        if err_holder is not None and (err.get("e") is not None or "last" not in err_holder):
+            err_holder["last"] = last_err
+        if channel == "gpt":
+            from core.gpt_request_policy import can_switch
+            if isinstance(last_err, sse.FirstOutputTimeout):
+                first_timeout_count += 1
+            if not can_switch(last_err, len(excluded), first_timeout_count):
+                break
+        # 确定性 4xx(请求本身错了):换号重试也是一样的结果,直接停,
+        # 别把同一个 400 再打 max_switch-1 遍。
+        if err.get("e") is not None and _is_deterministic_client_error(err["e"]):
+            if usage_holder is not None:
+                usage_holder["failed_reason"] = "client_error"
+            break
     _upstream_failed(channel, model, last_err)
     return False
 
 
 def _stream(adapter, channel, messages, model, body=None, max_switch=6, usage_holder=None,
-            cid=None, created=None):
+            cid=None, created=None, err_holder=None):
     """流式(普通型 adapter):取号 → chat,on_token 逐段出字,自己拼 OpenAI SSE。
 
     role 帧不在这里发:_openai_stream 在取号之前先发了(首字节不等上游,也不会因为
     换渠道重发)。cid / created 从那边传进来,一条流里所有帧同一个 id。
     返回 True = 出过字;False = 一帧没出(没号 / 换遍号仍失败),且什么都没 yield。"""
     if getattr(adapter, "streaming", False):
-        return (yield from _stream_sse(adapter, channel, model, body, max_switch, usage_holder))
+        return (yield from _stream_sse(adapter, channel, model, body, max_switch, usage_holder, err_holder))
     cid = cid or _cid()
     created = created or int(time.time())
 
@@ -1349,28 +1450,25 @@ def _stream(adapter, channel, messages, model, body=None, max_switch=6, usage_ho
         acct = POOL.get_valid_account(channel, adapter)
         if not acct:
             return False
-        if usage_holder is not None:
-            usage_holder["account_id"] = acct["id"]
         q = queue.Queue()
         result = {"raw": None, "content": None, "reasoning": None,
-                  "usage": None, "meta": None, "err": None}
+                  "usage": None, "err": None}
 
         def worker(acct=acct, q=q, result=result):
             try:
-                r = adapter.chat(acct, messages, stream=True, model=model, body=body,
+                r = account_runtime.call(DB, adapter, "chat", acct, messages, stream=True, model=model, body=body,
                                  on_token=lambda t, k="content": q.put((k, t)))
                 if isinstance(r, dict):
                     result["raw"] = r.get("raw")
                     result["content"] = r.get("content")
                     result["reasoning"] = r.get("reasoning")
                     result["usage"] = r.get("usage")
-                    result["meta"] = r.get("meta")
             except Exception as e:
                 result["err"] = e
             finally:
                 q.put(_STREAM_END)
 
-        th = threading.Thread(target=worker, daemon=True)
+        th = threading.Thread(target=account_runtime.worker_target(worker), daemon=True)
         th.start()
         got = False
         emitted = {"content": False, "reasoning": False}
@@ -1415,19 +1513,18 @@ def _stream(adapter, channel, messages, model, body=None, max_switch=6, usage_ho
             if result["err"] is None:
                 completed = True
                 final_usage = result["usage"]
-                _remember_window(adapter, acct["id"], patch=result.get("meta"))
             break
         # 什么都没吐出来:上游异常按性质落状态,无异常的空回复才算额度耗尽。
         dead = getattr(adapter, "exhausted_is_dead", False)
         if result["err"] is not None:
             print(f"[stream] {channel} 上游异常: {result['err']}", flush=True)
-            _remember_window(adapter, acct["id"],
-                             headers=getattr(result["err"], "headers", None))
             POOL.mark_failure(acct["id"], result["err"], dead=dead, adapter=adapter)
             last_err = result["err"]
         else:
             POOL.mark_exhausted(acct["id"], dead=dead, adapter=adapter)
             last_err = "empty reply"
+        if err_holder is not None and (result["err"] is not None or "last" not in err_holder):
+            err_holder["last"] = last_err
     else:
         # for 循环没被 break:换遍了号一个字都没出来。有号但全败才算上游失败,
         # 没号那条已经由 pool.empty 报过。一帧没出,交给调用方换渠道。
@@ -1477,278 +1574,13 @@ def _proxy_stream(adapter, body, usage_holder=None):
 # 换渠道全部复用。无状态:不存 response,previous_response_id 明确拒绝 ——
 # 客户端每轮带全量 input(Codex 的 store=false 模式正是如此)。
 
-def _rid():
-    return "resp_" + "".join(random.choices(string.ascii_letters + string.digits, k=24))
-
-
-def _part_to_chat(part):
-    """Responses 的 content part → chat 的 content part。认不出的返回 None。"""
-    if isinstance(part, str):
-        return {"type": "text", "text": part}
-    if not isinstance(part, dict):
-        return None
-    kind = part.get("type")
-    if kind in ("input_text", "output_text", "text") and isinstance(part.get("text"), str):
-        return {"type": "text", "text": part["text"]}
-    if kind == "input_image":
-        url = part.get("image_url")
-        if isinstance(url, dict):
-            url = url.get("url")
-        if url:
-            out = {"type": "image_url", "image_url": {"url": url}}
-            if part.get("detail"):
-                out["image_url"]["detail"] = part["detail"]
-            return out
-    return None
-
-
-def _flatten_parts(parts):
-    """全是文字就折成字符串(逆向渠道只认字符串),带图片才留数组。"""
-    if all(p.get("type") == "text" for p in parts):
-        return "".join(p["text"] for p in parts)
-    return parts
-
-
-def _responses_to_openai(body):
-    """Responses 请求 → chat/completions 请求。"""
-    if body.get("previous_response_id"):
-        raise HTTPException(status_code=400, detail={
-            "code": "stateless", "message": "this gateway does not store responses; "
-            "send the full conversation in `input` instead of previous_response_id"})
-    messages = []
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        messages.append({"role": "system", "content": instructions})
-
-    inp = body.get("input")
-    items = [{"role": "user", "content": inp}] if isinstance(inp, str) else list(inp or [])
-    pending_calls = []       # 连续的 function_call 合成一条 assistant 消息
-
-    def flush_calls():
-        if pending_calls:
-            messages.append({"role": "assistant", "content": None,
-                             "tool_calls": list(pending_calls)})
-            pending_calls.clear()
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        kind = item.get("type") or "message"
-        if kind == "function_call":
-            pending_calls.append({"id": item.get("call_id") or item.get("id") or _cid(),
-                                  "type": "function",
-                                  "function": {"name": item.get("name", "tool"),
-                                               "arguments": item.get("arguments") or "{}"}})
-            continue
-        flush_calls()
-        if kind == "function_call_output":
-            out = item.get("output")
-            messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
-                             "content": out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)})
-            continue
-        if kind != "message":
-            continue          # reasoning / item_reference 等历史项对上游没有意义
-        role = item.get("role") or "user"
-        if role == "developer":
-            role = "system"
-        content = item.get("content")
-        if isinstance(content, str):
-            messages.append({"role": role, "content": content})
-            continue
-        parts = [p for p in (_part_to_chat(x) for x in (content or [])) if p]
-        if parts:
-            messages.append({"role": role, "content": _flatten_parts(parts)})
-    flush_calls()
-
-    out = {"model": body.get("model", ""), "messages": messages,
-           "stream": bool(body.get("stream", False))}
-    if body.get("max_output_tokens") is not None:
-        out["max_tokens"] = body["max_output_tokens"]
-    for k in ("temperature", "top_p", "parallel_tool_calls"):
-        if body.get(k) is not None:
-            out[k] = body[k]
-    effort = (body.get("reasoning") or {}).get("effort") if isinstance(body.get("reasoning"), dict) else None
-    if effort:
-        out["reasoning_effort"] = effort
-    fmt = (body.get("text") or {}).get("format") if isinstance(body.get("text"), dict) else None
-    if isinstance(fmt, dict) and fmt.get("type") in ("json_object", "json_schema"):
-        out["response_format"] = ({"type": "json_object"} if fmt["type"] == "json_object"
-                                  else {"type": "json_schema",
-                                        "json_schema": {k: v for k, v in fmt.items() if k != "type"}})
-    tools = []
-    for tool in body.get("tools") or []:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("type") != "function":
-            raise HTTPException(status_code=400, detail={
-                "code": "unsupported_tool",
-                "message": f"built-in tool {tool.get('type')} is not supported; only function tools"})
-        if not tool.get("name"):
-            continue
-        fn = {"name": tool["name"], "description": tool.get("description", ""),
-              "parameters": tool.get("parameters") or {"type": "object", "properties": {}}}
-        if tool.get("strict") is not None:
-            fn["strict"] = tool["strict"]
-        tools.append({"type": "function", "function": fn})
-    if tools:
-        out["tools"] = tools
-    choice = body.get("tool_choice")
-    if isinstance(choice, dict) and choice.get("type") == "function" and choice.get("name"):
-        out["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
-    elif choice in ("auto", "none", "required"):
-        out["tool_choice"] = choice
-    return out
-
-
-def _responses_usage(usage):
-    u = usage if isinstance(usage, dict) else {}
-    it = int(u.get("prompt_tokens") or 0)
-    ot = int(u.get("completion_tokens") or 0)
-    cached = int(((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
-    reasoning = int(((u.get("completion_tokens_details") or {}).get("reasoning_tokens")) or 0)
-    return {"input_tokens": it, "output_tokens": ot, "total_tokens": it + ot,
-            "input_tokens_details": {"cached_tokens": cached},
-            "output_tokens_details": {"reasoning_tokens": reasoning}}
-
-
-def _response_shell(body, model, rid, created, status="in_progress"):
-    """响应对象的外壳,created / in_progress / completed 三处同一份。"""
-    return {"id": rid, "object": "response", "created_at": created, "status": status,
-            "model": model, "output": [], "error": None, "incomplete_details": None,
-            "instructions": body.get("instructions"),
-            "max_output_tokens": body.get("max_output_tokens"),
-            "parallel_tool_calls": body.get("parallel_tool_calls", True),
-            "tool_choice": body.get("tool_choice", "auto"), "tools": body.get("tools") or [],
-            "temperature": body.get("temperature", 1.0), "top_p": body.get("top_p", 1.0),
-            "metadata": body.get("metadata") or {}, "store": False,
-            "usage": None}
-
-
-def _openai_to_response(chat, body, model):
-    """chat/completions 非流式响应 → Responses 响应。"""
-    rid, created = _rid(), int(time.time())
-    choice = (chat.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    output = []
-    if message.get("content"):
-        output.append({"type": "message", "id": _mid(), "status": "completed", "role": "assistant",
-                       "content": [{"type": "output_text", "text": message["content"],
-                                    "annotations": []}]})
-    for call in message.get("tool_calls") or []:
-        fn = call.get("function") or {}
-        output.append({"type": "function_call", "id": "fc_" + secrets.token_hex(12),
-                       "call_id": call.get("id") or _cid(), "name": fn.get("name", "tool"),
-                       "arguments": fn.get("arguments") or "{}", "status": "completed"})
-    finish = choice.get("finish_reason")
-    resp = _response_shell(body, model, rid, created,
-                           status="incomplete" if finish == "length" else "completed")
-    if finish == "length":
-        resp["incomplete_details"] = {"reason": "max_output_tokens"}
-    resp["output"] = output
-    resp["usage"] = _responses_usage(chat.get("usage"))
-    return resp
-
-
-def _responses_stream(openai_lines, body, model):
-    """chat SSE → Responses 事件流。
-
-    文本走 message 项(output_text.delta),工具调用走 function_call 项
-    (function_call_arguments.delta),最后 response.completed 带全量 output 与 usage。
-    一帧都没来就什么都不发 —— 与 Anthropic 那条同一口径,宁可空流也不给残缺流。"""
-    rid, created = _rid(), int(time.time())
-    seq = [0]
-
-    def ev(kind, **payload):
-        seq[0] += 1
-        payload.update({"type": kind, "sequence_number": seq[0]})
-        return f"event: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    started = False
-    output = []                 # 已开始的输出项(按 output_index)
-    text_index = None           # 文本 message 项的 output_index
-    text_parts = []
-    calls = {}                  # chat 里的 tool_call index → output_index
-    usage = None
-    finish = None
-    for line in openai_lines:
-        if not isinstance(line, str) or not line.startswith("data:"):
-            continue
-        raw = line[5:].strip()
-        if raw == "[DONE]":
-            break
-        try:
-            packet = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not started:
-            started = True
-            shell = _response_shell(body, model, rid, created)
-            yield ev("response.created", response=shell)
-            yield ev("response.in_progress", response=shell)
-        if isinstance(packet.get("usage"), dict) and packet["usage"].get("total_tokens"):
-            usage = packet["usage"]
-        choice = (packet.get("choices") or [{}])[0]
-        delta = choice.get("delta") or {}
-        if delta.get("content"):
-            if text_index is None:
-                text_index = len(output)
-                item = {"type": "message", "id": _mid(), "status": "in_progress",
-                        "role": "assistant", "content": []}
-                output.append(item)
-                yield ev("response.output_item.added", output_index=text_index, item=item)
-                yield ev("response.content_part.added", item_id=item["id"], output_index=text_index,
-                         content_index=0, part={"type": "output_text", "text": "", "annotations": []})
-            text_parts.append(delta["content"])
-            yield ev("response.output_text.delta", item_id=output[text_index]["id"],
-                     output_index=text_index, content_index=0, delta=delta["content"])
-        for pos, call in enumerate(delta.get("tool_calls") or []):
-            key = call.get("index", pos)
-            fn = call.get("function") or {}
-            if key not in calls:
-                idx = len(output)
-                item = {"type": "function_call", "id": "fc_" + secrets.token_hex(12),
-                        "call_id": call.get("id") or _cid(), "name": fn.get("name", "tool"),
-                        "arguments": "", "status": "in_progress"}
-                output.append(item)
-                calls[key] = idx
-                yield ev("response.output_item.added", output_index=idx, item=dict(item))
-            item = output[calls[key]]
-            if fn.get("arguments"):
-                item["arguments"] += fn["arguments"]
-                yield ev("response.function_call_arguments.delta", item_id=item["id"],
-                         output_index=calls[key], delta=fn["arguments"])
-        if choice.get("finish_reason"):
-            finish = choice["finish_reason"]
-    if not started:
-        return
-    if text_index is not None:
-        item = output[text_index]
-        text = "".join(text_parts)
-        item["content"] = [{"type": "output_text", "text": text, "annotations": []}]
-        item["status"] = "completed"
-        yield ev("response.output_text.done", item_id=item["id"], output_index=text_index,
-                 content_index=0, text=text)
-        yield ev("response.content_part.done", item_id=item["id"], output_index=text_index,
-                 content_index=0, part=item["content"][0])
-        yield ev("response.output_item.done", output_index=text_index, item=item)
-    for key, idx in calls.items():
-        item = output[idx]
-        item["status"] = "completed"
-        yield ev("response.function_call_arguments.done", item_id=item["id"], output_index=idx,
-                 arguments=item["arguments"])
-        yield ev("response.output_item.done", output_index=idx, item=item)
-    final = _response_shell(body, model, rid, created,
-                            status="incomplete" if finish == "length" else "completed")
-    if finish == "length":
-        final["incomplete_details"] = {"reason": "max_output_tokens"}
-    final["output"] = output
-    final["usage"] = _responses_usage(usage)
-    yield ev("response.completed", response=final)
-
-
 @app.post("/v1/responses")
+@app.post("/backend-api/codex/responses")
 def responses_api(body: dict, request: Request, authorization: str = Header(None)):
     model = body.get("model", "")
+    if model_to_channel().get(_canonical_model(model)) == "gpt":
+        from core.gpt_native import respond
+        return respond(sys.modules[__name__], body, request, authorization)
     user, group = _authorize_gateway(authorization, _canonical_model(model), request=request)
     openai_body = _responses_to_openai(body)
     if not openai_body["messages"]:
@@ -1756,6 +1588,7 @@ def responses_api(body: dict, request: Request, authorization: str = Header(None
     cmodel = _canonical_model(model)
     channel = model_to_channel().get(cmodel)
     adapter = get_adapter(channel) if channel else None
+    _reject_prediction_chat(openai_body, [(channel, adapter)])
     req_messages = openai_body["messages"]
     started = time.time()
     request_id = _request_id()
@@ -1772,10 +1605,9 @@ def responses_api(body: dict, request: Request, authorization: str = Header(None
                 request_messages=req_messages, output_text=usage_holder.get("text"),
                 stream=True, duration_ms=int((time.time() - started) * 1000),
                 request_id=request_id, end_reason=end_reason,
-                first_token_ms=usage_holder.get("frt_ms"),
-                account_id=usage_holder.get("account_id"))
+                first_token_ms=usage_holder.get("frt_ms"), client_ip=_client_ip(request))
 
-        return StreamingResponse(
+        return _BilledStreamingResponse(
             _billed_stream(
                 _responses_stream(_openai_stream(openai_body, usage_holder), body, model),
                 usage_holder, settle),
@@ -1791,14 +1623,33 @@ def responses_api(body: dict, request: Request, authorization: str = Header(None
             upstream_usage=served.get("upstream_usage"),
             request_messages=req_messages, output_text=_extract_output_text(chat),
             stream=False, duration_ms=elapsed_ms,
-            request_id=request_id, end_reason="done", first_token_ms=elapsed_ms,
-            account_id=served.get("account_id"))
+            request_id=request_id, end_reason="done", first_token_ms=elapsed_ms, client_ip=_client_ip(request))
     return _openai_to_response(chat, body, model)
+
+
+@app.post("/v1/responses/compact")
+@app.post("/backend-api/codex/responses/compact")
+def gpt_compact(body: dict, request: Request, authorization: str = Header(None)):
+    from core.gpt_native import respond
+    return respond(sys.modules[__name__], body, request, authorization, compact=True)
+
+
+@app.get("/backend-api/codex/models")
+def gpt_manifest(request: Request, authorization: str = Header(None), x_api_key: str = Header(None)):
+    from core.gpt_native import manifest
+    return manifest(sys.modules[__name__], request, authorization, x_api_key)
+
+
+@app.websocket("/v1/responses")
+@app.websocket("/backend-api/codex/responses")
+async def gpt_websocket(socket: WebSocket):
+    from core.gpt_native import websocket_session
+    await websocket_session(sys.modules[__name__], socket)
 
 
 # ---- 向量 ----
 
-def _embed_via(channel, adapter, body, max_switch=6, holder=None):
+def _embed_via(channel, adapter, body, max_switch=6):
     """在一个渠道上做一次 embeddings:取号 → adapter.embeddings,失败切号。
     与 _sync 同一套失败口径:没号 503、换遍号仍失败 502 / 429。"""
     if not callable(getattr(adapter, "embeddings", None)):
@@ -1809,10 +1660,8 @@ def _embed_via(channel, adapter, body, max_switch=6, holder=None):
         acct = POOL.get_valid_account(channel, adapter)
         if not acct:
             raise HTTPException(status_code=503, detail=f"no available account for {channel}")
-        if holder is not None:
-            holder["account_id"] = acct["id"]
         try:
-            return adapter.embeddings(acct, body)
+            return account_runtime.call(DB, adapter, "embeddings", acct, body)
         except Exception as e:
             last_err = str(e)
             last_kind = POOL.mark_failure(
@@ -1843,12 +1692,12 @@ def embeddings_api(body: dict, request: Request, authorization: str = Header(Non
     if body.get("input") in (None, "", []):
         raise HTTPException(status_code=400, detail="input required")
     _, _, routed, routes = _resolve_routes(body)
+    _reject_prediction_chat(routed, routes)
     started = time.time()
     last_exc = None
     for i, (channel, adapter) in enumerate(routes):
-        served = {}
         try:
-            resp = _embed_via(channel, adapter, routed, holder=served)
+            resp = _embed_via(channel, adapter, routed)
         except HTTPException as e:
             if e.status_code in _FAILOVER_STATUS and i < len(routes) - 1:
                 last_exc = e
@@ -1862,48 +1711,41 @@ def embeddings_api(body: dict, request: Request, authorization: str = Header(Non
                                    "content": _embedding_input_text(body.get("input"))}],
                 output_text="", stream=False,
                 duration_ms=int((time.time() - started) * 1000),
-                request_id=_request_id(), end_reason="done",
-                account_id=served.get("account_id"))
-            return resp
+                request_id=_request_id(), end_reason="done", client_ip=_client_ip(request))
+        return resp
     raise last_exc
+
+
+# ---- 结构化数据预测 ----
+
+def _reject_prediction_chat(body, routes):
+    from core.gpt_web import MODEL as WEB_IMAGE_MODEL
+    if body["model"] == WEB_IMAGE_MODEL and any(channel == "gpt" for channel, _ in routes):
+        raise HTTPException(status_code=400, detail="Web 生图模型请使用 /v1/images/generations")
+
+
+
+
+
+
 
 
 # ---- 管理 API ----
 
 @app.get("/admin/stats")
-def admin_stats(authorization: str = Header(None)):
+def admin_stats(authorization: str = Depends(_admin_authorization)):
     _check(authorization, config.ADMIN_KEY)
-    # 声明了 sync_pool 的渠道以外部号源为准:出数前先对账一遍,否则面板会一直
-    # 留着已经被删掉的外部账号。同样不写死渠道名。
-    for _name, _ad in all_adapters().items():
-        if not hasattr(_ad, "sync_pool"):
-            continue
-        try:
-            _ad.sync_pool(DB)
-            if hasattr(_ad, "sync_runtime"):
-                _ad.sync_runtime(DB)
-        except Exception as e:
-            print(f"[bitapi] {_name} 状态同步失败: {e}", flush=True)
     channels = {}
     for name, ad in all_adapters().items():
         channels[name] = {"models": ad.models, "capabilities": ad.capabilities,
-                          "columns": ad.columns,
-                          # 面板的导入弹窗按这个提示该粘什么形状的凭据。
-                          # 由渠道自己声明,面板里不写死渠道名。
-                          "credentials_hint": getattr(ad, "credentials_hint", "")}
-    return {"channels": channels, "pool": DB.stats()}
+                          "columns": ad.columns, "registerable": bool(getattr(ad, "register_script", None))}
+    return {"channels": channels, "pool": DB.stats(), "mcp": mcp_snapshot()}
 
 
 @app.get("/admin/accounts")
 def admin_accounts(channel: str = None, status: str = None, q: str = None,
-                   schedulable: int = None, sort: str = None, order: str = "desc",
                    offset: int = 0, limit: int = 50,
-                   authorization: str = Header(None)):
-    """号池列表。筛选 / 排序 / 分页都在服务端做 —— 号池上万行时,把全量丢给浏览器
-    再筛,面板会卡在渲染上,而且「总共多少条」也得先全拿到才知道。
-
-    schedulable 传 1/0 只看在池的 / 被摘出的;不传就都看。
-    """
+                   authorization: str = Depends(_admin_authorization)):
     _check(authorization, config.ADMIN_KEY)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
@@ -1911,199 +1753,29 @@ def admin_accounts(channel: str = None, status: str = None, q: str = None,
     adapter = get_adapter(channel) if channel else None
     if adapter and hasattr(adapter, "sync_runtime"):
         adapter.sync_runtime(DB)
-    accts = DB.list_accounts(channel=channel, status=status, q=q,
-                             schedulable=schedulable, sort=sort, order=order,
-                             limit=limit, offset=offset)
+    accts = DB.list_accounts(channel=channel, status=status, limit=limit, offset=offset, q=q)
     if adapter and hasattr(adapter, "decorate_accounts"):
         adapter.decorate_accounts(accts)
-    # 脱敏:不返回 secret/token 明文(导出端点才是拿凭据的地方,那条路有单独的确认)
+    # 脱敏:不返回 secret/token 明文
     for a in accts:
         a.pop("secret", None)
         if a.get("token"):
             a["token"] = a["token"][:12] + "..."
-    total = DB.count_accounts(channel=channel, status=status, q=q,
-                              schedulable=schedulable)
-    return {"accounts": accts, "count": len(accts), "total": total,
-            "offset": offset, "limit": limit, "sort": sort, "order": order}
-
-
-@app.post("/admin/accounts/bulk")
-async def admin_accounts_bulk(request: Request, authorization: str = Header(None)):
-    """批量操作。body: {ids:[...], action:"enable"|"disable"|"reset"|"delete"}。
-
-    只认传进来的 id,没有「按筛选条件批量删」这条路 —— 那是没有边界的写操作,
-    而面板上选中的是哪几行,操作的人自己看得见。按条件改请看「批量编辑」那种
-    带预览的形态。
-    """
-    _check(authorization, config.ADMIN_KEY)
-    body = await request.json()
-    ids = body.get("ids") or []
-    action = str(body.get("action") or "").strip()
-    if not ids:
-        raise HTTPException(status_code=400, detail="ids required")
-    if action in ("enable", "disable"):
-        done = DB.set_schedulable(ids, action == "enable")
-        return {"ok": True, "action": action, "count": len(done), "ids": done}
-    if action == "reset":
-        # 重置状态 = 让号回到「待检」,由下一轮巡检按真实情况重新定级。
-        # 直接写 active 等于替巡检下结论,而我们对这个号此刻如何一无所知。
-        return {"ok": True, "action": action,
-                "count": DB.set_statuses(ids, dbmod.ST_UNCHECKED)}
-    if action == "delete":
-        return {"ok": True, "action": action, "count": DB.delete_ids(ids)}
-    raise HTTPException(status_code=400, detail=f"unknown action: {action}")
-
-
-@app.post("/admin/accounts/import")
-async def admin_accounts_import(request: Request, authorization: str = Header(None)):
-    """通用导入。body: {channel, accounts: <dict> | [dict] | {accounts:[...]}}。
-
-    每个 item 交给 adapter.import_account —— 凭据长什么样、哪些字段必须有,由
-    渠道自己说。加一个渠道不必回来改这里(docs/adapters.md 承诺的那件事)。
-    """
-    _check(authorization, config.ADMIN_KEY)
-    body = await request.json()
-    channel = body.get("channel")
-    ad = get_adapter(channel)
-    if not ad:
-        raise HTTPException(status_code=400, detail=f"unknown channel: {channel}")
-    if not callable(getattr(ad, "import_account", None)):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{channel} 不支持凭据导入,key 池型渠道请用 /admin/import-keys")
-    items = body.get("accounts")
-    if items is None:
-        items = body.get("data")
-    if isinstance(items, dict) and "accounts" in items:
-        items = items["accounts"]
-    if isinstance(items, dict):
-        items = [items]
-    if not isinstance(items, list) or not items:
-        raise HTTPException(status_code=400, detail="accounts required")
-
-    imported, skipped, errs = [], [], []
-    for idx, it in enumerate(items):
-        try:
-            action, identity = ad.import_account(DB, it)
-            # 导出 → 导入要能原样还原。status / schedulable 是站长的决定
-            # (哪些号被摘出、哪些被标停用),恢复时被悄悄抹掉就等于换了一批号。
-            if isinstance(it, dict) and "schedulable" in it:
-                row = DB.get_by_identity(channel, identity)
-                if row:
-                    DB.update_account(row["id"],
-                                      schedulable=1 if it["schedulable"] else 0)
-            (imported if action == "imported" else skipped).append(identity)
-        except Exception as e:
-            # 失败那一条标出是哪一条:凭据坏掉时 import_account 还没来得及算出
-            # identity,只能从原始 item 里挑几个像身份的字段兜底。
-            label = ""
-            if isinstance(it, dict):
-                sec = it.get("secret") if isinstance(it.get("secret"), dict) else it
-                label = str(sec.get("email") or it.get("identity")
-                            or sec.get("account_uuid")
-                            or sec.get("chatgpt_account_id") or "").strip()
-            errs.append(f"#{idx + 1} {label + ': ' if label else ''}{e}")
-    return {"ok": True, "channel": channel, "imported": imported,
-            "skipped": skipped, "count": len(imported),
-            "skipped_count": len(skipped), "errors": errs}
-
-
-@app.get("/admin/accounts/export")
-def admin_accounts_export(channel: str = None, ids: str = None,
-                          authorization: str = Header(None)):
-    """导出 JSON(**含凭据**)。ids 给了就只导这几行,否则按 channel / 全量。
-
-    这是唯一会吐出 secret 明文的读端点,和 `/admin/accounts` 的脱敏故意相反 ——
-    备份与迁移要的就是能原样导回去的那份。面板点它之前会先弹一次确认。
-    """
-    _check(authorization, config.ADMIN_KEY)
-    id_list = [int(x) for x in str(ids or "").replace(" ", "").split(",") if x.strip().isdigit()]
-    rows = DB.list_accounts(channel=channel, ids=id_list or None, limit=100000)
-    keep = ("channel", "identity", "secret", "meta", "token", "token_exp",
-            "balance", "status", "schedulable", "last_check", "last_used")
-    accounts = [{k: r.get(k) for k in keep} for r in rows]
-    return {"exported_at": int(time.time()), "count": len(accounts),
-            "accounts": accounts}
-
-
-@app.post("/admin/accounts/test")
-async def admin_accounts_test(request: Request, authorization: str = Header(None)):
-    """单账号测试:拿这个号发一条真请求,把上游原话回显给面板。
-
-    body: {channel, identity} 或 {id},可选 model / prompt。
-    与网关同一条 adapter 路径(adapter.test_account → chat),所以「测试通过」
-    和「真能调通」说的是同一件事。不计费、不进 usage_logs —— 这是运维动作。
-    """
-    _check(authorization, config.ADMIN_KEY)
-    body = await request.json()
-    acct = None
-    if body.get("id"):
-        acct = DB.get_account(int(body["id"]))
-    elif body.get("channel") and body.get("identity"):
-        acct = DB.get_by_identity(body["channel"], body["identity"])
-    if not acct:
-        raise HTTPException(status_code=404, detail="account not found")
-    ad = get_adapter(acct["channel"])
-    if not ad or not callable(getattr(ad, "test_account", None)):
-        raise HTTPException(status_code=400,
-                            detail=f"{acct['channel']} 不支持账号测试")
-    started = time.time()
-    try:
-        result = await asyncio.to_thread(ad.test_account, acct,
-                                         body.get("model"), body.get("prompt"))
-    except Exception as e:
-        # 上游原话逐字带回面板:是 401(号坏了)还是 503(上游此刻不好),
-        # 站长要自己看得见,不能只给一句「测试失败」。
-        detail = getattr(e, "detail", None) or str(e)
-        # 失败也带响应头 —— 窗口打满时上游回 429,最新的百分比就在那个头里,
-        # 而「测试」正是站长发现调不动时第一个会点的按钮。
-        if getattr(e, "headers", None) is not None:
-            persist_runtime_meta(DB, acct["id"], ad.window_meta(e.headers))
-        return {"ok": False, "channel": acct["channel"],
-                "identity": acct["identity"], "code": getattr(e, "code", 0),
-                "ms": int((time.time() - started) * 1000), "error": str(detail)[:1000]}
-    if result.get("meta"):
-        persist_runtime_meta(DB, acct["id"], result["meta"])
-    return {"ok": True, "channel": acct["channel"], "identity": acct["identity"],
-            "model": result.get("model"), "ms": result.get("ms"),
-            "text": result.get("text"), "reasoning": result.get("reasoning"),
-            "usage": result.get("usage")}
-
-
-@app.get("/admin/accounts/stats")
-def admin_accounts_stats(channel: str = None, ids: str = None, days: int = 7,
-                         authorization: str = Header(None)):
-    """按账号的用量 / 最近使用。余额与状态直接从 accounts 行上带出。
-
-    用量来自 usage_logs.account_id —— 加这一列之前的历史日志归属不到号上,
-    那些不计入(算进去就是编数)。days 给的是统计窗口。
-    """
-    _check(authorization, config.ADMIN_KEY)
-    from core.portal_state import USER_DB
-    id_list = [int(x) for x in str(ids or "").replace(" ", "").split(",") if x.strip().isdigit()]
-    rows = DB.list_accounts(channel=channel, ids=id_list or None, limit=1000)
-    since = int(time.time()) - max(1, min(days, 90)) * 86400
-    usage = USER_DB.account_usage([r["id"] for r in rows], since=since)
-    out = []
-    for r in rows:
-        u = usage.get(r["id"]) or {}
-        out.append({
-            "id": r["id"], "channel": r["channel"], "identity": r["identity"],
-            "status": r["status"], "schedulable": r["schedulable"],
-            "balance": r["balance"], "last_used": r["last_used"],
-            "last_check": r["last_check"],
-            "requests": u.get("reqs", 0), "input_tokens": u.get("in_tok", 0),
-            "output_tokens": u.get("out_tok", 0), "cost": u.get("cost", 0.0),
-            "avg_ms": int(u.get("avg_ms") or 0), "last_at": u.get("last_at") or 0,
-        })
-    return {"days": days, "since": since, "stats": out}
+    total = DB.count_accounts(channel=channel, status=status, q=q)
+    return {"accounts": accts, "count": len(accts),
+            "total": total, "offset": offset, "limit": limit,
+            "by_status": DB.count_by_status(channel=channel, q=q)}
 
 
 @app.post("/admin/accounts")
-async def report_account(request: Request, authorization: str = Header(None)):
+async def report_account(request: Request, authorization: str = Depends(_admin_authorization)):
     """本地注册 worker 上报账号入库。body: {channel, identity, secret, meta, token, token_exp}"""
     _check(authorization, config.ADMIN_KEY)
     body = await request.json()
+    return await asyncio.to_thread(_report_account_body, body)
+
+
+def _report_account_body(body):
     channel = body.get("channel")
     identity = body.get("identity")
     if not channel or not identity:
@@ -2123,7 +1795,6 @@ async def report_account(request: Request, authorization: str = Header(None)):
         # limit - tokens。这样注册号(有快照但 balance=None)也能参与号池排序,不会被排到最后。
         upd = {"token": body["token"], "token_exp": body.get("token_exp", 0),
                "status": dbmod.ST_ACTIVE}
-        # 服务器已有快照优先,避免客户端传来的旧快照冲掉运行时记账
         if not have_usage:
             upd["balance"] = body.get("balance")
         DB.update_account(acct_id, **upd)
@@ -2131,7 +1802,7 @@ async def report_account(request: Request, authorization: str = Header(None)):
 
 
 @app.post("/admin/import-keys")
-async def admin_import_keys(request: Request, authorization: str = Header(None)):
+async def admin_import_keys(request: Request, authorization: str = Depends(_admin_authorization)):
     """批量导入 API key 进 key 池型渠道。
     body: {channel, keys:[...]} 或 {channel, key:"多行/逗号分隔"}。
     每个 key 一个账号,identity 由 key 派生(脱敏),secret.api_key 存 key。
@@ -2139,10 +1810,16 @@ async def admin_import_keys(request: Request, authorization: str = Header(None))
     """
     _check(authorization, config.ADMIN_KEY)
     body = await request.json()
+    return await asyncio.to_thread(_import_keys_body, body)
+
+
+def _import_keys_body(body):
     channel = body.get("channel")
     ad = get_adapter(channel)
     if not ad:
         raise HTTPException(status_code=400, detail=f"unknown channel: {channel}")
+    if channel == "gpt":
+        raise HTTPException(status_code=400, detail="GPT OAuth 请使用 /admin/gpt/import 导入账号")
     keys = parse_keys(body)
     if not keys:
         raise HTTPException(status_code=400, detail="keys required")
@@ -2154,21 +1831,94 @@ async def admin_import_keys(request: Request, authorization: str = Header(None))
 
 
 @app.post("/admin/scan")
-async def admin_scan(channel: str = None, authorization: str = Header(None)):
+async def admin_scan(channel: str = None, authorization: str = Depends(_admin_authorization)):
     """手动触发一轮巡检(刷 token / 查余额 / 测活)。channel=None 全渠道,否则仅该渠道。"""
     _check(authorization, config.ADMIN_KEY)
     if channel and not get_adapter(channel):
         raise HTTPException(status_code=400, detail=f"unknown channel: {channel}")
-    # 注:scan_once 内部已对文件型号池(grok)做增量同步 + 跳过 per-account 巡检
+    # 注:scan_once 内部已对文件型号池做增量同步 + 跳过 per-account 巡检
     tally = await scan_once(DB, config.SCAN_CONCURRENCY,
                             config.REFRESH_MARGIN, config.MIN_BALANCE, channel=channel)
     return {"ok": True, "result": tally}
 
 
+# ---- 面板「产号」：跑注册脚本，把新号导进号池 ----
+# 渠道 adapter 声明 register_script + register_channels 即可在面板一键产号。
+_PRODUCE = {}
+
+
+def _produce_log(channel):
+    if not re.fullmatch(r"[a-z0-9_-]{1,32}", channel or ""):
+        raise HTTPException(400, "bad channel")
+    return os.path.join(tempfile.gettempdir(), "produce_%s.log" % channel)
+
+
+def _produce_info(channel):
+    st = _PRODUCE.get(channel) or {}
+    log = _produce_log(channel)
+    info = {"channel": channel, "running": False, "done": 0, "failed": 0, "tail": []}
+    proc = st.get("proc")
+    if proc is not None:
+        info["running"] = proc.poll() is None
+    if os.path.isfile(log):
+        try:
+            with open(log, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 65536))
+                txt = stream.read(65536).decode("utf-8", errors="replace")
+            info["truncated"] = size > 65536
+        except Exception:
+            txt = ""
+        info["done"] = txt.count("上报结果")
+        info["failed"] = txt.count("失败")
+        info["tail"] = [l for l in txt.strip().splitlines()[-4:]]
+    return info
+
+
+@app.get("/admin/produce")
+def admin_produce_status(channel: str, authorization: str = Depends(_admin_authorization)):
+    _check(authorization, config.ADMIN_KEY)
+    return _produce_info(channel)
+
+
+@app.post("/admin/produce")
+def admin_produce(channel: str, count: int = 10,
+                        authorization: str = Depends(_admin_authorization)):
+    _check(authorization, config.ADMIN_KEY)
+    ad = get_adapter(channel)
+    script = getattr(ad, "register_script", None) if ad else None
+    if not script:
+        raise HTTPException(status_code=400, detail=f"channel {channel} 不支持产号")
+    cur = _PRODUCE.get(channel) or {}
+    if cur.get("proc") is not None and cur["proc"].poll() is None:
+        raise HTTPException(status_code=409, detail="该渠道已有产号任务在跑")
+    count = max(1, min(int(count or 1), 2000))
+    root = os.path.dirname(os.path.abspath(__file__))
+    log = _produce_log(channel)
+    with open(log, "wb"):
+        pass
+    env = dict(os.environ)
+    env["BITAPI_ADMIN_KEY"] = config.ADMIN_KEY
+    if config.TM_KEY:
+        env["BITAPI_TM_KEY"] = config.TM_KEY
+    chans = ",".join(getattr(ad, "register_channels", [channel]))
+    cmd = [sys.executable, os.path.join(root, script), "--count", str(count),
+           "--bitapi", f"http://127.0.0.1:{config.PORT}",
+           "--channels", chans, "--jwt-out", os.path.join(os.path.dirname(os.path.abspath(config.DB_PATH)), f"{channel}_accounts.txt")]
+    f = open(log, "ab")
+    try:
+        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=root)
+    finally:
+        f.close()
+    _PRODUCE[channel] = {"proc": proc, "log": log}
+    return {"ok": True, "channel": channel, "count": count, "pid": proc.pid, "log": log}
+
+
 @app.post("/admin/purge")
-async def admin_purge(channel: str = None, authorization: str = Header(None)):
+def admin_purge(channel: str = None, authorization: str = Depends(_admin_authorization)):
     """清除失效账号。指定 channel(面板手动点清除)时: dead + exhausted 一起清;
-    全局不指定时: 清所有 dead,以及声明了 exhausted_is_dead 的渠道的 exhausted。"""
+    全局不指定时: 清所有 dead,外加自己声明 exhausted_is_dead 的渠道的 exhausted。"""
     _check(authorization, config.ADMIN_KEY)
     if channel and not get_adapter(channel):
         raise HTTPException(status_code=400, detail=f"unknown channel: {channel}")
@@ -2179,8 +1929,9 @@ async def admin_purge(channel: str = None, authorization: str = Header(None)):
                                       limit=100000))
     else:
         targets = DB.list_accounts(status=dbmod.ST_DEAD, limit=100000)
-        # 「额度耗尽算不算永久失效」由渠道自己用 exhausted_is_dead 声明,这里不写死渠道名 ——
-        # 写死了的话,后来新增一个同样声明的渠道,全局清理会一直漏掉它。
+        # 「额度耗尽算不算永久失效」由渠道自己用 exhausted_is_dead 声明,这里不写死渠道名:
+        # 早先硬编码成单一渠道名,后来第二个渠道也声明了 True,全局清理就一直漏掉它。
+        # (那两个渠道本身已于 2026-10-27 下线,但这条教训对现役渠道同样成立。)
         for name, ad in all_adapters().items():
             if getattr(ad, "exhausted_is_dead", False):
                 targets += DB.list_accounts(channel=name, status=dbmod.ST_EXHAUSTED,
@@ -2197,7 +1948,7 @@ async def admin_purge(channel: str = None, authorization: str = Header(None)):
 
 
 @app.post("/admin/channel/delete")
-async def admin_delete_channel(channel: str, authorization: str = Header(None)):
+def admin_delete_channel(channel: str, authorization: str = Depends(_admin_authorization)):
     """删除某渠道全部账号(清空该渠道号池,不分状态)。adapter 仍在代码里注册,卡片会显示 0。"""
     _check(authorization, config.ADMIN_KEY)
     if not channel or not get_adapter(channel):
@@ -2207,8 +1958,8 @@ async def admin_delete_channel(channel: str, authorization: str = Header(None)):
 
 
 @app.post("/admin/account/delete")
-async def admin_delete_account(channel: str, identity: str, authorization: str = Header(None)):
-    """删除单个账号。adapter 若有 delete_account 钩子(如 grok 删 auth 文件)则走它。"""
+def admin_delete_account(channel: str, identity: str, authorization: str = Depends(_admin_authorization)):
+    """删除单个账号。adapter 若有 delete_account 钩子(如删掉本地 auth 文件)则走它。"""
     _check(authorization, config.ADMIN_KEY)
     ad = get_adapter(channel)
     if not ad:
@@ -2220,7 +1971,29 @@ async def admin_delete_account(channel: str, identity: str, authorization: str =
     return {"ok": True, "channel": channel, "identity": identity}
 
 
-GEN_MAX_N = 4        # 一次生成的张数上限
+@app.post("/admin/gpt/import")
+async def admin_gpt_import(request: Request, authorization: str = Depends(_admin_authorization)):
+    """导入 GPT(Codex / ChatGPT OAuth)账号到现有数据库。
+
+    body 支持 sub2api 的 OAuth 导入形状:
+      {"content": "多行 accessToken / auth.json / JSON 数组"}   管理台粘贴框走这条
+      {"contents": ["...", "..."]}                            多段一起贴
+      {"accounts": [...]} / [...] / {...单个 auth.json...}      脚本与导出文件走这条
+      {"force": true}                                          覆盖已有账号
+
+    返回逐条结果(imported / updated / skipped / failed + 每条的警告),管理台据此
+    显示「跳过 N 个、失败 N 个、失败原因」,而不是只回一个光秃秃的成功数。
+    """
+    _check(authorization, config.ADMIN_KEY)
+    ad = get_adapter("gpt")
+    if not ad:
+        raise HTTPException(status_code=400, detail="gpt adapter not loaded")
+    body = await request.json()
+    try:
+        result = await asyncio.to_thread(ad.import_body, DB, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "channel": "gpt", **result}
 
 
 def _gen_count(body):
@@ -2230,12 +2003,12 @@ def _gen_count(body):
         n = int(body.get("n", 1) or 1)
     except (TypeError, ValueError):
         n = 1
-    return max(1, min(n, GEN_MAX_N))
+    return max(1, min(n, config.GEN_MAX_N))
 
 
-# 生成渠道的请求限速。与 groups.rpm_limit 是两回事:那个按用户、护的是本站成本;
-# 这个按渠道、全站合计,护的是**上游账号** —— 高频调用会被上游不可逆封号,
-# 而这类账号往往没有密码可重登,废了就回不来。
+# 生成渠道的请求限速。与 groups.concurrency_limit 是两回事:那个按用户限制同时处理数;
+# 这个按渠道、全站合计,护的是**上游账号** —— 高频调用可能被上游不可逆地封号,
+# 而账号没有密码可重登,废了就回不来。
 # adapter 用 max_rpm 声明(0 / 缺省 = 不限)。
 _gen_rpm = {}
 _gen_rpm_lock = threading.Lock()
@@ -2259,8 +2032,8 @@ def _gen_rate_limit(channel, adapter):
 def _rehost(urls, adapter, want_b64):
     """上游 CDN URL 列表 → OpenAI 风格的 data[]。
 
-    上游返回的链接对调用方不可靠(带 referer 防盗链、内网地址、很快过期)——
-    一律把字节抓到自家 /media/gen 下再给出去。
+    上游返回的链接对调用方不可靠(clipfly 带 referer 防盗链;oreate 改写成
+    ai.baipiao.co/media 而网关无此路由)—— 一律把字节抓到自家 /media/gen 下再给出去。
     want_b64=True 则内联 base64(response_format=b64_json,不落链接依赖)。
 
     抓取失败**不静默**:图已经出了、钱也扣了,回原始 URL 至少让调用方还有一线可取,
@@ -2298,7 +2071,7 @@ def _generate(body, want_kind, max_switch=6):
     n = _gen_count(body)
     # 默认自托管 URL;response_format=b64_json 才内联字节(与 OpenAI 一致)。
     want_b64 = (body.get("response_format") == "b64_json")
-    # 渠道自定义透传参数(声明了 accepts_options 的渠道用它收单次调用的选项)。
+    # 渠道自定义透传参数。
     # 只给声明了 accepts_options 的渠道传 —— 别的渠道签名里没这个参数,硬传会 TypeError。
     opts = body.get("matchup_options")
     if not isinstance(opts, dict):
@@ -2306,7 +2079,7 @@ def _generate(body, want_kind, max_switch=6):
     # 限速放在取号之前:被限的请求不该占用账号,也不该留下任何副作用。
     _gen_rate_limit(channel, adapter)
     # 总时长预算:网关在 Cloudflare 后面,CF 的 524 线是「源站 100 秒无响应就切」。
-    # 光把单次超时调短没用 —— 重试几次叠起来照样超(踩过:某个生图渠道报 524,
+    # 光把单次超时调短没用 —— 重试几次叠起来照样超(踩过:metachatai/gpt-image-2
     # 报 524,用户拿到的是 CF 那张 HTML 页,看不出是哪一段慢)。这里只在预算内**开始**
     # 新的尝试:快的失败(额度不足一两秒就回)可以多试几个号,慢的尝试只跑得起一次,
     # 于是最坏耗时 ≈ 预算 + 单次上限,渠道把这两个数一起卡在 100 秒内。
@@ -2322,9 +2095,9 @@ def _generate(body, want_kind, max_switch=6):
             raise HTTPException(status_code=503, detail=f"no account for {channel}")
         try:
             if getattr(adapter, "accepts_options", False):
-                urls = adapter.generate(acct, model, prompt, size, n, options=opts)
+                urls = account_runtime.call(DB, adapter, "generate", acct, model, prompt, size, n, options=opts)
             else:
-                urls = adapter.generate(acct, model, prompt, size, n)
+                urls = account_runtime.call(DB, adapter, "generate", acct, model, prompt, size, n)
             return {"created": int(time.time()),
                     "data": _rehost(urls, adapter, want_b64)}
         except GenerationSubmittedError as e:
@@ -2356,7 +2129,7 @@ GEN_ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 def _gen_prompt(messages):
     """chat messages → prompt:取最后一条 user 消息的文字。
 
-    多模态数组只收 text 段。图生图上游还没开,把图片 URL
+    多模态数组只收 text 段。图生图上游还没开(clipfly 的 type 22),把图片 URL
     拼进 prompt 只会让模型照着念一遍,不如当没传。
     """
     for m in reversed(messages or []):
@@ -2414,7 +2187,7 @@ def _gen_chat_stream(adapter, body, usage_holder=None):
     """流式:先出一帧占住连接,出图前每 GEN_KEEPALIVE_EVERY 秒补一个 SSE 心跳。
 
     心跳不是装饰:用户拿到的入口在 Cloudflare 后面,原点 100 秒不出字节就被掐断
-    (生图实测能跑到 300 秒以上)。先发
+    (clipfly 最慢的 midjourney_v7 实测 ~95 秒,oreate 出图能到 300 秒)。先发
     role 帧再定期心跳,把「等首字节」变成「有字节在流」,这条路才等得起几分钟。
     """
     cid, created, model = _cid(), int(time.time()), body["model"]
@@ -2438,7 +2211,7 @@ def _gen_chat_stream(adapter, body, usage_holder=None):
         except Exception as e:
             result["err"] = e
 
-    th = threading.Thread(target=worker, daemon=True)
+    th = threading.Thread(target=account_runtime.worker_target(worker), daemon=True)
     th.start()
     while True:
         th.join(timeout=GEN_KEEPALIVE_EVERY)
@@ -2466,7 +2239,19 @@ def _gen_chat_stream(adapter, body, usage_holder=None):
 async def images_generations(request: Request, authorization: str = Header(None)):
     body = await request.json()
     model = body.get("model", "")
+    if model_to_channel().get(_canonical_model(model)) == "gpt":
+        from core.gpt_native import images
+        return await asyncio.to_thread(images, sys.modules[__name__], body, request, authorization)
     user, group = _authorize_gateway(authorization, model, request=request)
+    from core import openai_images
+    if any(openai_images.supports(get_adapter(channel), _canonical_model(model)) for channel in model_routes(_canonical_model(model))):
+        served = {}
+        result = await asyncio.to_thread(openai_images.generate, sys.modules[__name__], body, served)
+        if user is not None:
+            BILLING.record_usage(user, group, served["channel"], _canonical_model(model), adapter=served["adapter"],
+                                 upstream_usage=served["usage"], units=served["units"], stream=False,
+                                 duration_ms=served["duration_ms"], client_ip=_client_ip(request))
+        return result
     # 生成是同步阻塞的(提交 + 轮询,几十秒到几分钟)。留在事件循环里跑会把整个
     # 单 worker 的网关挂住 —— 别的请求连健康检查都排不上。
     resp = await asyncio.to_thread(_generate, body, "image")
@@ -2474,7 +2259,7 @@ async def images_generations(request: Request, authorization: str = Header(None)
         channel = model_to_channel().get(model)
         BILLING.record_usage(user, group, channel, model,
                              adapter=get_adapter(channel) if channel else None,
-                             stream=False, units=_gen_count(body))
+                             stream=False, units=_gen_count(body), client_ip=_client_ip(request))
     return resp
 
 
@@ -2488,8 +2273,101 @@ async def videos_generations(request: Request, authorization: str = Header(None)
         channel = model_to_channel().get(model)
         BILLING.record_usage(user, group, channel, model,
                              adapter=get_adapter(channel) if channel else None,
-                             stream=False, units=_gen_count(body))
+                             stream=False, units=_gen_count(body), client_ip=_client_ip(request))
     return resp
+
+
+# ---- 音频(TTS / STT)----
+# bit-api 原先只有 chat / images / videos。eazo 网关额外提供 /v1/audio/speech 与
+# /v1/audio/transcriptions,这里补两条 OpenAI 兼容路由:路由到 adapter.speech()/
+# transcribe()(由渠道实现),取号/换号/计费与 _generate 同口径。
+
+def _audio_run(channel, adapter, fn):
+    """取号 → fn(acct),失败换号(与 _generate 同口径)。返回 fn 的结果。"""
+    last = None
+    for _ in range(6):
+        acct = POOL.get_valid_account(channel, adapter)
+        if not acct:
+            raise HTTPException(status_code=503, detail=f"no account for {channel}")
+        try:
+            with account_runtime.dispatch(DB, acct):
+                return fn(acct)
+        except GenerationSubmittedError as e:
+            POOL.mark_cooldown(acct["id"])
+            raise HTTPException(status_code=502, detail={
+                "code": "generation_result_unknown", "task_id": e.task_id,
+                "message": "任务已提交,结果暂时未知,请勿重复提交"})
+        except Exception as e:
+            last = str(e)
+            POOL.mark_failure(acct["id"], e,
+                              dead=getattr(adapter, "exhausted_is_dead", False),
+                              adapter=adapter)
+    _upstream_failed(channel, "audio", last)
+    raise HTTPException(status_code=502, detail=f"audio failed: {last}")
+
+
+def _audio_speech(body):
+    model = body.get("model")
+    channel = model_to_channel().get(model)
+    adapter = get_adapter(channel) if channel else None
+    if not adapter or not hasattr(adapter, "speech"):
+        raise HTTPException(status_code=404, detail=f"unknown speech model: {model}")
+    return _audio_run(channel, adapter, lambda a: adapter.speech(a, body))
+
+
+def _audio_transcribe(model, filename, content_type, data):
+    channel = model_to_channel().get(model)
+    adapter = get_adapter(channel) if channel else None
+    if not adapter or not hasattr(adapter, "transcribe"):
+        raise HTTPException(status_code=404, detail=f"unknown transcription model: {model}")
+    return _audio_run(channel, adapter,
+                      lambda a: adapter.transcribe(a, model, filename, content_type, data))
+
+
+@app.post("/v1/audio/speech")
+async def audio_speech(request: Request, authorization: str = Header(None)):
+    body = await request.json()
+    model = body.get("model", "")
+    user, group = _authorize_gateway(authorization, model, request=request)
+    data, mime = await asyncio.to_thread(_audio_speech, body)
+    if user is not None:
+        channel = model_to_channel().get(model)
+        BILLING.record_usage(user, group, channel, model,
+                             adapter=get_adapter(channel) if channel else None,
+                             stream=False, units=1, client_ip=_client_ip(request))
+    from fastapi.responses import Response
+    return Response(content=data, media_type=mime)
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(request: Request, authorization: str = Header(None)):
+    tok = (authorization or "").replace("Bearer ", "").strip()
+    if not secret_equal(tok, config.API_KEY) and not await asyncio.to_thread(BILLING.resolve_user_by_key, tok):
+        raise HTTPException(401, "Unauthorized")
+    try:
+        form = await request.form(max_files=1, max_fields=20, max_part_size=config.MAX_AUDIO_BYTES)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "malformed multipart") from exc
+    model = str(form.get("model") or "")
+    up = form.get("file")
+    data = await up.read(config.MAX_AUDIO_BYTES + 1) if hasattr(up, "read") else b""
+    if hasattr(up, "close"):
+        await up.close()
+    if len(data) > config.MAX_AUDIO_BYTES:
+        raise HTTPException(413, "audio too large")
+    filename = getattr(up, "filename", None) or "audio.bin"
+    ctype = getattr(up, "content_type", None) or "application/octet-stream"
+    user, group = _authorize_gateway(authorization, model, request=request)
+    out = await asyncio.to_thread(_audio_transcribe, model, filename, ctype, data)
+    if user is not None:
+        channel = model_to_channel().get(model)
+        BILLING.record_usage(user, group, channel, model,
+                             adapter=get_adapter(channel) if channel else None,
+                             stream=False, units=1, client_ip=_client_ip(request))
+    from fastapi.responses import JSONResponse
+    return JSONResponse(out)
 
 
 # 回调两种方法都要收(易支付用 GET 带 query,别的渠道 POST)。写成两个装饰器而不是
@@ -2507,8 +2385,9 @@ async def pay_notify(provider: str, request: Request):
     from core import orders as orders_mod
     from core.portal_state import USER_DB
     raw = await request.body()
-    params = dict(request.query_params)
-    if not params and raw:
+    # 毛支付须保留重复参数，让渠道按公开协议拒绝歧义请求。
+    params = request.query_params if provider == "baipiao" else dict(request.query_params)
+    if provider != "baipiao" and not params and raw:
         params = {k: v[0] for k, v in
                   urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
     ok, msg = orders_mod.handle_notify(USER_DB, provider, dict(request.headers),
@@ -2564,6 +2443,16 @@ def portal_ui():
     import os
     from fastapi.responses import HTMLResponse as _HTML
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portal.html")
+    with open(path, encoding="utf-8") as f:
+        return _HTML(content=f.read(), headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/mcp-guide", response_class=HTMLResponse)
+def mcp_guide():
+    """MCP 接入指引页（各客户端配置片段）。"""
+    import os
+    from fastapi.responses import HTMLResponse as _HTML
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp.html")
     with open(path, encoding="utf-8") as f:
         return _HTML(content=f.read(), headers={"Cache-Control": "no-cache"})
 
@@ -2638,15 +2527,6 @@ def static_asset(name: str):
                         headers={"Cache-Control": "no-cache"})
 
 
-@app.get("/admin/ui", response_class=HTMLResponse)
-def admin_ui():
-    """号池监控面板(读 /admin/stats + /admin/accounts 动态渲染)。"""
-    import os
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
-    with open(path, encoding="utf-8") as f:
-        return f.read()
-
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "adapters": list(all_adapters().keys())}
+    return {"status": "ok"}

@@ -14,7 +14,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "alerts.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -85,7 +84,7 @@ class CoreEventsTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com",
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com",
                                                    "password": "secret123"})
         assert r.status_code == 200, r.text
         cls.uid = r.json()["user_id"]
@@ -124,19 +123,19 @@ class CoreEventsTest(unittest.TestCase):
         throttle.LOGIN_EMAIL.limit = 1
         try:
             with _Capture("auth.throttled") as cap:
-                self.client.post("/api/login", json={"email": "root@example.com", "password": "x"})
-                r = self.client.post("/api/login", json={"email": "root@example.com", "password": "x"})
+                self.client.post("/api/login", json={"email": "root@gmail.com", "password": "x"})
+                r = self.client.post("/api/login", json={"email": "root@gmail.com", "password": "x"})
                 self.assertEqual(r.status_code, 429)
             self.assertEqual(len(cap.got), 1)
             self.assertEqual(cap.got[0][1]["scope"], "login")
-            self.assertEqual(cap.got[0][1]["key"], "root@example.com")
+            self.assertEqual(cap.got[0][1]["key"], "root@gmail.com")
         finally:
             throttle.LOGIN_EMAIL.limit = saved
 
     def test_mail_failed_emitted_on_smtp_error(self):
         db = portal_state.USER_DB
         db.set_setting("smtp_host", "smtp.example.com")
-        db.set_setting("smtp_from", "no-reply@example.com")
+        db.set_setting("smtp_from", "no-reply@gmail.com")
         db.set_setting("smtp_user", "u")
         db.set_setting("smtp_pass", "p")
 
@@ -151,9 +150,9 @@ class CoreEventsTest(unittest.TestCase):
             with mock.patch.object(mailer.smtplib, "SMTP_SSL", Boom):
                 with _Capture("mail.failed") as cap:
                     with self.assertRaises(mailer.MailError):
-                        mailer.send("x@example.com", "s", "t")
+                        mailer.send("x@gmail.com", "s", "t")
             self.assertEqual(len(cap.got), 1)
-            self.assertEqual(cap.got[0][1]["to"], "x@example.com")
+            self.assertEqual(cap.got[0][1]["to"], "x@gmail.com")
             self.assertIn("认证失败", cap.got[0][1]["error"])
         finally:
             for k in ("smtp_host", "smtp_from", "smtp_user", "smtp_pass"):
@@ -167,7 +166,7 @@ class StuckOrderTest(unittest.TestCase):
         self.db = UserDB(os.path.join(_TMP, f"stuck-{id(self)}.db"))
         portal_state.rebind(self.db)
         self.db.create_group("free", supported_models=["*"], billing_policy="balance", is_default=1)
-        self.uid = self.db.create_user("pay@example.com", "x", "AFFCODE1", group_id=1)
+        self.uid = self.db.create_user("pay@gmail.com", "x", "AFFCODE1", group_id=1)
 
     def tearDown(self):
         portal_state.rebind(portal_state.USER_DB)
@@ -267,18 +266,18 @@ class WebhookPluginTest(unittest.TestCase):
 
     def test_no_url_means_silent(self):
         plugin.CONFIG["url"] = ""
-        self.assertFalse(plugin.notify("pool.empty", "grok", "t", "x"))
+        self.assertFalse(plugin.notify("pool.empty", "kogo", "t", "x"))
         self.assertEqual(self.posts, [])
 
     def test_dedup_per_event_and_key_within_cooldown(self):
-        self.assertTrue(plugin.notify("pool.empty", "grok", "t", "x"))
-        self.assertFalse(plugin.notify("pool.empty", "grok", "t", "x"))     # 冷却中
+        self.assertTrue(plugin.notify("pool.empty", "kogo", "t", "x"))
+        self.assertFalse(plugin.notify("pool.empty", "kogo", "t", "x"))     # 冷却中
         self.assertTrue(plugin.notify("pool.empty", "xai", "t", "x"))       # 别的渠道
-        self.assertTrue(plugin.notify("upstream.failed", "grok", "t", "x"))  # 别的事件
+        self.assertTrue(plugin.notify("upstream.failed", "kogo", "t", "x"))  # 别的事件
         self.assertEqual(len(self.posts), 3)
         # 冷却过了再发
-        plugin._last[("pool.empty", "grok")] -= 601
-        self.assertTrue(plugin.notify("pool.empty", "grok", "t", "x"))
+        plugin._last[("pool.empty", "kogo")] -= 601
+        self.assertTrue(plugin.notify("pool.empty", "kogo", "t", "x"))
 
     def test_payload_shapes(self):
         plugin.CONFIG["url"] = "https://api.telegram.org/bot123:abc/sendMessage?chat_id=42"
@@ -298,7 +297,7 @@ class WebhookPluginTest(unittest.TestCase):
         self.assertEqual(generic["text"], generic["content"])
 
     def test_handlers_route_events(self):
-        plugin.on_pool_empty(channel="grok", reason="no_active")
+        plugin.on_pool_empty(channel="kogo", reason="no_active")
         plugin.on_upstream_failed(channel="xai", model="xai-grok-4.6", error="502 bad", kind="error")
         plugin.on_order_stuck(order={"out_trade_no": "OT1", "user_id": 3, "amount": 10.0,
                                      "status": "paid"}, age=1200)
@@ -307,7 +306,7 @@ class WebhookPluginTest(unittest.TestCase):
         plugin.on_auth_throttled(scope="login", key="1.2.3.4", retry_after=60)
         self.assertEqual(len(self.posts), 6)
         titles = [b["title"] for _, b in self.posts]
-        self.assertTrue(any("grok" in t for t in titles))
+        self.assertTrue(any("kogo" in t for t in titles))
         self.assertTrue(any("OT1" in t for t in titles))
         # 大额消费:阈值 0 不报;设了阈值只报超过的
         plugin.on_usage_recorded(user={"id": 1, "email": "a@b.c"}, model="m", channel="c",
@@ -325,7 +324,7 @@ class WebhookPluginTest(unittest.TestCase):
     def test_delivery_failure_never_raises(self):
         self._p1.stop()
         with mock.patch.object(plugin, "_post", side_effect=OSError("connection refused")):
-            self.assertTrue(plugin.notify("pool.empty", "grok", "t", "x"))   # 没抛出来
+            self.assertTrue(plugin.notify("pool.empty", "kogo", "t", "x"))   # 没抛出来
         self._p1.start()
 
 

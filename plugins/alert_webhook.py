@@ -149,3 +149,18 @@ def on_usage_recorded(user, model, channel, actual_cost, request_id, **_):
            f"(模型 {model} / 渠道 {channel},请求 {request_id})",
            {"user_id": (user or {}).get("id"), "model": model, "channel": channel,
             "actual_cost": actual_cost, "request_id": request_id})
+
+
+@on("model.failed")
+def on_model_failed(channel, model, error, **_):
+    notify("model.failed", f"{channel}:{model}", f"模型失效 {model}",
+           f"小时级巡检发现 {channel} 渠道的 {model} 检测失败:"
+           f"{str(error)[:200]}。用户此刻调用该模型会报错,去管理台「模型状态」看详情。",
+           {"channel": channel, "model": model, "error": str(error)[:500]})
+
+
+@on("model.recovered")
+def on_model_recovered(channel, model, **_):
+    notify("model.recovered", f"{channel}:{model}", f"模型恢复 {model}",
+           f"{channel} 渠道的 {model} 在小时级巡检里重新通过检测。",
+           {"channel": channel, "model": model})

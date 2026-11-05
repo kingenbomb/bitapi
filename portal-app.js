@@ -2,7 +2,7 @@
    页面组件在 static/portal-pages.js(用户侧)与 static/portal-admin.js(管理台)。 */
 (function () {
   "use strict";
-  const { createApp, ref, computed, watch, watchEffect, onMounted, onUnmounted, h } = Vue;
+  const { createApp, ref, computed, watch, watchEffect, onMounted, onUnmounted, nextTick, h } = Vue;
   const P = window.BitPortal;
   const { api, msg, token, setToken, clearToken, dark, theme, themeOverrides, ic,
     tag, POLICY, ANN_LEVEL, relTime, nf, fmt, narrow } = P;
@@ -16,17 +16,25 @@
     ["playground", "在线体验", "bolt", "挑个模型直接对话,按真实单价扣费"],
     ["keys", "API 密钥", "key", "创建、命名、禁用密钥,或一键导入 CC Switch"],
     ["usage", "使用记录", "doc", "每次请求的 token 明细与命中的定价档位"],
+    ["modelstatus", "模型状态", "pulse", "每个模型最近一次检测的结果与响应耗时"],
+    ["leaderboard", "Token 消耗榜", "bars", "查看 Token 用量排名与自己的位置"],
     ["wallet", "钱包", "wallet", "充值、兑换码与余额流水"],
     ["billing", "计费与套餐", "dollar", "买时长卡、看当前额度与生效单价"],
-    ["leaderboard", "Token 消耗榜", "bars", "累计与近期用量排名，用户名脱敏"],
     ["invite", "邀请返佣", "gift", "返佣码、返佣入账与绑定规则"],
+    ["share", "共享 Key", "share", "上传上游 API key,验活通过按把换余额奖励"],
     ["profile", "个人资料", "user", "昵称头像、登录绑定与密码"],
     ["admin", "管理控制台", "gear", "站点设置、分组、定价、用户与兑换码"],
   ];
   const COMP = { dashboard: PG.Dashboard, plaza: PG.Plaza,
     playground: PG.Playground, keys: PG.Keys,
-    usage: PG.Usage, wallet: PG.Wallet, billing: PG.Billing,
-    leaderboard: PG.Leaderboard, invite: PG.Invite, profile: PG.Profile, admin: ADM.Admin };
+    usage: PG.Usage, modelstatus: PG.ModelStatus,
+    leaderboard: PG.Leaderboard, wallet: PG.Wallet, billing: PG.Billing,
+    invite: PG.Invite, share: PG.Share, profile: PG.Profile, admin: ADM.Admin };
+  /* 侧栏分组:显式映射,不能按位置推 —— 在中间插一项会把后面全部挤错组。 */
+  const NAV_GROUPS = { dashboard: "工作台", plaza: "工作台", playground: "工作台",
+    keys: "接入与用量", usage: "接入与用量", modelstatus: "接入与用量",
+    leaderboard: "接入与用量", wallet: "账户", invite: "账户", share: "账户",
+    profile: "账户" };
   const META = {};
   NAV.forEach((n) => { META[n[0]] = { title: n[1], sub: n[3] }; });
   /* 登录页那几张:未登录才给看,已登录访问会被弹回概览。 */
@@ -43,25 +51,31 @@
     return { path: (i < 0 ? s : s.slice(0, i)) || "",
       query: new URLSearchParams(i < 0 ? "" : s.slice(i + 1)) };
   }
+  // 登录后的回跳仅接受站内已定义的体验/接入入口，不接受 URL。
+  const authDestination = (next) => ["playground", "keys"].includes(next) ? next : "dashboard";
 
-  /* 登录与注册共用一张居中卡:两页字段差一个邀请码,不值得拆成两套壳。 */
+  /* 注册入口按服务端策略展示；社区等级由服务端核验。 */
   const Auth = {
-    props: ["mode", "ref0"],
+    props: ["mode", "ref0", "next"],
     setup(props) {
-      const f = ref({ email: "", password: "", invite: props.ref0 || "", code: "", verification_code: "" });
-      watch(() => props.ref0, value => { f.value.invite = value || ""; });
-      const authQuery = computed(() => props.ref0 ? "?ref=" + encodeURIComponent(props.ref0) : "");
+      const f = ref({ email: "", password: "", invite: props.ref0 || "", code: "",
+        verification_code: "" });
       const busy = ref(false);
       const communityBusy = ref(false);
       const err = ref("");
       const reg = computed(() => props.mode === "register");
+      watch(() => props.ref0, (value) => { f.value.invite = value || ""; });
+      const registrationPolicy = ref(null);
+      onMounted(() => api("GET", "/registration-policy")
+        .then((r) => { registrationPolicy.value = r; })
+        .catch(() => { err.value = "注册方式加载失败，请刷新页面重试"; }));
       const mailBusy = ref(false), mailWait = ref(0), mailSent = ref("");
       let mailTimer;
       onUnmounted(() => clearInterval(mailTimer));
       watch(() => f.value.email, () => { f.value.verification_code = ""; mailSent.value = ""; });
       const sendRegistrationCode = () => {
         const email = (f.value.email || "").trim();
-        if (!email) return (err.value = "请先填写邮箱");
+        if (!email) return (err.value = "请先填写 QQ 或 Gmail 主邮箱");
         err.value = "";
         mailBusy.value = true;
         api("POST", "/register/code", { email })
@@ -84,7 +98,7 @@
       const finish = (r) => {
         setToken(r.token);
         if (reg.value) msg.success("注册成功,你的邀请码 " + r.aff_code);
-        location.hash = "#/dashboard";
+        location.hash = "#/" + authDestination(props.next);
       };
       const submit = () => {
         err.value = "";
@@ -132,18 +146,24 @@
           .then((r) => {
             if (!r.authorize_url) throw new Error("社区登录地址未配置");
             sessionStorage.setItem("bitapi_community_purpose", "login");
+            sessionStorage.setItem("bitapi_community_next", authDestination(props.next));
             location.assign(r.authorize_url);
           })
           .catch((e) => { err.value = e.message; })
           .then(() => { communityBusy.value = false; });
       };
 
-      return { f, busy, communityBusy, err, reg, submit, communityLogin, ic,
-        mailBusy, mailWait, mailSent, sendRegistrationCode, authQuery,
-        ticket, backToPassword };
+      return { f, busy, communityBusy, err, reg, registrationPolicy, submit, communityLogin, ic,
+        ticket, backToPassword, mailBusy, mailWait, mailSent, sendRegistrationCode,
+        nextQuery: computed(() => {
+          const params = new URLSearchParams();
+          if (["playground", "keys"].includes(props.next)) params.set("next", props.next);
+          if (props.ref0) params.set("ref", props.ref0);
+          return params.size ? "?" + params.toString() : "";
+        }) };
     },
     template: `
-<div class="authwrap">
+<div class="authwrap" :class="{'community-signup': reg && (!registrationPolicy || registrationPolicy.community_only)}">
   <n-card class="authcard" :bordered="false" size="large">
     <div class="authbrand">
       <img class="brandmark" src="/static/bit-api-icon-180.png" alt="">
@@ -169,6 +189,41 @@
         </div>
       </n-space>
     </n-form>
+    <section v-else-if="reg && (!registrationPolicy || registrationPolicy.community_only)"
+      class="signup-content" aria-label="社区账号注册">
+      <template v-if="registrationPolicy">
+        <h1 class="signup-title">欢迎加入 bit-api</h1>
+        <p class="signup-intro">用白嫖社区账号，开启你的 API 体验。</p>
+        <div class="signup-eligibility">
+          <div class="signup-level" :aria-label="'社区等级 Lv' + registrationPolicy.community_min_level + ' 及以上'">
+            <span>Lv</span>{{ registrationPolicy.community_min_level }}<span>+</span>
+          </div>
+          <div class="signup-eligibility-copy">
+            <strong>白嫖社区等级要求</strong>
+            <span>以社区个人主页显示为准</span>
+          </div>
+        </div>
+        <ul class="signup-benefits" aria-label="注册说明">
+          <li><span aria-hidden="true">✓</span>无需邀请码</li>
+          <li><span aria-hidden="true">✓</span>无需另设密码</li>
+        </ul>
+        <n-button class="signup-primary" type="primary" block :loading="communityBusy" @click="communityLogin">
+          使用社区账号注册<span v-if="!communityBusy" class="signup-arrow" aria-hidden="true">→</span>
+        </n-button>
+        <p class="signup-verification">授权后自动核验等级与已验证邮箱</p>
+        <p v-if="f.invite" class="signup-verification">已携带邀请关系，仅新账号注册成功时绑定。</p>
+        <div class="signup-community-link">
+          <span>还没达到 Lv{{ registrationPolicy.community_min_level }}？</span>
+          <a href="https://baipiao.org/bbs/" target="_blank" rel="noopener">前往白嫖社区<span aria-hidden="true"> ↗</span></a>
+        </div>
+      </template>
+      <div v-else-if="!err" class="signup-loading" role="status" aria-label="正在加载注册方式"><n-spin size="small"/></div>
+      <n-alert v-if="err" class="signup-error" role="alert" type="error" :bordered="false" :show-icon="false">{{ err }}</n-alert>
+      <div class="signup-login">
+        <div>已有账号？<a :href="'#/login' + nextQuery">去登录<span aria-hidden="true"> →</span></a></div>
+        <p>老用户登录不受影响</p>
+      </div>
+    </section>
     <n-form v-else :show-feedback="false" @submit.prevent="submit">
       <n-space vertical :size="14">
         <n-form-item label="邮箱" label-placement="top">
@@ -176,8 +231,11 @@
             :input-props="{type:'email',autocomplete:'username'}"/>
         </n-form-item>
         <template v-if="reg">
+          <n-text depth="3" style="font-size:12px">
+            仅支持数字@qq.com、Gmail 主邮箱。Gmail 请去掉点号，不支持 + 别名。
+          </n-text>
           <n-form-item label="邮件验证码" label-placement="top">
-            <n-input-group class="registration-code">
+            <n-input-group>
               <n-input v-model:value="f.verification_code" placeholder="6 位验证码" maxlength="6"
                 :input-props="{inputmode:'numeric',autocomplete:'one-time-code'}"/>
               <n-button :loading="mailBusy" :disabled="mailWait > 0" @click="sendRegistrationCode">
@@ -215,10 +273,10 @@
         </template>
         <div class="authswitch">
           <span v-if="reg">已有账号?
-            <n-button text type="primary" tag="a" :href="'#/login' + authQuery">去登录
+            <n-button text type="primary" tag="a" :href="'#/login' + nextQuery">去登录
             </n-button></span>
           <span v-else>还没有账号?
-            <n-button text type="primary" tag="a" :href="'#/register' + authQuery">注册
+            <n-button text type="primary" tag="a" :href="'#/register' + nextQuery">注册
             </n-button></span>
         </div>
         <!-- 模型广场不需要登录,登录页得给个入口,否则这页只有知道 hash 的人找得到。 -->
@@ -334,27 +392,16 @@
   const CommunityCallback = {
     setup() {
       const busy = ref(true);
-      const needsInvite = ref(false);
-      const invite = ref("");
-      const community = ref({});
       const err = ref("");
       const purpose = sessionStorage.getItem("bitapi_community_purpose") || "login";
 
-      const finish = (withInvite) => {
-        const code = invite.value.trim();
-        if (withInvite && !code) return (err.value = "请输入邀请码");
+      const finish = () => {
         busy.value = true;
         err.value = "";
-        const body = withInvite ? { invite_code: code } : {};
-        api("POST", "/community/auth/finish", body)
+        api("POST", "/community/auth/finish", {})
           .then((r) => {
-            if (r.needs_invite) {
-              community.value = r.community || {};
-              needsInvite.value = true;
-              return;
-            }
             if (r.token) setToken(r.token);
-            if (!r.token && purpose !== "bind")
+            if (!r.authenticated && !r.token && purpose !== "bind")
               throw new Error("社区登录未返回登录凭证");
             sessionStorage.removeItem("bitapi_community_purpose");
             if (r.bound || purpose === "bind") {
@@ -363,15 +410,24 @@
               location.hash = "#/profile";
               return;
             }
-            msg.success("社区账号登录成功");
-            location.hash = "#/dashboard";
+            msg.success(r.registered ? "注册成功，欢迎使用 bit-api" : "社区账号登录成功");
+            const next = authDestination(sessionStorage.getItem("bitapi_community_next"));
+            sessionStorage.removeItem("bitapi_community_next");
+            location.hash = "#/" + next;
           })
           .catch((e) => { err.value = e.message; })
           .then(() => { busy.value = false; });
       };
 
-      onMounted(() => finish(false));
-      return { busy, needsInvite, invite, community, err, purpose, finish };
+      onMounted(() => {
+        const error = parseHash(location.hash).query.get("error");
+        if (error) {
+          err.value = error === "access_denied" ? "你已取消社区授权，可以返回后重新登录。"
+            : "社区授权未完成，请返回后重试。";
+          busy.value = false;
+        } else finish();
+      });
+      return { busy, err, purpose };
     },
     template: `
 <div class="authwrap">
@@ -383,29 +439,11 @@
         <div class="authsub">{{ purpose === 'bind' ? '绑定社区账号' : '社区账号登录' }}</div>
       </div>
     </div>
-    <div v-if="busy && !needsInvite" style="padding:30px 0;text-align:center">
+    <div v-if="busy" style="padding:30px 0;text-align:center">
       <n-spin size="small"/>
       <n-text depth="3" style="display:block;margin-top:12px;font-size:12.5px">
         正在确认社区身份…</n-text>
     </div>
-    <n-space v-else-if="needsInvite" vertical :size="14">
-      <n-alert type="success" :bordered="false" :show-icon="false">
-        已验证社区账号
-        <b>{{ community.name || community.username || '社区用户' }}</b>
-        <span v-if="community.username"> (@{{ community.username }})</span>
-      </n-alert>
-      <n-text depth="3" style="font-size:12.5px">
-        首次使用社区账号创建 bit-api 账号需要邀请码。
-      </n-text>
-      <n-form-item label="邀请码" :show-feedback="false">
-        <n-input v-model:value="invite" placeholder="请输入邀请码"
-          @keyup.enter="finish(true)"/>
-      </n-form-item>
-      <n-alert v-if="err" type="error" :bordered="false" :show-icon="false"
-        style="font-size:12.5px">{{ err }}</n-alert>
-      <n-button type="primary" block :loading="busy" @click="finish(true)">
-        完成注册并登录</n-button>
-    </n-space>
     <n-space v-else vertical :size="14">
       <n-alert type="error" :bordered="false" :show-icon="false">
         {{ err || '社区授权未完成,请重新发起。' }}</n-alert>
@@ -501,9 +539,10 @@
 <n-popover trigger="hover" placement="bottom-end" content-class="flushpop"
   :show-arrow="false">
   <template #trigger>
-    <n-button size="small" secondary round @click="go('wallet')">
+    <n-button class="console-balance-trigger" size="small" secondary round @click="go('wallet')"
+      :aria-label="'钱包，可用余额 $' + fmt(b.balance)">
       <template #icon><Ic name="wallet" :size="15"/></template>
-      <span :style="{fontFamily:'var(--mono)',fontWeight:650}">
+      <span class="console-wallet-value">
         \${{ fmt(b.balance) }}</span>
     </n-button>
   </template>
@@ -558,8 +597,7 @@
       const worst = computed(() => rows.value.reduce(
         (a, x) => (a && a.pct >= x.pct ? a : x), null));
       const lv = (p) => (p >= 90 ? "error" : p >= 70 ? "warning" : "success");
-      const dot = (p) => ({ error: "#b91c1c", warning: "#a17a10",
-        success: "#15803d" }[lv(p)]);
+      const dot = (p) => P.sem(lv(p));
       return { b, rows, show, worst, unitText, lv, dot, nf,
         go: (p) => ctx.emit("nav", p) };
     },
@@ -590,9 +628,9 @@
         :show-indicator="false" :border-radius="99" :status="lv(r.pct)"/>
     </div>
     <div class="crrow crtop">
-      <span class="crk">分组 · RPM</span>
+      <span class="crk">分组 · 并发上限</span>
       <span class="crv">{{ b.group || '—' }}
-        {{ b.rpm_limit ? '· ' + nf(b.rpm_limit) : '' }}</span>
+        {{ b.concurrency_limit ? '· ' + nf(b.concurrency_limit) : '' }}</span>
     </div>
     <n-button size="tiny" block style="margin-top:11px"
       @click="go('billing')">查看套餐</n-button>
@@ -626,9 +664,71 @@
 </n-modal>`,
   };
 
+  const ConsoleSidebar = {
+    components: { Ic: P.Ic },
+    props: ["options", "active", "collapsed", "admin", "canManage", "authed"],
+    emits: ["nav"],
+    setup(props) {
+      const navRoot = ref(null), markerY = ref(null), copied = ref(false), copying = ref(false);
+      let resize, resetCopy = 0, disposed = false;
+      const placeMarker = () => {
+        const nav = navRoot.value, selected = nav?.querySelector(".n-menu-item-content--selected");
+        markerY.value = selected ? selected.getBoundingClientRect().top - nav.getBoundingClientRect().top +
+          (selected.getBoundingClientRect().height - 16) / 2 : null;
+      };
+      onMounted(() => {
+        resize = new ResizeObserver(placeMarker);
+        resize.observe(navRoot.value);
+        placeMarker();
+      });
+      watch(() => [props.active, props.collapsed, props.options], () => nextTick(placeMarker));
+      const copyEndpoint = async () => {
+        if (copying.value) return;
+        copying.value = true;
+        const ok = await P.copy("https://ai.baipiao.co/", "API 端点已复制");
+        if (disposed) return;
+        copying.value = false;
+        if (!ok) return;
+        clearTimeout(resetCopy);
+        copied.value = true;
+        resetCopy = setTimeout(() => { copied.value = false; }, 1800);
+      };
+      onUnmounted(() => { disposed = true; resize?.disconnect(); clearTimeout(resetCopy); });
+      return { navRoot, markerY, copied, copying, copyEndpoint };
+    },
+    template: `
+<div class="console-sidebar" :class="{'is-collapsed': collapsed}">
+  <a class="brand" href="/" aria-label="bit-api 首页">
+    <img class="brandmark" src="/static/bit-api-icon-180.png" alt="">
+    <span v-if="!collapsed">bit-api<span class="console-brand-dot">.</span></span>
+  </a>
+  <div v-if="!collapsed" class="console-workspace-switch" aria-label="切换工作区">
+    <button type="button" :class="{active: !admin}" @click="$emit('nav', authed ? 'dashboard' : 'plaza')">
+      <Ic name="grid" :size="15"/>控制台</button>
+    <button v-if="canManage" type="button" :class="{active: admin}" @click="$emit('nav', 'admin')">
+      <Ic name="gear" :size="15"/>管理后台</button>
+  </div>
+  <nav ref="navRoot" class="console-navigation" aria-label="主导航">
+    <span v-if="markerY !== null" class="console-nav-marker" aria-hidden="true"
+      :style="{transform: 'translateY(' + markerY + 'px)'}"></span>
+    <n-menu :value="active" :options="options" :collapsed="collapsed"
+      :collapsed-width="76" :collapsed-icon-size="20" :indent="16" @update:value="$emit('nav', $event)"/>
+  </nav>
+  <div v-if="!collapsed" class="console-sidebar-foot">
+    <span class="console-eyebrow">ONE API. MORE POSSIBILITIES.</span>
+    <p>连接模型，专注创造。</p>
+    <button type="button" class="console-endpoint-copy" :class="{'is-copied': copied}" @click="copyEndpoint"
+      :disabled="copying" :aria-label="copied ? 'API 端点已复制' : '复制 API 端点 https://ai.baipiao.co/'">
+      <span>ai.baipiao.co</span><span class="console-copy-symbol" :key="copied"><Ic :name="copied ? 'check' : 'copy'" :size="15"/></span>
+    </button>
+  </div>
+</div>`,
+  };
+
   const App = {
     components: { Auth, Recover, CommunityCallback, Ic: P.Ic, Avatar: P.Avatar,
-      Bell: Bell, Balance: Balance, QuotaMini: QuotaMini, AnnPopup: AnnPopup },
+      Bell: Bell, Balance: Balance, QuotaMini: QuotaMini, AnnPopup: AnnPopup,
+      ConsoleSidebar: ConsoleSidebar },
 
     setup() {
       const route = ref(parseHash(location.hash));
@@ -640,17 +740,10 @@
       const popup = ref(null);
       const shown = new Set();   // 本会话已弹过的公告 id,不入队第二次
       const collapsed = ref(localStorage.getItem("bitapi_sider") === "1");
-      /* 窄屏(手机)把侧栏改成盖在内容上的抽屉。has-sider 的侧栏是占位的:234px
-         压在 390px 的屏上只剩 150 多给正文,页面会被挤成每行两三个字,选择器还会
-         溢出到屏幕外 —— 整个控制台原先一条 media query 都没有。
-         narrow 来自 portal-shared.js(与 portal.html 那条 media query 同一个
-         断点);抽屉开合用独立的 ref,不写进 bitapi_sider:手机上开一次不该改掉
-         桌面端记住的偏好。 */
+      /* 手机用带焦点约束的抽屉；不覆盖桌面侧栏的折叠偏好。
+         narrow 与 portal-console.css 的断点一致。 */
       const drawer = ref(false);
       watch(narrow, (v) => { if (v) drawer.value = false; });  // 转窄屏先收起
-      /* 侧栏的收起态在两种形态下读不同的源:窄屏看抽屉,宽屏看记住的偏好。 */
-      const siderCollapsed = computed(
-        () => (narrow.value ? !drawer.value : collapsed.value));
       const setSider = (shut) => {
         if (narrow.value) drawer.value = !shut;
         else collapsed.value = shut;
@@ -683,7 +776,24 @@
       const path = computed(() => route.value.path);
       const isAuth = computed(() => !!AUTHONLY[path.value] || !!AUTHFLOW[path.value]);
       const page = computed(() => COMP[path.value] || null);
-      const meta = computed(() => META[path.value] || { title: "", sub: "" });
+      const canManage = computed(() => !!me.value && me.value.role === "admin");
+      const adminTab = computed(() => {
+        const key = route.value.query.get("tab") || localStorage.getItem("bitapi_admin_tab");
+        return P.ADMIN_NAV.some((n) => n.key === key) ? key : "stats";
+      });
+      watch([path, adminTab], ([currentPath, tab]) => {
+        if (currentPath === "admin") localStorage.setItem("bitapi_admin_tab", tab);
+      }, { immediate: true });
+      const isAdmin = computed(() => path.value === "admin" && canManage.value);
+      const activeNav = computed(() => isAdmin.value ? "admin?tab=" + adminTab.value : path.value);
+      const pageProps = computed(() => path.value === "admin" ? { selectedTab: adminTab.value } : {});
+      const meta = computed(() => {
+        if (isAdmin.value) {
+          const n = P.ADMIN_NAV.find((item) => item.key === adminTab.value);
+          return { title: n.label, sub: n.description, group: n.group };
+        }
+        return META[path.value] || { title: "", sub: "" };
+      });
       /* 菜单已对普通用户隐藏管理台,但手打 #/admin 也得挡住,
          否则页面会连打一串 403 只显示「加载失败」。角色未知时先不判。 */
       const denied = computed(() => path.value === "admin" && !!me.value &&
@@ -749,11 +859,45 @@
 
       /* 未登录只留 OPEN 里那几页:其余点进去都会被守卫弹回登录,
          摆在菜单里等于给一排死链。 */
-      const navOptions = computed(() => NAV
-        .filter((n) => (authed.value || OPEN[n[0]]) &&
-          (n[0] !== "admin" || (me.value && me.value.role === "admin")))
-        .map((n) => ({ key: n[0], label: n[1],
-          icon: () => ic(n[2], 18, undefined, 1.8) })));
+      const navOptions = computed(() => {
+        const entries = isAdmin.value ? P.ADMIN_NAV.map((n) => ({
+          key: "admin?tab=" + n.key, label: n.label, icon: n.icon, group: n.group,
+        })) : NAV.filter((n) => n[0] !== "admin" && (authed.value || OPEN[n[0]]))
+          .map((n, i) => ({ key: n[0], label: n[1], icon: n[2],
+            group: NAV_GROUPS[n[0]] || (i < 3 ? "工作台" : i < 6 ? "接入与用量" : "账户") }));
+        const groups = [];
+        entries.forEach((n) => {
+          let group = groups.find((g) => g.label === n.group);
+          if (!group) { group = { type: "group", key: n.group, label: n.group, children: [] }; groups.push(group); }
+          group.children.push({ key: n.key, label: n.label, icon: () => ic(n.icon, 18, undefined, 1.8) });
+        });
+        return groups;
+      });
+      const finder = ref(false), finderQuery = ref("");
+      const finderItems = computed(() => {
+        const pages = NAV.filter((n) => n[0] !== "admin" && (authed.value || OPEN[n[0]]))
+          .map((n) => ({ key: n[0], label: n[1], icon: n[2], description: n[3], group: "控制台" }));
+        if (canManage.value) pages.push(...P.ADMIN_NAV.map((n) => Object.assign({}, n, {
+          key: "admin?tab=" + n.key, group: "管理后台 · " + n.group,
+        })));
+        const q = finderQuery.value.trim().toLowerCase();
+        return pages.filter((n) => !q || (n.label + n.key + n.description).toLowerCase().includes(q));
+      });
+      const nav = (v) => { drawer.value = false; finder.value = false; location.hash = "#/" + v; };
+      const openFinder = () => { finderQuery.value = ""; finder.value = true; };
+      const onShortcut = (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k" && !isAuth.value) {
+          e.preventDefault(); openFinder();
+        }
+      };
+      window.addEventListener("keydown", onShortcut);
+      onUnmounted(() => {
+        window.removeEventListener("keydown", onShortcut);
+        window.removeEventListener("hashchange", guard);
+        window.removeEventListener("bitapi:me-changed", loadMe);
+        window.removeEventListener("bitapi:balance-changed", loadMe);
+        window.removeEventListener("bitapi:announcements-changed", loadAnn);
+      });
 
       const logout = () => {
         clearToken();
@@ -827,14 +971,15 @@
       loadAnn();
 
       return { route, path, isAuth, page, meta, me, bill, anns, annUnread,
-        popup, collapsed, dark, authed, narrow, drawer, siderCollapsed, setSider,
+        popup, collapsed, dark, authed, narrow, drawer, setSider,
         theme, themeOverrides, navOptions, logout, POLICY, denied, loadAnn,
-        markRead, closePopup,
+        markRead, closePopup, canManage, isAdmin, adminTab, activeNav, pageProps,
+        finder, finderQuery, finderItems, openFinder,
         shortName, initial, avatar, roleText, showBalance, userMenu, onUserMenu,
         fmt: P.fmt, ic: ic,
         zhCN: naive.zhCN, dateZhCN: naive.dateZhCN,
         /* 窄屏点导航后要把抽屉收掉,否则它盖着刚跳过去的页面。 */
-        nav: (v) => { drawer.value = false; location.hash = "#/" + v; } };
+        nav: nav };
     },
     template: `
 <n-config-provider :theme="theme" :theme-overrides="themeOverrides"
@@ -846,42 +991,41 @@
        邮箱框和上一步的报错会原地留下来。 -->
   <Recover v-else-if="path === 'forgot' || path === 'reset'" :key="path" :mode="path"
     :token="route.query.get('token') || ''"/>
-  <Auth v-else :mode="path" :ref0="route.query.get('ref') || ''"/>
+  <Auth v-else :mode="path" :ref0="route.query.get('ref') || ''" :next="route.query.get('next') || ''"/>
 </template>
-<n-layout v-else has-sider position="absolute">
-  <!-- 窄屏:transform 模式 + collapsed-width 0 + absolute,侧栏滑出视野而不占位,
-       盖在正文上当抽屉;宽屏保持原来的 width 模式(收起还留 64px 图标条)。 -->
-  <n-layout-sider bordered :collapse-mode="narrow ? 'transform' : 'width'"
-    :collapsed-width="narrow ? 0 : 64" :width="234"
-    :collapsed="siderCollapsed" :show-trigger="!narrow"
-    :position="narrow ? 'absolute' : 'static'"
-    :native-scrollbar="false" :style="narrow ? 'z-index:3' : ''"
+<n-layout v-else class="console-shell" has-sider position="absolute">
+  <!-- 桌面保留折叠图标栏；手机以独立抽屉呈现同一套导航。 -->
+  <n-layout-sider v-if="!narrow" class="console-sider" bordered collapse-mode="width"
+    :collapsed-width="76" :width="248" :collapsed="collapsed" show-trigger
+    :native-scrollbar="false"
     @collapse="setSider(true)" @expand="setSider(false)">
-    <div class="brand">
-      <img class="brandmark" src="/static/bit-api-icon-180.png" alt="">
-      <span v-if="!siderCollapsed">bit-api</span>
-    </div>
-    <n-menu :value="path" :options="navOptions" :collapsed="siderCollapsed"
-      :collapsed-width="64" :collapsed-icon-size="20" :indent="20"
-      @update:value="nav"/>
+    <ConsoleSidebar :options="navOptions" :active="activeNav" :collapsed="collapsed"
+      :admin="isAdmin" :can-manage="canManage" :authed="authed" @nav="nav"/>
   </n-layout-sider>
-  <!-- 抽屉展开时点旁边收起。手机上没有「点空白关掉」会很难受。 -->
-  <div v-if="narrow && drawer" class="sidermask" @click="setSider(true)"></div>
+  <!-- 抽屉负责焦点约束、Esc/遮罩关闭与关闭后归还焦点。 -->
+  <n-drawer v-if="narrow" v-model:show="drawer" placement="left" :width="288">
+    <n-drawer-content title="导航" closable body-content-style="padding:0">
+      <ConsoleSidebar :options="navOptions" :active="activeNav" :collapsed="false"
+        :admin="isAdmin" :can-manage="canManage" :authed="authed" @nav="nav"/>
+    </n-drawer-content>
+  </n-drawer>
 
-  <n-layout-content :native-scrollbar="false"
-    :content-style="narrow ? 'padding:14px 13px 44px' : 'padding:24px 30px 60px'">
-    <div class="pagehead">
+  <n-layout-content class="console-main" :native-scrollbar="false">
+    <header class="console-topbar">
       <div class="headleft">
         <n-button v-if="narrow" class="hamb" quaternary circle size="small"
           aria-label="打开导航" @click="setSider(false)">
           <Ic name="menu" :size="19"/>
         </n-button>
-        <div class="headtitle">
-          <h2>{{ meta.title }}</h2>
-          <p class="sub">{{ meta.sub }}</p>
+        <div class="console-breadcrumb" aria-label="当前位置">
+          <span>{{ isAdmin ? '管理后台' : '控制台' }}</span><Ic name="chevronRight" :size="13"/>
+          <strong>{{ meta.title }}</strong>
         </div>
       </div>
       <n-space class="headright" align="center" :size="10">
+        <button class="console-search-trigger" type="button" aria-label="搜索页面" @click="openFinder">
+          <Ic name="search" :size="17"/><span>快速前往</span><kbd>⌘ / Ctrl K</kbd>
+        </button>
         <!-- 顶栏右侧顺序:铃铛 → 主题 → 额度 → 余额 → 账号。
              铃铛在最左、余额紧挨账号,与参考图一致。
              未登录时铃铛与账号入口都没有意义(公告要登录才拉、账号菜单里
@@ -901,14 +1045,14 @@
         <Balance v-if="showBalance" :bill="bill" @nav="nav"/>
         <n-dropdown v-if="authed" trigger="click" :options="userMenu"
           placement="bottom-end" @select="onUserMenu">
-          <div class="usertrig">
+          <button type="button" class="usertrig" aria-label="账户菜单">
             <Avatar :src="avatar" :text="initial" :size="28"/>
             <div v-if="me" class="uinfo">
               <div class="uname">{{ shortName }}</div>
               <div class="urole">{{ roleText }}</div>
             </div>
             <Ic name="chevronDown" :size="14"/>
-          </div>
+          </button>
         </n-dropdown>
         <n-space v-else :size="7" align="center">
           <n-button size="small" quaternary @click="nav('login')">登录</n-button>
@@ -916,19 +1060,43 @@
             注册</n-button>
         </n-space>
       </n-space>
-    </div>
+    </header>
+    <main class="console-content">
+      <div v-if="!isAdmin" class="console-page-heading">
+        <div class="console-eyebrow">{{ meta.group || (path === 'dashboard' ? '你的工作台' : 'BIT-API CONSOLE') }}</div>
+        <h1><PageTitle :text="meta.title" :key="path"/></h1><p>{{ meta.sub }}</p>
+      </div>
     <n-result v-if="denied" status="403" title="没有权限"
       description="管理控制台仅管理员可见。">
       <template #footer><n-button @click="nav('dashboard')">返回概览
       </n-button></template>
     </n-result>
-    <component v-else :is="page" :key="path"/>
+    <div v-else class="console-route-frame" :key="path">
+      <component :is="page" v-bind="pageProps"/>
+    </div>
+    </main>
   </n-layout-content>
+  <n-modal v-model:show="finder" preset="card" title="快速前往" class="console-finder"
+    style="width:min(600px,calc(100vw - 28px))" :bordered="false" :auto-focus="true">
+    <n-input v-model:value="finderQuery" placeholder="搜索页面名称或功能…" clearable
+      aria-label="搜索控制台页面" @keydown.enter="finderItems.length && nav(finderItems[0].key)">
+      <template #prefix><Ic name="search" :size="18"/></template>
+    </n-input>
+    <div class="console-finder-results">
+      <button v-for="item in finderItems" :key="item.key" type="button" class="console-finder-item" @click="nav(item.key)">
+        <Ic :name="item.icon" :size="19"/><span><strong>{{ item.label }}</strong><small>{{ item.group }}</small></span>
+        <Ic name="chevronRight" :size="16"/>
+      </button>
+      <n-empty v-if="!finderItems.length" description="没有匹配的页面" style="padding:28px"/>
+    </div>
+    <div class="console-finder-note">Enter 前往首项 · Tab 选择页面 · Esc 关闭</div>
+  </n-modal>
   <AnnPopup v-if="popup" :item="popup" @close="closePopup"/>
 </n-layout>
 </n-config-provider>`,
   };
 
-  createApp(App).use(naive).mount("#app");
+  createApp(App).use(naive).component("MetricValue", P.MetricValue)
+    .component("PageTitle", P.PageTitle).mount("#app");
 
 })();

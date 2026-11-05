@@ -30,6 +30,7 @@ _DB = None
 
 # 管理台可配的键 → 环境变量兜底值的来源(config 属性名)
 ENV_SOURCE = {
+    "community_min_level": "COMMUNITY_MIN_LEVEL",
     "payment_providers": "PAYMENT_PROVIDERS",
     "min_topup": "MIN_TOPUP",
     "site_url": "SITE_URL",
@@ -37,6 +38,9 @@ ENV_SOURCE = {
     "epay_pid": "EPAY_PID",
     "epay_key": "EPAY_KEY",
     "epay_usd_rate": "EPAY_USD_RATE",
+    "baipiao_pid": "BAIPIAO_PID",
+    "baipiao_key": "BAIPIAO_KEY",
+    "mao_per_usd": "MAO_PER_USD",
     "disabled_channels": "DISABLED_CHANNELS",
     "channel_routing": "CHANNEL_ROUTING",
     "checkin_min": "CHECKIN_MIN",
@@ -60,6 +64,9 @@ SMTP_SECURITY_MODES = ("ssl", "starttls", "none")
 RATE_MIN, RATE_MAX = 1.0, 50.0
 TOPUP_MIN, TOPUP_MAX = 0.5, 10000.0
 CHECKIN_MIN_ALLOWED, CHECKIN_MAX_ALLOWED = 0.0001, 100.0
+# 单把共享 key 的奖励上限。不是「是正数就行」—— 把 2 写成 20000 会在一夜之间
+# 把余额发穿,而每一笔看上去都合法。给一个明显不合理的天花板拦手滑。
+SHARE_AMOUNT_MAX = 1000.0
 
 
 def bind(db):
@@ -128,6 +135,14 @@ def names(key):
 
 # ---- 具体项(调用方只用这些,不直接碰 config) ----
 
+def community_min_level(*, stored=_MISSING):
+    """注册门槛。建号事务可传入同一连接读到的值，避免另开读库或提交事务。"""
+    value = _raw("community_min_level") if stored is _MISSING else stored
+    if value is _MISSING:
+        value = config.COMMUNITY_MIN_LEVEL
+    return validate("community_min_level", value)
+
+
 def payment_providers():
     return names("payment_providers")
 
@@ -154,6 +169,18 @@ def epay_key():
 
 def epay_usd_rate():
     return number("epay_usd_rate")
+
+
+def baipiao_pid():
+    return text("baipiao_pid")
+
+
+def baipiao_key():
+    return text("baipiao_key")
+
+
+def mao_per_usd():
+    return number("mao_per_usd")
 
 
 def disabled_channels():
@@ -193,6 +220,22 @@ def invite_rewards(*, stored=_MISSING):
     if value is _MISSING:
         value = invite_reward_defaults()
     return validate("invite_rewards", value)
+
+
+def share_reward_defaults():
+    """共享 Key 奖励的环境变量默认值(未配置时关闭)。"""
+    return {"enabled": bool(config.SHARE_REWARD_ENABLED),
+            "amount": float(config.SHARE_REWARD_AMOUNT),
+            "channels": list(config.SHARE_REWARD_CHANNELS),
+            "max_per_user": int(config.SHARE_REWARD_MAX_PER_USER)}
+
+
+def share_rewards(*, stored=_MISSING):
+    """共享 Key 奖励规则 {enabled, amount, channels, max_per_user}。"""
+    value = _raw("share_rewards") if stored is _MISSING else stored
+    if value is _MISSING:
+        value = share_reward_defaults()
+    return validate("share_rewards", value)
 
 
 def smtp_host():
@@ -249,6 +292,11 @@ def _check_url(label, value, allow_loopback):
 
 def validate(key, value, known_providers=(), known_channels=()):
     """返回规范化后的值;不合法抛 SettingError。写库之前必须过这里。"""
+    if key == "community_min_level":
+        if type(value) is not int or not 0 <= value <= 6:
+            raise SettingError("社区最低注册等级需是 0~6 的整数")
+        return value
+
     if key == "payment_providers":
         vals = value if isinstance(value, list) else [
             x.strip() for x in str(value or "").split(",")]
@@ -308,6 +356,34 @@ def validate(key, value, known_providers=(), known_channels=()):
             raise SettingError("开启邀请奖励前，请设置大于 0 的每人奖励")
         return {"enabled": value["enabled"], "amount": amount, "max_invitees": limit}
 
+    if key == "share_rewards":
+        if not isinstance(value, dict) or set(value) != {
+                "enabled", "amount", "channels", "max_per_user"}:
+            raise SettingError("共享 Key 设置需包含 enabled、amount、channels、max_per_user")
+        if not isinstance(value["enabled"], bool):
+            raise SettingError("共享 Key 开关必须是布尔值")
+        amount = _as_finite(value["amount"], "每把 key 奖励")
+        if isinstance(value["amount"], bool) or amount < 0 or round(amount, 4) != amount:
+            raise SettingError("每把 key 奖励须为非负金额，最多四位小数")
+        if amount > SHARE_AMOUNT_MAX:
+            raise SettingError(f"每把 key 奖励不能超过 {SHARE_AMOUNT_MAX:g} 美元")
+        chans = value["channels"]
+        if isinstance(chans, str):
+            chans = [x.strip() for x in chans.split(",")]
+        if not isinstance(chans, (list, tuple)):
+            raise SettingError("允许共享的渠道需是列表")
+        chans = sorted({str(c).strip() for c in chans if str(c).strip()})
+        for c in chans:
+            if known_channels and c not in known_channels:
+                raise SettingError(f"未知渠道: {c}(可选:{'/'.join(known_channels)})")
+        limit = value["max_per_user"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise SettingError("每人奖励上限须为非负整数，0 表示不限")
+        if value["enabled"] and amount <= 0:
+            raise SettingError("开启共享奖励前，请设置大于 0 的每把奖励")
+        return {"enabled": value["enabled"], "amount": amount,
+                "channels": chans, "max_per_user": limit}
+
     if key == "min_topup":
         f = _as_finite(value, "单笔最低充值")
         if not (TOPUP_MIN <= f <= TOPUP_MAX):
@@ -322,6 +398,12 @@ def validate(key, value, known_providers=(), known_channels=()):
             raise SettingError(
                 f"{label}需在 {CHECKIN_MIN_ALLOWED:g}~{CHECKIN_MAX_ALLOWED:g} 美元之间")
         return round(f, 4)
+
+    if key == "mao_per_usd":
+        f = _as_finite(value, "每美元所需毛数")
+        if not (0.01 <= f <= 10000) or round(f, 4) != f:
+            raise SettingError("每美元所需毛数须在 0.01~10000 之间，最多四位小数")
+        return f
 
     if key == "epay_usd_rate":
         f = _as_finite(value, "汇率")
@@ -342,7 +424,7 @@ def validate(key, value, known_providers=(), known_channels=()):
         _check_url(label, s, allow_loopback=(key == "site_url"))
         return s
 
-    if key in ("epay_pid", "epay_key"):
+    if key in ("epay_pid", "epay_key", "baipiao_pid", "baipiao_key"):
         return str(value or "").strip()
 
     if key == "smtp_port":

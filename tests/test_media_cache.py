@@ -39,7 +39,7 @@ class StoreReadTest(unittest.TestCase):
 
             def __exit__(self, *a):
                 return False
-        return mock.patch("urllib.request.urlopen", return_value=_Resp())
+        return mock.patch.object(media_cache._OPENER, "open", return_value=_Resp())
 
     def test_fetch_stores_and_serves_by_token(self):
         with self._fake_download():

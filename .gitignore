@@ -28,3 +28,20 @@ media/
 
 # 库备份(core/backup.py 产物,与库同级的 backups/)
 backups/
+
+# OpenRouter 自动注册产物(含 API key 明文,绝不入仓)
+data/or_*.txt
+data/or_*.out
+data/or_*.err
+
+# TinyFish 自动注册产物(含 API key 明文,绝不入仓)
+data/tf_*.txt
+data/tf_*.log
+
+# 运行时产物与一次性脚本日志(不参与入库)
+_start_local.cmd
+_feed.*
+_srv.*
+data/galaxy_mothers.txt
+data/tf_*.out
+data/tf_*.err

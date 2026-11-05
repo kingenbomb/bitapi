@@ -18,6 +18,15 @@ USER_DB = UserDB(config.DB_PATH)
 PRICING = Pricing(USER_DB, catalog=Catalog(), cache_ttl=config.PRICING_CACHE_TTL)
 BILLING = Billing(USER_DB, pricing=PRICING)
 
+# 额外持有 db 引用的模块由上层(routers)登记回调。这里不能直接 import routers ——
+# core 层不该反向依赖路由层,而且 routers.portal_shared 自己就 import 本模块。
+_BINDERS = []
+
+
+def register_binder(fn):
+    """登记一个 bind(db) 回调,rebind() 时一并调用。"""
+    _BINDERS.append(fn)
+
 
 def rebind(db):
     """把所有自己存了一份 db 引用的东西指向同一个实例。
@@ -26,12 +35,15 @@ def rebind(db):
     「写进去了但读不到」—— 测试里换隔离库时最容易踩,而且不报错、只是行为不对。
     PRICING 是第三处:它在构造时收下 USER_DB,重指模块级 USER_DB 不会带上它,
     结果定价读的还是上一个库(测试里就是开发机的真库),写进去的价读不到。
+    路由层还有几处(portal_shared / portal_admin)通过 register_binder 挂进来。
     再加这类模块时改这里一处。
     """
     credit_mod.bind(db)
     site_settings.bind(db)
     PRICING.db = db
     PRICING.invalidate()
+    for fn in _BINDERS:
+        fn(db)
 
 
 rebind(USER_DB)
@@ -49,7 +61,7 @@ def ensure_default_group():
         rate_multiplier=1.0,
         supported_models=["*"],   # 默认放开全部模型,管理员可后续收紧
         billing_policy="free",    # 默认不计费,管理员改为 balance/quota
-        rpm_limit=20,
+        concurrency_limit=20,
         daily_limit=0, weekly_limit=0, monthly_limit=0,
         limit_unit="requests",
         is_default=1)

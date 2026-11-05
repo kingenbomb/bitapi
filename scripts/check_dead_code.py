@@ -4,13 +4,13 @@
 
 为什么门槛钉在 min-confidence 80 而不是 vulture 默认的 60:
 60 会把「未使用的函数/方法/属性」也报出来,在这个仓是 125 条,其中绝大多数是
-框架回调与接口实现 —— HTMLParser 的 handle_* 、socketio 的 on_* 、Adapter 子类
-覆盖的 refresh_interval 、被平铺导入触发的注册函数。要用 60 就得背
-一份 120 行的白名单,而一条报了没人修的门禁会让人整个不看输出,连带跳过其余全部。
+框架回调与接口实现 —— HTMLParser 的 handle_* 、Adapter 子类覆盖的 refresh_interval 、
+以及被平铺导入后由注册表调用的注册函数。要用 60 就得背一份 120 行的白名单,
+而一条报了没人修的门禁会让人整个不看输出,连带跳过其余全部。
 收窄规则集,不是调低门槛。
 
 80 这一档留下的是确定性判据:未使用的导入、未使用的变量、不可满足的条件。
-这个仓已经栽过一次 —— 「清掉三处未使用导入」是靠人工审出来的。
+这个仓已经栽过一次 —— 提交 35543b5 就是「清掉三处未使用导入」,人工审出来的。
 门槛要往 60 走的话,先建白名单文件并逐条写明为什么是误报,再改这里。
 
 参数刻意写死在脚本里,不放配置文件:配置文件躺着而没人调用,读数会从「缺」
@@ -25,7 +25,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TARGETS = ["adapters", "core", "payments", "plugins", "routers", "tests",
-           "config.py", "main.py", "server.py"]
+           "config.py", "main.py", "server.py", "scripts"]
 MIN_CONFIDENCE = "80"
 
 

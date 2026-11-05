@@ -12,7 +12,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ["BITAPI_DB"] = os.path.join(_TMP, "gen.db")
-os.environ["BITAPI_GROK_AUTH_DIR"] = os.path.join(_TMP, "nx")
 os.environ["BITAPI_JWT_SECRET"] = "gen-secret"
 os.environ["BITAPI_API_KEY"] = "sk-gen-master"
 os.environ["BITAPI_PRICING_URL"] = ""
@@ -35,7 +34,7 @@ _UPSTREAM = {"fail": False, "slow": 0.0}
 
 
 class StubGen(Adapter):
-    """假生图渠道:kind=generation,和真实的生图渠道一样没有 chat()。"""
+    """假生图渠道:kind=generation,和 clipfly/oreate 一样没有 chat()。"""
     name = "stubgen"
     capabilities = []
     kind = "generation"
@@ -57,7 +56,8 @@ class _Pool:
     """取号永远给得出;失败标记不落库(这里只关心网关行为)。"""
 
     def get_valid_account(self, _channel, _adapter):
-        return {"id": 1}
+        return {"id": 1, "channel": "stubgen", "identity": "stubgen@test",
+                "secret": {}, "meta": {}}
 
     def mark_failure(self, *_a, **_kw):
         pass
@@ -91,7 +91,7 @@ def setUpModule():
                        per_request_price=PRICE)
     pricing.invalidate()
     gid = _DB.create_group(name="gen-paid", supported_models=["*"],
-                           billing_policy="balance", rpm_limit=0)
+                           billing_policy="balance", concurrency_limit=0)
     _UID = _DB.create_user("gen@example.com", auth.hash_password("secret123"),
                            "GENAFF01", group_id=gid)
     _KEY = auth.generate_api_key()
@@ -245,7 +245,7 @@ class RehostTest(unittest.TestCase):
 class GenRateLimitTest(unittest.TestCase):
     """生成渠道的按渠道限速(护上游账号,不是护本站成本)。
 
-    生图渠道高频调用会被上游不可逆封号,所以 adapter 用 max_rpm 声明全站合计
+    designarena 高频调用会被上游不可逆封号,所以 adapter 用 max_rpm 声明全站合计
     上限,超了 429。这里断言的是「超限请求不碰账号、不扣钱」。
     """
 
@@ -280,7 +280,7 @@ class GenRateLimitTest(unittest.TestCase):
         self.assertEqual(self._balance(), before, "被限速的请求不该扣钱")
 
     def test_no_max_rpm_means_unlimited(self):
-        """没声明 max_rpm 的渠道行为不变,一律放行。"""
+        """没声明 max_rpm 的渠道(clipfly/oreate 等)行为不变,一律放行。"""
         with mock.patch.object(StubGen, "max_rpm", 0):
             server._gen_rpm.clear()
             for _ in range(5):

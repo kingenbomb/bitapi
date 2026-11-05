@@ -15,7 +15,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "bk.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 import config  # noqa: E402
 from core import backup as B  # noqa: E402
@@ -49,10 +48,17 @@ class BackupOnceTest(unittest.TestCase):
         self.assertTrue(os.path.exists(done["path"]))
         self.assertEqual(done["size"], os.path.getsize(done["path"]))
         rows = self._rows(done["path"])
-        self.assertEqual([r[0] for r in rows], ["k1", "k2"])
+        # 只断言「本测试写的那两行被带上了」,不断言整表内容 —— 库启动时会有
+        # 迁移写入自己的 setting(pool_usage_tracking_since 之类),
+        # 写死全表会让以后每加一条迁移都误红。
+        got = {r[0]: r[1] for r in rows}
+        self.assertIn("k1", got)
+        self.assertIn("k2", got)
+        self.assertEqual(got["k1"], '"v1"')
         # 备份是独立文件:之后改原库不影响它
         self.db.set_setting("k1", "changed")
-        self.assertEqual(self._rows(done["path"])[0][1], '"v1"')
+        after = {r[0]: r[1] for r in self._rows(done["path"])}
+        self.assertEqual(after["k1"], '"v1"')
 
     def test_no_tmp_left_behind_and_name_has_prefix(self):
         done = B.backup_once(self.db_path, self.dest, keep=7)
@@ -87,6 +93,33 @@ class BackupOnceTest(unittest.TestCase):
         self.assertEqual(len(left), 3)
         self.assertEqual(left[0]["path"], r["path"])   # 最新的在最前
         self.assertTrue(os.path.exists(stranger))       # 别人的文件不碰
+
+    def test_prune_also_removes_wal_sidecars(self):
+        """轮转删掉备份时,它的 -shm/-wal 也要一起删;目录里没有对应 .db 的
+        孤立边车(历史遗留)同样要清,否则只增不减。"""
+        os.makedirs(self.dest)
+        base = time.time() - 10 * 86400
+        paths = []
+        for k in range(4):
+            r = B.backup_once(self.db_path, self.dest, keep=0, now=base + k * 86400)
+            os.utime(r["path"], (base + k * 86400, base + k * 86400))
+            paths.append(r["path"])
+        # 最老那份被打开过,留下边车
+        for suffix in ("-shm", "-wal"):
+            with open(paths[0] + suffix, "w") as f:
+                f.write("x")
+        # 完全孤立的边车(对应 .db 早已被删)
+        for suffix in ("-shm", "-wal"):
+            with open(os.path.join(self.dest, "bitapi-20990101-000000.db" + suffix), "w") as f:
+                f.write("x")
+
+        r = B.backup_once(self.db_path, self.dest, keep=2)
+        self.assertEqual(len(B.list_backups(self.dest)), 2)
+        left = [n for n in os.listdir(self.dest)
+                if n.endswith("-shm") or n.endswith("-wal")]
+        self.assertEqual(left, [], left)
+        # 4 份旧 + 新 1 份 = 5 份,keep=2 删 3 份 + 2 个孤立边车 = 5 次删除
+        self.assertEqual(r["pruned"], 5)
 
     def test_status_reports_latest_and_next(self):
         st = B.status(self.dest, 3600, 7)

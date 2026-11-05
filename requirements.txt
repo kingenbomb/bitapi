@@ -6,8 +6,15 @@
 # 升版本请单独一个 commit,让 CI 单独为它作证。
 fastapi==0.139.0
 uvicorn==0.46.0
-python-socketio[client]==5.16.1
 PyJWT==2.10.1
 email-validator==2.1.1
 httpx==0.28.1
 tiktoken==0.12.0
+# /v1/audio/transcriptions 的 multipart 表单解析需要（Starlette request.form()）
+python-multipart==0.0.9
+websockets==13.1
+cryptography==50.0.2
+PyNaCl==1.6.2
+curl_cffi==0.17.0
+websocket-client==1.9.0
+Pillow==13.0.0

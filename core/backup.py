@@ -75,6 +75,42 @@ def latest_mtime(dest_dir):
     return items[0]["mtime"] if items else 0
 
 
+def remove_sidecars(path):
+    """删掉备份对应的 -shm/-wal。
+
+    backup API 写出来的是完整一致的库,不该带 WAL 边车文件;目录里出现它们,
+    说明有人把备份当库打开过(或旧版直接 cp 主文件)。留着既占空间,又会让
+    下次「按 mtime 找最新一份」把边车误当备份。"""
+    removed = 0
+    for suffix in ("-shm", "-wal"):
+        try:
+            os.remove(path + suffix)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def prune_orphan_sidecars(dest_dir):
+    """清理没有对应 .db 的孤立边车文件(源备份早已被轮转删掉的那些)。"""
+    if not os.path.isdir(dest_dir):
+        return 0
+    removed = 0
+    for name in os.listdir(dest_dir):
+        if not (name.startswith(PREFIX) and (name.endswith("-shm") or name.endswith("-wal"))):
+            continue
+        # "bitapi-20261027-024822.db-shm" -> "bitapi-20261027-024822.db"
+        owner = os.path.join(dest_dir, name[:-4])
+        if os.path.exists(owner):
+            continue
+        try:
+            os.remove(os.path.join(dest_dir, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def due(dest_dir, interval, now=None):
     """该不该备了:没有任何备份 → 该;最新一份的年龄 ≥ interval → 该。
     按「最新一份的 mtime」而不是进程内的上次时间判断:重启不会让周期归零,
@@ -123,6 +159,8 @@ def backup_once(db_path, dest_dir=None, keep=7, now=None):
                 pruned += 1
             except OSError:
                 pass
+            remove_sidecars(item["path"])
+    pruned += prune_orphan_sidecars(dest_dir)
     return {"path": final, "size": os.path.getsize(final), "pruned": pruned}
 
 

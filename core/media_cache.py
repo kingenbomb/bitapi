@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """生成图片/视频的自托管缓存 —— 把上游 CDN 的字节抓下来,放到自家域名下短期托管。
 
-为什么需要:生成型渠道返回的往往是**上游 CDN 的 URL**。这些链接对调用方并不可靠
-—— 有的带 referer 防盗链,直接 GET 会被拒;有的是内网地址或很快就过期。于是客户端
-拿到一个 200 + 一串打不开的链接,就是「能生成但没返回过来」。
+为什么需要:生成型渠道(clipfly / oreate)返回的是**上游 CDN 的 URL**。这些链接
+对调用方并不可靠 —— clipfly 的图带 referer 防盗链,直接 GET 会被拒;oreate 那条
+被改写成 https://ai.baipiao.co/media/... 而网关根本没有 /media 路由。于是客户端拿到
+一个 200 + 一串打不开的链接,就是「能生成但没返回过来」。
 
 做法:服务端一次性把字节下载到 <MEDIA_DIR>,用随机 token 命名,对外给
 <SITE_URL>/media/gen/<token>.<ext>。调用方从我们域名取,不再依赖上游是否防盗链。
@@ -15,9 +16,13 @@
 兜底清理,不依赖任何内存索引。
 """
 import os
+import http.client
+import ipaddress
 import secrets
+import socket
 import time
 import urllib.request
+from urllib.parse import urlsplit
 
 import config
 
@@ -36,6 +41,58 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
 _MAX_BYTES = 64 * 1024 * 1024   # 单文件上限:挡住上游异常返回一个超大响应打爆磁盘
+
+
+def _public_socket(host, port, timeout):
+    """解析一次并连接到已校验的数值地址，避免二次 DNS 查询产生重绑定。"""
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    for _family, _kind, _proto, _canon, sockaddr in addresses:
+        ip = ipaddress.ip_address(sockaddr[0])
+        ip = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped else ip
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError("media URL must resolve to public addresses")
+    error = None
+    for _family, _kind, _proto, _canon, sockaddr in addresses:
+        try:
+            return socket.create_connection((sockaddr[0], port), timeout)
+        except OSError as exc:
+            error = exc
+    raise error or ValueError("media host has no address")
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = _public_socket(self.host, self.port, self.timeout)
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        sock = _public_socket(self.host, self.port, self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PublicHTTPConnection, req)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PublicHTTPSConnection, req)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, _fp, code, msg, headers, _newurl):
+        # 签名由 urllib 的基类定死(它按位置调),用不到的参数加下划线标明是刻意不用
+        raise ValueError("media redirects are not allowed")
+
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+    _PublicHTTPHandler(), _PublicHTTPSHandler(), _NoRedirect())
 
 
 def resolve_dir():
@@ -59,13 +116,16 @@ def _ext_from(url, content_type):
 def fetch_and_store(url, referer=None, timeout=60):
     """下载 url 的字节,落盘,返回 (token_filename, abs_path, mime)。失败抛异常。
 
-    referer:上游若做 referer 防盗链,传对应站点根;None 则不带。
+    referer:上游若做 referer 防盗链(clipfly),传对应站点根;None 则不带。
     """
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("invalid media URL")
     headers = {"User-Agent": _UA, "Accept": "*/*"}
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         ct = r.headers.get("Content-Type", "")
         data = r.read(_MAX_BYTES + 1)
     if len(data) > _MAX_BYTES:
@@ -100,6 +160,11 @@ def read(name):
         return None
     path = os.path.join(resolve_dir(), name)
     if not os.path.isfile(path):
+        return None
+    try:
+        if time.time() - os.path.getmtime(path) > config.MEDIA_TTL:
+            return None
+    except OSError:
         return None
     return path, _MIME_BY_EXT.get(ext, "application/octet-stream")
 

@@ -19,7 +19,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "rt.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -162,6 +161,8 @@ class FailoverTest(unittest.TestCase):
         db_path = os.path.join(_TMP, "rt-ep.db")
         config.DB_PATH = db_path
         fresh = UserDB(db_path)
+        fresh.upsert_pricing(MODEL, billing_mode="free")
+        fresh.upsert_pricing("fo-*", billing_mode="free")
         billing = Billing(fresh, pricing=portal_state.PRICING)
         for mod in (portal_state, server, portal_routes):
             mod.USER_DB = fresh
@@ -169,7 +170,7 @@ class FailoverTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com",
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com",
                                                    "password": "secret123"})
         assert r.status_code == 200, r.text
         cls.admin_h = {"Authorization": "Bearer " + r.json()["token"]}
@@ -211,6 +212,25 @@ class FailoverTest(unittest.TestCase):
 
     # ---- 非流式 ----
 
+    def test_account_attribution_survives_streams_and_channel_failover(self):
+        self._acct("fo-a")
+        self._acct("fo-s")
+        self.a.fail = "raise"
+        aid = pool_state.DB.list_accounts(channel="fo-s")[0]["id"]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                # Restore the first route to exercise failed-account attribution
+                # on both protocols, not just an already-empty pool.
+                for row in pool_state.DB.list_accounts(channel="fo-a"):
+                    pool_state.DB.set_status(row["id"], "active")
+                response = self._chat(stream=stream)
+                self.assertEqual(response.status_code, 200, response.text)
+                log = self._last_log()
+                self.assertEqual(log["channel"], "fo-s")
+                self.assertEqual(log["upstream_account_id"], aid)
+        from core.account_runtime import busy_ids
+        self.assertEqual(busy_ids(), {})
+
     def test_nonstream_falls_through_empty_pool_to_next_channel(self):
         """a 没号 → 503 → s 没号 → b 有号 → b 作答,账记在 b。"""
         self._acct("fo-b")
@@ -235,13 +255,12 @@ class FailoverTest(unittest.TestCase):
         self.assertEqual(self._last_log()["channel"], "fo-b")
 
     def test_nonstream_all_fail_returns_last_error(self):
-        """全败时抛的是最后一个渠道的错:一把号抛一次就进冷却,下一轮取号落空是
-        503「fo-b 没号」;号多时才是 502「换遍号仍失败」。两种都得指向 fo-b。"""
+        """最后一个渠道的真实错误不被随后取号落空覆盖。"""
         self._acct("fo-b")
         self.b.fail = "raise"
         r = self._chat()
-        self.assertIn(r.status_code, (502, 503), r.text)
-        self.assertIn("fo-b", r.text)
+        self.assertEqual(r.status_code, 502, r.text)
+        self.assertEqual(r.json()["detail"], "fo-b exploded")
         self._acct("fo-b", 8)
         for a in pool_state.DB.list_accounts(channel="fo-b"):
             pool_state.DB.set_status(a["id"], "active")
@@ -255,6 +274,15 @@ class FailoverTest(unittest.TestCase):
         r = self._chat()
         self.assertEqual(r.json()["choices"][0]["message"]["content"], "hello@fo-a")
         self.assertEqual(self._last_log()["channel"], "fo-a")
+
+    def test_nonstream_upstream_status_preserves_channel_failover(self):
+        self._acct("fo-a")
+        self._acct("fo-b")
+        with mock.patch.object(self.a, "chat", side_effect=UpstreamError(401, "Unauthorized")):
+            response = self._chat()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["choices"][0]["message"]["content"], "hello@fo-b")
+        self.assertEqual(self._last_log()["channel"], "fo-b")
 
     def test_sse_channel_answers_nonstream_with_relabelled_model(self):
         self._acct("fo-s")
@@ -310,9 +338,40 @@ class FailoverTest(unittest.TestCase):
         r = self._chat(stream=True)
         self.assertEqual(r.status_code, 200)
         frames = self._frames(r.text)
-        self.assertIn("no available upstream", r.text)
+        content = "".join((f["choices"][0]["delta"] or {}).get("content", "") for f in frames)
+        self.assertEqual(content, "当前没有可调度的账号（模型：shared-model）")
+        self.assertNotIn("no available upstream", r.text)
         self.assertEqual(frames[-1]["choices"][0]["finish_reason"], "stop")
         self.assertTrue(r.text.rstrip().endswith("data: [DONE]"))
+        self.assertEqual(self._last_log()["pricing_snapshot"]["end_reason"], "error")
+        self.assertEqual(self._last_log()["actual_cost"], 0)
+
+    def test_upstream_errors_survive_account_and_channel_failover(self):
+        """两类 adapter 的原始状态与正文都不能被后续空池或兜底文案覆盖。"""
+        for stream in (False, True):
+            for name, adapter in (("fo-a", self.a), ("fo-s", self.s)):
+                for code, message in ((503, "Our servers are currently overloaded. " + "x" * 320 + " end"),
+                                      (429, "rate limit exceeded"), (401, "Unauthorized")):
+                    with self.subTest(stream=stream, channel=name, code=code):
+                        for ad in (self.a, self.b, self.s):
+                            pool_state.DB.delete_channel(ad.name)
+                        self._acct(name)
+                        method = "stream_chat" if stream and adapter.streaming else "chat"
+                        with mock.patch.object(adapter, method, side_effect=UpstreamError(code, message)):
+                            response = self._chat(stream=stream)
+                        expected = f"upstream {code}: {message}"
+                        if stream:
+                            self.assertEqual(response.status_code, 200, response.text)
+                            frames = self._frames(response.text)
+                            content = "".join((f["choices"][0]["delta"] or {}).get("content", "")
+                                              for f in frames if f.get("choices"))
+                            self.assertEqual(content, expected)
+                            self.assertEqual(self._last_log()["pricing_snapshot"]["end_reason"], "error")
+                            self.assertEqual(self._last_log()["actual_cost"], 0)
+                        else:
+                            self.assertEqual(response.status_code, code, response.text)
+                            self.assertEqual(response.json()["detail"], expected)
+                        self.assertNotIn("no available upstream", response.text)
 
     def test_stream_does_not_switch_after_partial_output(self):
         """a 出了字再断:流归 a,不去找 b 再拼一段。"""
@@ -340,11 +399,16 @@ class FailoverTest(unittest.TestCase):
         data = self.client.get("/v1/models", headers=self.h).json()["data"]
         mine = [m for m in data if m["id"] == MODEL]
         self.assertEqual(len(mine), 1)
-        self.assertEqual(mine[0]["owned_by"], "fo-a")
+        # 渠道是内部实现:owned_by 回中性品牌名,不能把渠道摊给客户端
+        self.assertEqual(mine[0]["owned_by"], "baipiao")
         plaza = self.client.get("/api/models", headers=self.admin_h).json()["data"]
         card = [c for c in plaza if c["model"] == MODEL][0]
-        self.assertEqual(card["channel"], "fo-a")
-        self.assertEqual(sorted(card["channels"]), ["fo-a", "fo-b", "fo-s"])
+        # 模型广场(用户侧)同样不得暴露渠道
+        self.assertNotIn("channel", card)
+        self.assertNotIn("channels", card)
+        # 同一模型挂多个渠道时广场只列一次(渠道归属改由管理端 /admin/channels
+        # 的 shared_models 看,用户侧不再暴露)
+        self.assertEqual(len([c for c in plaza if c["model"] == MODEL]), 1)
 
     def test_routing_endpoint_changes_order_and_persists(self):
         r = self.client.patch("/api/admin/channels/fo-b/routing", json={"priority": 99, "weight": 3},

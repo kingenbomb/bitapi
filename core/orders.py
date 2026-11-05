@@ -21,8 +21,10 @@
 迟到的合法回调**不设时间上界**:签名伪造不出来,能进来的就是用户真付了钱,
 所以 expired → paid 是允许的(tests/test_orders.py 的 test_expire_orders 锁了这条)。
 """
+import math
 import secrets
 import time
+from decimal import Decimal, InvalidOperation
 
 import config
 from core.hooks import emit
@@ -58,7 +60,7 @@ def create_order(db, user, amount, provider_name):
         amount = float(amount)
     except (TypeError, ValueError) as e:
         raise OrderError("INVALID_AMOUNT", "amount must be a number") from e
-    if amount <= 0:
+    if not math.isfinite(amount) or amount <= 0:
         raise OrderError("INVALID_AMOUNT", "amount must be positive")
     min_topup = S.min_topup()
     if amount < min_topup:
@@ -101,7 +103,37 @@ def create_order(db, user, amount, provider_name):
                              f" (check the exchange rate setting)")
         db.set_order_pay_amount_cny(otn, cny)
         order = db.get_order(oid)
+    if provider_name == "baipiao":
+        mao = pay_info.get("amount_mao")
+        merchant_id = pay_info.get("merchant_id")
+        if not isinstance(mao, int) or mao <= 0 or not merchant_id:
+            db.fail_order(otn)
+            raise OrderError("BAD_PAYABLE", "invalid Mao payment quote")
+        db.set_order_mao_quote(otn, mao, merchant_id)
+        order = db.get_order(oid)
     return order, pay_info
+
+
+def _mao_payment_matches(order, payment):
+    """回调、定时查单与人工查单共用同一笔冻结报价。"""
+    if order["provider"] != "baipiao":
+        return True
+    try:
+        amount = Decimal(str(payment.get("amount_mao")))
+        return (amount.is_finite() and order.get("pay_amount_mao") is not None
+                and amount == Decimal(str(order["pay_amount_mao"])) and amount > 0
+                and payment.get("pid") == order.get("pay_merchant_id")
+                and payment.get("out_trade_no") == order["out_trade_no"])
+    except InvalidOperation:
+        return False
+
+
+def settle_query(db, order, result):
+    if (order["provider"] not in S.payment_providers() or not result
+            or result.get("status") != "paid" or not _mao_payment_matches(order, result)):
+        return False
+    db.mark_order_paid(order["out_trade_no"], result.get("trade_no"), result.get("amount"))
+    return fulfil(db, order["out_trade_no"])
 
 
 def handle_notify(db, provider_name, headers, raw_body, params=None):
@@ -141,6 +173,9 @@ def handle_notify(db, provider_name, headers, raw_body, params=None):
         _reject("provider mismatch", provider_name, otn,
                 f"order.provider={order['provider']}")
         return False, "provider mismatch"
+    if not _mao_payment_matches(order, verified):
+        _reject("Mao quote mismatch", provider_name, otn)
+        return False, "amount or merchant mismatch"
     if order["status"] == "completed":
         return True, "already completed"
 
@@ -233,8 +268,7 @@ def poll_pending(db, limit=200):
                 print(f"[bitapi] 查单失败 {order['out_trade_no']}: {e}", flush=True)
                 continue
             if res and res.get("status") == "paid":
-                db.mark_order_paid(order["out_trade_no"])
-                if fulfil(db, order["out_trade_no"]):
+                if settle_query(db, order, res):
                     done += 1
                     print(f"[bitapi] 查单补到账 {order['out_trade_no']}", flush=True)
     return done

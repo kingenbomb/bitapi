@@ -67,8 +67,3 @@ def get_provider(name):
 
 def all_providers():
     return dict(_REGISTRY)
-
-
-def enabled_providers(names):
-    """按配置过滤出启用且已注册的渠道。"""
-    return [_REGISTRY[n] for n in names if n in _REGISTRY]

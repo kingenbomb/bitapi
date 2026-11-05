@@ -3,7 +3,7 @@
 #   proxy_buffering off      —— SSE 不缓冲。缓冲了流式就变成「等完再一次吐」,首字延迟 = 总时长
 #   proxy_read_timeout 600   —— 生图能到 300 秒、长思考几分钟;默认 60 秒会掐断正常请求
 #   X-Forwarded-For          —— 限速与密钥 IP 白名单读它。不传的话全站共享 127.0.0.1 一个桶,
-#                               一个人撞库全站登不上(BITAPI_TRUST_PROXY_HEADERS 默认开)
+#                               应用须显式设置 BITAPI_TRUST_PROXY_HEADERS=1，源站仅允许反代访问
 #   client_max_body_size     —— 带图的请求 base64 后轻松几 MB,默认 1m 会 413
 #   /pay/notify/             —— 支付回调必须能从公网打进来,别被别的规则挡掉
 server {
@@ -21,13 +21,19 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
 
     client_max_body_size 32m;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    # Vue 的本地模板编译器使用 eval；脚本来源仍限本站，禁止内联脚本。
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'" always;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection        "";
 

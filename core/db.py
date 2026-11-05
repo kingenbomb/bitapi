@@ -18,34 +18,40 @@ ST_EXHAUSTED = "exhausted"  # 余额耗尽
 ST_DEAD = "dead"            # 失效(登录失败/被封)
 ST_UNCHECKED = "unchecked"  # 新入库未验证
 
+# Account-management fields. Existing identities, credentials and health states
+# remain authoritative; migrations only add fields with the old behavior as default.
+ACCOUNT_COLUMNS = {
+    "name": "TEXT DEFAULT ''", "account_type": "TEXT DEFAULT ''",
+    "priority": "INTEGER DEFAULT 50", "concurrency": "INTEGER DEFAULT 0",
+    "rate_multiplier": "REAL DEFAULT 1", "group_ids": "TEXT DEFAULT '[]'",
+    "account_expires_at": "INTEGER DEFAULT 0", "auto_pause_on_expired": "INTEGER DEFAULT 1",
+    "temp_until": "INTEGER DEFAULT 0", "temp_reason": "TEXT DEFAULT ''",
+    "last_used_at": "INTEGER DEFAULT 0", "last_error": "TEXT DEFAULT ''",
+    "proxy_id": "INTEGER", "quota_limit": "REAL DEFAULT 0",
+    "quota_daily_limit": "REAL DEFAULT 0", "quota_weekly_limit": "REAL DEFAULT 0",
+    "quota_reset_at": "INTEGER DEFAULT 0", "quota_reset_log_id": "INTEGER DEFAULT 0",
+    "base_rpm": "INTEGER DEFAULT 0", "window_cost_limit": "REAL DEFAULT 0",
+    "upstream_until": "INTEGER DEFAULT 0", "upstream_reason": "TEXT DEFAULT ''",
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel     TEXT NOT NULL,              -- 来源渠道 (adapter 的 name)
+    channel     TEXT NOT NULL,              -- 来源渠道名
     identity    TEXT NOT NULL,              -- 唯一标识 (email 等)
     secret      TEXT,                       -- 凭证 json (password/vendor 等)
     token       TEXT,                       -- 缓存的 access token
     token_exp   INTEGER DEFAULT 0,          -- token 过期 unix 时间
     balance     REAL,                       -- 余额/额度
     status      TEXT DEFAULT 'unchecked',
-    schedulable INTEGER DEFAULT 1,          -- 0 = 站长手动摘出号池
     meta        TEXT,                       -- 额外信息 json
     created_at  INTEGER,
     updated_at  INTEGER,
-    last_check  INTEGER DEFAULT 0,          -- 最后一次巡检时间
-    last_used   INTEGER DEFAULT 0,          -- 最后一次真实发出请求的时间
+    last_check  INTEGER DEFAULT 0,
     UNIQUE(channel, identity)
 );
 CREATE INDEX IF NOT EXISTS idx_channel_status ON accounts(channel, status);
 """
-
-# 面板可用的排序键 → 真实列名。白名单而不是把参数拼进 SQL:排序键来自 query
-# string,拼进去就是一条注入口子。
-SORTABLE = {
-    "id": "id", "identity": "identity", "status": "status",
-    "balance": "balance", "last_check": "last_check", "last_used": "last_used",
-    "created_at": "created_at", "updated_at": "updated_at",
-}
 
 
 class ThreadConns:
@@ -114,6 +120,14 @@ class ThreadConns:
         with self._lock:
             return len(self._live)
 
+    def close_all(self):
+        """服务停止后关闭所有线程连接，最后一个连接负责 SQLite WAL 收尾。"""
+        with self._lock:
+            for conn in self._live.values():
+                conn.close()
+            self._live.clear()
+        self._local.conn = None
+
 
 class DB:
     def __init__(self, path):
@@ -124,18 +138,32 @@ class DB:
         ))
         with self._conn() as c:
             c.executescript(SCHEMA)
-            self._migrate(c)
-
-    def _migrate(self, c):
-        """轻量列迁移:老库补新增列(SQLite 的 ADD COLUMN 没有 IF NOT EXISTS)。
-
-        schedulable 默认 1 —— 老库里的号全都还在池子里,升级不该悄悄摘掉谁。
-        """
-        have = {r["name"] for r in c.execute("PRAGMA table_info(accounts)")}
-        for name, ddl in (("schedulable", "INTEGER DEFAULT 1"),
-                          ("last_used", "INTEGER DEFAULT 0")):
-            if name not in have:
-                c.execute(f"ALTER TABLE accounts ADD COLUMN {name} {ddl}")
+            existing = {r["name"] for r in c.execute("PRAGMA table_info(accounts)")}
+            for name, ddl in ACCOUNT_COLUMNS.items():
+                if name not in existing:
+                    c.execute(f"ALTER TABLE accounts ADD COLUMN {name} {ddl}")
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS pool_proxies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                    url TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS pool_test_plans (
+                    account_id INTEGER PRIMARY KEY, model TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                    next_run INTEGER NOT NULL, last_run INTEGER, last_result TEXT
+                );
+                CREATE TABLE IF NOT EXISTS pool_test_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL, model TEXT NOT NULL, result TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_pool_test_account ON pool_test_results(account_id,id);
+                CREATE TABLE IF NOT EXISTS gpt_actions (
+                    request_id TEXT PRIMARY KEY, account_id INTEGER NOT NULL,
+                    admin_id INTEGER NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, intent TEXT NOT NULL, result TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_gpt_actions_account ON gpt_actions(account_id,created_at);
+            """)
 
     def _conn(self):
         # 每线程一个连接(FastAPI 同步路由跑在线程池),线程结束后由 ThreadConns 关掉
@@ -169,6 +197,14 @@ class DB:
                  json.dumps(meta) if meta else None,
                  status, now, now))
             return cur.lastrowid
+
+    def insert_account(self, channel, identity, secret, meta, status=ST_UNCHECKED):
+        """Create only; a concurrent create must never overwrite credentials."""
+        now = int(time.time())
+        with self._conn() as c:
+            return c.execute(
+                "INSERT INTO accounts(channel,identity,secret,meta,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (channel, identity, json.dumps(secret), json.dumps(meta), status, now, now)).lastrowid
 
     def upsert_accounts_bulk(self, channel, items):
         """批量 upsert(一个事务)。items=[(identity, secret, meta, status, token_exp)]。
@@ -253,7 +289,7 @@ class DB:
         fields["updated_at"] = int(time.time())
         cols, vals = [], []
         for k, v in fields.items():
-            if k in ("secret", "meta") and not isinstance(v, str):
+            if k in ("secret", "meta", "group_ids") and not isinstance(v, str):
                 v = json.dumps(v)
             cols.append(f"{k}=?")
             vals.append(v)
@@ -284,7 +320,7 @@ class DB:
         if r is None:
             return None
         d = dict(r)
-        for k in ("secret", "meta"):
+        for k in ("secret", "meta", "group_ids"):
             if d.get(k):
                 try:
                     d[k] = json.loads(d[k])
@@ -302,50 +338,40 @@ class DB:
                 "SELECT * FROM accounts WHERE channel=? AND identity=?",
                 (channel, identity)).fetchone())
 
-    @staticmethod
-    def _filters(channel=None, status=None, q=None, schedulable=None, ids=None):
-        """面板筛选 → (WHERE 子句, 参数)。列表与计数共用一份,两处口径不会歪。
-
-        q 是关键词:identity 或 meta 里出现即可。面板上搜的是一个号,而号的关键
-        信息一半在 identity(email)、一半在 meta(套餐、订阅),只搜 identity 会让
-        「搜 k12 套餐」这类筛选落空。
-        """
-        where, args = ["1=1"], []
+    def list_accounts(self, channel=None, status=None, limit=1000, offset=0, q=None):
+        sql, args = "SELECT * FROM accounts WHERE 1=1", []
         if channel:
-            where.append("channel=?"); args.append(channel)
+            sql += " AND channel=?"; args.append(channel)
         if status:
-            where.append("status=?"); args.append(status)
-        if schedulable is not None:
-            where.append("schedulable=?"); args.append(1 if schedulable else 0)
-        if ids:
-            ids = [int(i) for i in ids]
-            where.append(f"id IN ({','.join('?' for _ in ids)})"); args += ids
+            sql += " AND status=?"; args.append(status)
         if q:
-            like = f"%{q}%"
-            where.append("(identity LIKE ? OR meta LIKE ?)"); args += [like, like]
-        return " AND ".join(where), args
-
-    def list_accounts(self, channel=None, status=None, limit=1000, offset=0,
-                      q=None, schedulable=None, sort=None, order="desc", ids=None):
-        where, args = self._filters(channel, status, q, schedulable, ids)
-        col = SORTABLE.get(sort or "")
-        if col:
-            direction = "ASC" if str(order).lower() == "asc" else "DESC"
-            # id 兜底排序:同值时没有稳定的第二排序键,翻页会重复或漏行
-            tail = f" ORDER BY {col} {direction}, id DESC"
-        else:
-            tail = " ORDER BY id"
-        q_ = f"SELECT * FROM accounts WHERE {where}{tail} LIMIT ? OFFSET ?"
+            sql += " AND identity LIKE ?"; args.append(f"%{q}%")
+        sql += " ORDER BY id LIMIT ? OFFSET ?"; args += [limit, offset]
         with self._conn() as c:
-            return [self._row(r) for r in
-                    c.execute(q_, [*args, limit, offset]).fetchall()]
+            return [self._row(r) for r in c.execute(sql, args).fetchall()]
 
-    def count_accounts(self, channel=None, status=None, q=None, schedulable=None,
-                       ids=None):
-        where, args = self._filters(channel, status, q, schedulable, ids)
+    def count_accounts(self, channel=None, status=None, q=None):
+        sql, args = "SELECT COUNT(*) n FROM accounts WHERE 1=1", []
+        if channel:
+            sql += " AND channel=?"; args.append(channel)
+        if status:
+            sql += " AND status=?"; args.append(status)
+        if q:
+            sql += " AND identity LIKE ?"; args.append(f"%{q}%")
         with self._conn() as c:
-            return c.execute(
-                f"SELECT COUNT(*) n FROM accounts WHERE {where}", args).fetchone()["n"]
+            return c.execute(sql, args).fetchone()["n"]
+
+    def count_by_status(self, channel=None, q=None):
+        """某渠道(可加 identity 搜索)下各状态的账号数,给筛选条用。"""
+        sql = "SELECT status, COUNT(*) n FROM accounts WHERE 1=1"
+        args = []
+        if channel:
+            sql += " AND channel=?"; args.append(channel)
+        if q:
+            sql += " AND identity LIKE ?"; args.append(f"%{q}%")
+        sql += " GROUP BY status"
+        with self._conn() as c:
+            return {r["status"]: r["n"] for r in c.execute(sql, args).fetchall()}
 
     def delete_channel(self, channel):
         """删除某渠道的全部账号(不分状态)。返回删除数。"""
@@ -360,94 +386,87 @@ class DB:
             return c.execute("DELETE FROM accounts WHERE channel=? AND identity=?",
                              (channel, identity)).rowcount
 
-    def pick_active(self, channel):
-        """挑一个可用账号(active,余额降序优先)。用于网关取号。
+    def list_shared(self, user_id=None, limit=200):
+        """用户共享进来的账号(meta.shared_by 有值),新→旧。
 
-        schedulable=0 的号在 SQL 这一层就排除掉:那是站长手动摘出号池的号,
-        网关、巡检、批量操作三条路都要认这一位,漏了任何一条都会出现
-        「面板上明明停用了,却还在被调用」。"""
+        走 SQLite 的 JSON1(json_extract)。万一运行环境的 SQLite 没编 JSON1,
+        退回「读一批再在 Python 里筛」—— 一个可选视图不该把接口整个打挂。
+        """
+        try:
+            sql = ("SELECT * FROM accounts "
+                   "WHERE json_extract(meta,'$.shared_by') IS NOT NULL")
+            args = []
+            if user_id is not None:
+                sql += " AND json_extract(meta,'$.shared_by')=?"
+                args.append(int(user_id))
+            sql += " ORDER BY id DESC LIMIT ?"
+            args.append(int(limit))
+            with self._conn() as c:
+                return [self._row(r) for r in c.execute(sql, args).fetchall()]
+        except sqlite3.OperationalError:
+            out = []
+            for row in self.list_accounts(limit=5000):
+                meta = row.get("meta") or {}
+                if not isinstance(meta, dict) or not meta.get("shared_by"):
+                    continue
+                if user_id is not None and int(meta["shared_by"]) != int(user_id):
+                    continue
+                out.append(row)
+                if len(out) >= limit:
+                    break
+            return out
+
+    def pick_active(self, channel, prefer=None, group_id=None, exclude=None, preferred_id=None, web_image=False):
+        """取一个可用账号(active,按余额降序),供轮换取号。
+
+        prefer: 可选的 SQL **布尔表达式**。adapter 用它把「更该先用」的号排到最前
+        —— 例如会员期内的号不消耗额度(余额恒 0),必须先吃流量,否则会被
+        余额降序的排序永远排到最后,等于没用上。
+        """
+        order = ("CASE WHEN %s THEN 0 ELSE 1 END, " % prefer) if prefer else ""
+        now = int(time.time())
+        where = ""
+        if web_image and channel != "gpt":
+            raise ValueError("Web image selection is only supported for GPT accounts")
+        status_filter = "status IN ('active','cooldown','exhausted','unchecked')" if web_image else "status=?"
+        args = [channel, *([] if web_image else [ST_ACTIVE]), now, now]
+        if group_id is not None:
+            where += " AND (json_array_length(group_ids)=0 OR ? IN (SELECT value FROM json_each(group_ids)))"
+            args.append(group_id)
+        if exclude:
+            where += " AND id NOT IN (" + ",".join("?" for _ in exclude) + ")"
+            args.extend(exclude)
         with self._conn() as c:
             r = c.execute(
-                "SELECT * FROM accounts WHERE channel=? AND status=? AND schedulable=1 "
-                "ORDER BY (balance IS NULL) ASC, balance DESC, last_check ASC LIMIT 1",
-                (channel, ST_ACTIVE)).fetchone()
+                "SELECT * FROM accounts WHERE channel=? AND " + status_filter + " "
+                # 管理台显式停用的号（meta.admin_paused）不参与取号：
+                # 只靠 status 翻不动它，因为巡检器会把"能用"的号放回 active。
+                "AND COALESCE(json_extract(meta,'$.admin_paused'),0)=0 "
+                "AND (auto_pause_on_expired=0 OR account_expires_at=0 OR account_expires_at>?) "
+                "AND temp_until<=? " + ("" if web_image else "AND upstream_until<=strftime('%s','now') ") + where +
+                " ORDER BY " + ("CASE WHEN id=" + str(int(preferred_id)) + " THEN 0 ELSE 1 END," if preferred_id else "") + "priority ASC, " + order +
+                "(balance IS NULL) ASC, balance DESC, last_check ASC LIMIT 1",
+                args).fetchone()
             return self._row(r)
 
-    def touch_used(self, acct_id):
-        """记一次「这个号真的发出去过请求」。面板的「最近使用」读它。
-
-        单独一条 UPDATE 而不是并进别的写:取号成功后并不总有别的字段要写,
-        而 last_check 是「什么时候被检查过」,和「什么时候被用过」是两件事 ——
-        混成一个字段的话,面板上就分不出「这号一直能用」和「这号一直没人用」。"""
+    def get_pool_proxy(self, proxy_id):
         with self._conn() as c:
-            c.execute("UPDATE accounts SET last_used=? WHERE id=?",
-                      (int(time.time()), acct_id))
-
-    # ---- 批量(面板选中多行后一次做完) ----
-
-    def set_schedulable(self, ids, on):
-        """批量摘出/放回号池。返回受影响的 id 列表。
-
-        只认传进来的 id:没有「按条件批量」这条路 —— 那等于给一个不带边界的写操作,
-        而面板上每次选中的是什么,操作的人自己看得见。"""
-        ids = [int(i) for i in (ids or [])]
-        if not ids:
-            return []
-        ph = ",".join("?" for _ in ids)
-        with self._conn() as c:
-            c.execute(f"UPDATE accounts SET schedulable=?, updated_at=? "
-                      f"WHERE id IN ({ph})",
-                      [1 if on else 0, int(time.time()), *ids])
-            return [r["id"] for r in c.execute(
-                f"SELECT id FROM accounts WHERE id IN ({ph})", ids).fetchall()]
-
-    def set_statuses(self, ids, status):
-        """批量改状态(面板的「重置状态」)。"""
-        ids = [int(i) for i in (ids or [])]
-        if not ids:
-            return 0
-        now = int(time.time())
-        ph = ",".join("?" for _ in ids)
-        with self._conn() as c:
-            return c.execute(
-                f"UPDATE accounts SET status=?, updated_at=?, last_check=? "
-                f"WHERE id IN ({ph})", [status, now, now, *ids]).rowcount
-
-    def delete_ids(self, ids):
-        """按主键批量删除。面板的「批量删除」用它 —— 单条那条入口按
-        (channel, identity) 定位,与面板选中行的 id 对不上。"""
-        ids = [int(i) for i in (ids or [])]
-        if not ids:
-            return 0
-        deleted = 0
-        with self._conn() as c:
-            for start in range(0, len(ids), 500):     # 分块避开 SQLite 参数上限
-                batch = ids[start:start + 500]
-                ph = ",".join("?" for _ in batch)
-                deleted += c.execute(
-                    f"DELETE FROM accounts WHERE id IN ({ph})", batch).rowcount
-        return deleted
+            r = c.execute("SELECT * FROM pool_proxies WHERE id=?", (proxy_id,)).fetchone()
+            return dict(r) if r else None
 
     def stats(self, channel=None):
-        """各渠道统计:总数/各状态数/余额合计/被摘出的号。
-
-        parked 单独出一档而不是并进某个状态:站长手动摘出的号状态照旧是 active
-        (它本身没坏),只是不参与取号 —— 面板上「可用 12」和「其中 3 个已摘出」
-        要能同时看见,否则摘出一个号之后账就对不上了。"""
-        q = ("SELECT channel, status, schedulable, COUNT(*) n, "
+        """各渠道统计:总数/各状态数/余额合计。"""
+        q = ("SELECT channel, status, COUNT(*) n, "
              "COALESCE(SUM(balance),0) bal FROM accounts ")
         args = []
         if channel:
             q += "WHERE channel=? "; args.append(channel)
-        q += "GROUP BY channel, status, schedulable"
+        q += "GROUP BY channel, status"
         out = {}
         with self._conn() as c:
             for r in c.execute(q, args):
-                ch = out.setdefault(r["channel"], {"total": 0, "balance": 0.0,
-                                                   "parked": 0, "by_status": {}})
-                ch["by_status"][r["status"]] = ch["by_status"].get(r["status"], 0) + r["n"]
+                ch = out.setdefault(r["channel"], {"total": 0, "balance": 0.0, "by_status": {}})
+                ch["by_status"][r["status"]] = r["n"]
                 ch["total"] += r["n"]
                 ch["balance"] += r["bal"] or 0
-                if not r["schedulable"]:
-                    ch["parked"] += r["n"]
         return out

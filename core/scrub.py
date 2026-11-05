@@ -11,8 +11,13 @@ import re
 import config
 
 # 上游品牌词(出现在模型自述里会暴露上游)。长词优先,大小写不敏感,整段删除。
-# 默认空:要抹谁由部署方用 BITAPI_SCRUB_TERMS 给(逗号分隔),这里不预设任何上游。
-DEFAULT_TERMS = []
+DEFAULT_TERMS = [
+    "KOGO OS", "KOGOOS", "kogo.ai", "KOGO",
+    "OreateAI", "oreateai.com", "Oreate",
+    "spoe.ai", "SPOE",
+    "Venice AI", "venice.ai", "VeniceAI",
+    "openrouter.ai", "OpenRouter",
+]
 
 
 def _build(terms):

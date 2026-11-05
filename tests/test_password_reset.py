@@ -19,7 +19,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "pw.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -40,14 +39,16 @@ class FakeSMTP:
     auth_fail = False
     last_init = None
 
-    def __init__(self, host, port, timeout=None):
+    def __init__(self, host, port, timeout=None, context=None):
         FakeSMTP.last_init = (host, port, timeout)
+        if context is not None:
+            assert context.check_hostname and context.verify_mode == 2
 
     def ehlo(self):
         pass
 
-    def starttls(self):
-        pass
+    def starttls(self, context=None):
+        assert context.check_hostname and context.verify_mode == 2
 
     def login(self, user, pw):
         if FakeSMTP.auth_fail:
@@ -79,7 +80,7 @@ class PasswordResetTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com",
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com",
                                                    "password": "secret123"})
         assert r.status_code == 200, r.text
         cls._seq = 0
@@ -97,10 +98,10 @@ class PasswordResetTest(unittest.TestCase):
         # 管理员会话每个用例重新登:改密会让旧会话作废,类级别缓存的 token 会被
         # 前面的用例弄死 —— 这正是被测特性,所以不能把它缓存在类上。
         self.admin_h = {"Authorization": "Bearer " + self._login(
-            "root@example.com", "secret123").json()["token"]}
+            "root@gmail.com", "secret123").json()["token"]}
         # 每个用例自己的用户,密码互不干扰
         type(self)._seq += 1
-        self.email = f"u{self._seq}@example.com"
+        self.email = f"u{self._seq}@gmail.com"
         r = self.client.post("/api/register", json={"email": self.email,
                                                     "password": "secret123"})
         self.assertEqual(r.status_code, 200, r.text)
@@ -112,8 +113,8 @@ class PasswordResetTest(unittest.TestCase):
 
     def _configure_smtp(self, security="ssl"):
         _db().set_setting("smtp_host", "smtp.example.com")
-        _db().set_setting("smtp_from", "no-reply@example.com")
-        _db().set_setting("smtp_user", "no-reply@example.com")
+        _db().set_setting("smtp_from", "no-reply@gmail.com")
+        _db().set_setting("smtp_user", "no-reply@gmail.com")
         _db().set_setting("smtp_pass", "pw")
         _db().set_setting("smtp_security", security)
         _db().set_setting("site_url", "https://ai.example.com")
@@ -162,7 +163,7 @@ class PasswordResetTest(unittest.TestCase):
 
     def test_unknown_email_returns_ok_without_sending(self):
         self._configure_smtp()
-        r = self._forgot("nobody@example.com")
+        r = self._forgot("nobody@gmail.com")
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(FakeSMTP.sent, [])
 
@@ -284,8 +285,7 @@ class PasswordResetTest(unittest.TestCase):
         tok = self._login(self.email, "secret123").json()["token"]
         h = {"Authorization": "Bearer " + tok}
         r = self.client.post("/api/email/bind", json={"email": self.email}, headers=h)
-        self.assertEqual(r.status_code, 200)
-        self.assertFalse(r.json()["sent"])
+        self.assertEqual(r.status_code, 503)
         self._configure_smtp(security="starttls")
         r = self.client.post("/api/email/bind", json={"email": self.email}, headers=h)
         self.assertEqual(r.status_code, 200, r.text)
@@ -298,22 +298,22 @@ class PasswordResetTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
 
     def test_admin_mail_test_endpoint(self):
-        r = self.client.post("/api/admin/mail/test", json={"to": "me@example.com"},
+        r = self.client.post("/api/admin/mail/test", json={"to": "me@gmail.com"},
                              headers=self.admin_h)
         self.assertEqual(r.status_code, 502)          # 未配置
         self._configure_smtp()
-        r = self.client.post("/api/admin/mail/test", json={"to": "me@example.com"},
+        r = self.client.post("/api/admin/mail/test", json={"to": "me@gmail.com"},
                              headers=self.admin_h)
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(FakeSMTP.sent[-1]["To"], "me@example.com")
+        self.assertEqual(FakeSMTP.sent[-1]["To"], "me@gmail.com")
         FakeSMTP.auth_fail = True
-        r = self.client.post("/api/admin/mail/test", json={"to": "me@example.com"},
+        r = self.client.post("/api/admin/mail/test", json={"to": "me@gmail.com"},
                              headers=self.admin_h)
         self.assertEqual(r.status_code, 502)
         self.assertIn("认证失败", r.json()["detail"])
         # 非管理员不能拿站点的 SMTP 当发信机
         tok = self._login(self.email, "secret123").json()["token"]
-        self.assertEqual(self.client.post("/api/admin/mail/test", json={"to": "x@example.com"},
+        self.assertEqual(self.client.post("/api/admin/mail/test", json={"to": "x@gmail.com"},
                                           headers={"Authorization": "Bearer " + tok}).status_code, 403)
 
 

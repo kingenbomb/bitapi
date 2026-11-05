@@ -11,7 +11,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ["BITAPI_DB"] = os.path.join(_TMP, "stateless.db")
-os.environ["BITAPI_GROK_AUTH_DIR"] = os.path.join(_TMP, "nx")
 os.environ["BITAPI_PRICING_URL"] = ""
 os.environ["BITAPI_PRICING_PATH"] = os.path.join(_TMP, "nopricing.json")
 
@@ -96,7 +95,9 @@ class StatelessKeysGatewayTest(unittest.TestCase):
         """豁免不包括凭据失效:401 说的就是这把 key 本身不行。"""
         _, status = self._run_sync(ADAPTERS["flaky_stateless"],
                                    _Upstream(401, "unauthorized"))
-        self.assertEqual(status, dbmod.ST_EXHAUSTED)
+        # 401 = 凭据被拒,先移出轮换;但实测上游 401 会瞬时恢复,
+        # 所以落 cooldown(巡检可验活放回),不判死也不当额度耗尽。
+        self.assertEqual(status, dbmod.ST_COOLDOWN)
 
     def test_channel_without_declaration_still_cools_down(self):
         _, status = self._run_sync(ADAPTERS["flaky_penalized"],

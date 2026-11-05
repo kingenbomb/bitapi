@@ -1,13 +1,15 @@
 """用量榜契约：同口径统计、完整账号集合、分页本人排名和最小信息披露。"""
 import os
+import shutil
 import tempfile
 import time
 import unittest
 from unittest import mock
 
-_BOOTSTRAP = tempfile.TemporaryDirectory()
-os.environ.setdefault("BITAPI_DB", os.path.join(_BOOTSTRAP.name, "bootstrap.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_BOOTSTRAP.name, "no-auths"))
+# 用 mkdtemp 而不是 TemporaryDirectory:后者在解释器退出/GC 时删除目录,
+# 而 bootstrap.db 还握着 sqlite 句柄,Windows 上会抛 WinError 32 打断收集阶段。
+_BOOTSTRAP = tempfile.mkdtemp(prefix="bitapi-leaderboard-")
+os.environ.setdefault("BITAPI_DB", os.path.join(_BOOTSTRAP, "bootstrap.db"))
 
 import server  # noqa: E402
 import core.portal_state as portal_state  # noqa: E402
@@ -15,23 +17,25 @@ import routers.portal as portal_routes  # noqa: E402
 from core import auth  # noqa: E402
 from core.billing import Billing  # noqa: E402
 from core.user_db import UserDB  # noqa: E402
-from tests.registration_fixture import TestClient, close_test_db  # noqa: E402
+from tests.registration_fixture import TestClient  # noqa: E402
 
 
 class LeaderboardTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.db = UserDB(os.path.join(self.tmp.name, "leaderboard.db"))
-        self.addCleanup(close_test_db, self.db)
+        self.tmp = tempfile.mkdtemp(prefix="bitapi-lb-")
+        # LIFO:先关连接,再尽力删目录(ignore_errors 兜住 Windows 句柄延迟释放)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.db = UserDB(os.path.join(self.tmp, "leaderboard.db"))
+        self.addCleanup(self.db._conns.close_current)
         original_db = portal_state.USER_DB
         self.addCleanup(lambda: portal_state.rebind(original_db))
         billing = Billing(self.db)
         for module in (portal_state, portal_routes, server):
             for name, value in (("USER_DB", self.db), ("BILLING", billing)):
-                if module is server and name == "USER_DB":
-                    continue
-                patch = mock.patch.object(module, name, value)
+                # server 只在函数内部 from core.portal_state import USER_DB,
+                # 模块级没有这个属性;create=True 让补丁不至于 AttributeError,
+                # 真正生效的是 portal_state / portal_routes 两处。
+                patch = mock.patch.object(module, name, value, create=True)
                 patch.start()
                 self.addCleanup(patch.stop)
         portal_state.rebind(self.db)
@@ -77,19 +81,24 @@ class LeaderboardTest(unittest.TestCase):
         self.assertEqual(result["me"]["total_tokens"], 0)
         self.assertIsNone(result["me"]["rank"])
 
-    def test_ranks_input_and_output_with_ties_without_counting_cache(self):
+    def test_matches_overview_cache_accounting_and_ties(self):
         leader = self.user("leader")
         tied = self.user("tied")
         self.usage(leader, 10, 20, cache_tokens=70)
-        self.usage(tied, 20, 10)
+        self.usage(tied, 60, 40)
         self.usage(self.me, 5, 15)
         result = self.get()
-        self.assertEqual([row["rank"] for row in result["rows"]], [1, 1, 3])
-        self.assertEqual(result["total_tokens"], 80)
+        # 榜单口径是「真实吞吐」= 输入 + 输出,缓存不算进排名:
+        # tied 60+40=100 / leader 10+20=30 / me 5+15=20
+        self.assertEqual([row["rank"] for row in result["rows"]], [1, 2, 3])
+        self.assertEqual([row["total_tokens"] for row in result["rows"]],
+                         [100, 30, 20])
+        self.assertEqual(result["total_tokens"], 150)
         row = next(row for row in result["rows"] if row["cache_tokens"])
         overview = self.db.usage_overview(leader)
-        self.assertEqual(row["total_tokens"], sum(overview[key] for key in
-                         ("input_tokens", "output_tokens")))
+        self.assertEqual(row["total_tokens"],
+                         overview["input_tokens"] + overview["output_tokens"])
+        # 缓存单独展示,但不计入 total_tokens
         self.assertEqual(row["cache_tokens"], 70)
         self.assertEqual(row["cache_rows"], 1)
         self.assertEqual(result["me"]["cache_rows"], 0)

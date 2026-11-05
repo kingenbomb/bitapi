@@ -1,15 +1,16 @@
 """有效注册 → 邀请关系 → 奖励流水；资金上限、回滚和既有登录边界。"""
 import concurrent.futures
 import os
+import shutil
 import tempfile
 import time
 import unittest
 import urllib.parse
 from unittest import mock
 
-_BOOTSTRAP = tempfile.TemporaryDirectory()
-os.environ.setdefault("BITAPI_DB", os.path.join(_BOOTSTRAP.name, "bootstrap.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_BOOTSTRAP.name, "no-auths"))
+# mkdtemp 而非 TemporaryDirectory:后者 GC 时删目录会撞上未释放的 sqlite 句柄
+_BOOTSTRAP = tempfile.mkdtemp(prefix="bitapi-invite-")
+os.environ.setdefault("BITAPI_DB", os.path.join(_BOOTSTRAP, "bootstrap.db"))
 
 import config  # noqa: E402
 import server  # noqa: E402
@@ -18,15 +19,16 @@ import routers.portal as routes  # noqa: E402
 from core import auth, community_auth, hooks, site_settings  # noqa: E402
 from core.billing import Billing  # noqa: E402
 from core.user_db import UserDB  # noqa: E402
-from tests.registration_fixture import TestClient, close_test_db, verified_registration_body  # noqa: E402
+from tests.registration_fixture import TestClient, verified_registration_body  # noqa: E402
 
 
 class InviteRewardsTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.db = UserDB(os.path.join(self.tmp.name, "invite.db"))
-        self.addCleanup(close_test_db, self.db)
+        self.tmp = tempfile.mkdtemp(prefix="bitapi-invite-")
+        # LIFO:先关连接,再尽力删目录
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.db = UserDB(os.path.join(self.tmp, "invite.db"))
+        self.addCleanup(self.db._conns.close_current)
         original_db = state.USER_DB
         self.addCleanup(lambda: state.rebind(original_db))
         handlers = {key: list(value) for key, value in hooks._HANDLERS.items()}
@@ -36,16 +38,15 @@ class InviteRewardsTest(unittest.TestCase):
         self.addCleanup(restore_handlers)
         for module in (state, routes, server):
             for key, value in (("USER_DB", self.db), ("BILLING", Billing(self.db))):
-                if module is server and key == "USER_DB":
-                    continue
-                patch = mock.patch.object(module, key, value)
+                # server 只在函数内部 import USER_DB,模块级无此属性
+                patch = mock.patch.object(module, key, value, create=True)
                 patch.start(); self.addCleanup(patch.stop)
         state.rebind(self.db)
         for key, value in {
-            "SIGNUP_BONUS": 0, "PLUGINS": [],
-            "COMMUNITY_BASE_URL": "https://baipiao.org/bbs",
+            "COMMUNITY_REGISTRATION_ONLY": False, "SIGNUP_BONUS": 0, "PLUGINS": [],
+            "COMMUNITY_MIN_LEVEL": 3, "COMMUNITY_BASE_URL": "https://baipiao.org/bbs",
             "COMMUNITY_CLIENT_ID": "test-client", "COMMUNITY_CLIENT_SECRET": "test-secret",
-            "COMMUNITY_REDIRECT_URI": "http://testserver/oauth/community",
+            "COMMUNITY_REDIRECT_URI": "http://testserver/oauth/baipiao-community",
         }.items():
             patch = mock.patch.object(config, key, value)
             patch.start(); self.addCleanup(patch.stop)
@@ -74,12 +75,9 @@ class InviteRewardsTest(unittest.TestCase):
                    "active": True, "community_level": level}
         with mock.patch.object(community_auth, "exchange_code", return_value="test-token"), \
                 mock.patch.object(community_auth, "get_userinfo", return_value=profile):
-            callback = client.get("/oauth/community", params={
+            callback = client.get("/oauth/baipiao-community", params={
                 "state": query["state"][0], "code": "test-code"}, follow_redirects=False)
         self.assertEqual(callback.status_code, 302, callback.text)
-        self.community_code = "INVITE-" + subject
-        if not self.db.get_code(self.community_code):
-            self.db.create_code(self.community_code, 0, type="invitation")
         return self.db.get_ready_community_flow(community_auth.digest(client.cookies.get(community_auth.FLOW_COOKIE)))
 
     def test_admin_policy_validation_persistence_and_permissions(self):
@@ -163,27 +161,38 @@ class InviteRewardsTest(unittest.TestCase):
     def test_community_referral_survives_oauth_and_login_cannot_rebind(self):
         self.policy()
         self.community_ready()
-        finished = self.client.post("/api/community/auth/finish", json={"invite_code": self.community_code})
+        finished = self.client.post("/api/community/auth/finish", json={})
         self.assertEqual(finished.status_code, 200, finished.text)
         user = self.db.get_user_by_email("community42@gmail.com")
         self.assertEqual(user["inviter_id"], self.admin)
-        self.assertEqual(self.client.post("/api/community/auth/finish", json={"invite_code": self.community_code}).status_code, 400)
+        self.assertEqual(self.client.post("/api/community/auth/finish", json={}).status_code, 400)
         other = self.db.create_user("other@gmail.com", "unused", "OTHER")
         self.community_ready(ref="OTHER")
-        login = self.client.post("/api/community/auth/finish", json={"invite_code": self.community_code})
+        login = self.client.post("/api/community/auth/finish", json={})
         self.assertEqual(login.status_code, 200, login.text)
         self.assertFalse(login.json()["registered"])
         self.assertEqual(self.db.get_user(user["id"])["inviter_id"], self.admin)
         self.assertAlmostEqual(self.db.get_user(self.admin)["balance"], 0.25)
         self.assertEqual(self.db.get_user(other)["balance"], 0)
 
+    def test_community_level_invalid_referral_and_disabled_inviter_do_not_pay(self):
+        self.policy()
+        for subject, ref, level, status in (("51", "OWNER", 2, 403), ("52", "NO-SUCH-CODE", 3, 400)):
+            self.community_ready(subject, ref, level)
+            response = self.client.post("/api/community/auth/finish", json={})
+            self.assertEqual(response.status_code, status, response.text)
+            self.assertIsNone(self.db.get_user_by_email("community" + subject + "@gmail.com"))
+        self.community_ready("53")
+        self.db.update_user(self.admin, status="disabled")
+        self.assertEqual(self.client.post("/api/community/auth/finish", json={}).status_code, 400)
+        self.assertEqual(self.db.get_user(self.admin)["balance"], 0)
 
     def test_failed_registration_rolls_back_reward_and_account_together(self):
         self.policy()
         flow = self.community_ready()
         with mock.patch.object(self.db, "_consume_community_flow", side_effect=RuntimeError("test failure")):
             with self.assertRaisesRegex(RuntimeError, "test failure"):
-                self.db.register_community_user(flow["id"], self.community_code, "NEW-AFF")
+                self.db.register_community_user(flow["id"], "NEW-AFF")
         self.assertIsNone(self.db.get_user_by_email("community42@gmail.com"))
         self.assertEqual(self.db.get_user(self.admin)["balance"], 0)
         self.assertEqual(self.db.invite_reward_count(self.admin), 0)
@@ -202,7 +211,7 @@ class InviteRewardsTest(unittest.TestCase):
         with self.db._conn() as conn:
             conn.execute("ALTER TABLE community_auth_flows DROP COLUMN referral_code")
         migrated = UserDB(self.db.path)
-        self.addCleanup(close_test_db, migrated)
+        self.addCleanup(migrated._conns.close_current)
         with migrated._conn() as conn:
             row = conn.execute("SELECT * FROM community_auth_flows WHERE id=?", (flow_id,)).fetchone()
             self.assertIsNone(row["referral_code"])
@@ -232,18 +241,3 @@ class InviteRewardsTest(unittest.TestCase):
                              self.db.get_user(self.admin)["balance"]))
         self.assertEqual(self.register("notification").status_code, 200)
         self.assertEqual(seen, [(True, 0.25)])
-
-    def test_community_gate_invalid_referral_and_disabled_inviter_do_not_pay(self):
-        self.policy()
-        self.community_ready("50")
-        without_invite = self.client.post("/api/community/auth/finish", json={})
-        self.assertTrue(without_invite.json()["needs_invite"])
-        self.assertEqual(self.db.get_user(self.admin)["balance"], 0)
-        for subject, ref in (("51", "NO-SUCH-CODE"), ("52", "OWNER")):
-            self.community_ready(subject, ref)
-            if subject == "52":
-                self.db.update_user(self.admin, status="disabled")
-            response = self.client.post("/api/community/auth/finish", json={"invite_code": self.community_code})
-            self.assertEqual(response.status_code, 403, response.text)
-            self.assertIsNone(self.db.get_user_by_email("community" + subject + "@gmail.com"))
-        self.assertEqual(self.db.get_user(self.admin)["balance"], 0)

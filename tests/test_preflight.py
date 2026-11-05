@@ -13,7 +13,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "pf.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -83,10 +82,10 @@ class AdminEndpointAuthTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com", "password": "secret123"})
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com", "password": "secret123"})
         cls.admin_tok = r.json()["token"]
         cls.admin_id = r.json()["user_id"]
-        r = cls.client.post("/api/register", json={"email": "u@example.com", "password": "secret123"})
+        r = cls.client.post("/api/register", json={"email": "u@gmail.com", "password": "secret123"})
         cls.user_tok = r.json()["token"]
 
     def _stats(self, tok):
@@ -96,6 +95,33 @@ class AdminEndpointAuthTest(unittest.TestCase):
         self.assertEqual(self._stats("adm-test"), 200)
         self.assertEqual(self._stats(self.admin_tok), 200)
 
+    def test_admin_key_coexists_with_proxy_basic_authorization(self):
+        headers = {"Authorization": "Basic cHJveHktYWRtaW46Zml4dHVyZQ==",
+                   "X-BitAPI-Admin-Key": "adm-test"}
+        self.assertEqual(self.client.get("/admin/stats", headers=headers).status_code, 200)
+        self.assertEqual(self.client.get("/admin/accounts", headers=headers).status_code, 200)
+        # 反代登录不能代替应用鉴权；缺少或错误的管理密钥仍然不能读数据。
+        for key in (None, "wrong-key", self.user_tok):
+            denied = {"Authorization": headers["Authorization"]}
+            if key:
+                denied["X-BitAPI-Admin-Key"] = key
+            self.assertEqual(self.client.get("/admin/stats", headers=denied).status_code, 401)
+
+    def test_all_pool_operations_accept_separate_admin_header(self):
+        spec = server.app.openapi()
+        paths = {"/admin/stats": ("get",), "/admin/accounts": ("get", "post"),
+                 "/admin/import-keys": ("post",), "/admin/scan": ("post",),
+                 "/admin/purge": ("post",), "/admin/channel/delete": ("post",),
+                 "/admin/account/delete": ("post",),
+                 "/admin/gpt/import": ("post",)}
+        for path, methods in paths.items():
+            for method in methods:
+                with self.subTest(path=path, method=method):
+                    headers = {p["name"].lower() for p in spec["paths"][path][method]["parameters"]
+                               if p["in"] == "header"}
+                    self.assertIn("x-bitapi-admin-key", headers)
+                    self.assertIn("authorization", headers)
+
     def test_user_jwt_and_garbage_fail(self):
         self.assertEqual(self._stats(self.user_tok), 401)
         self.assertEqual(self._stats("nope"), 401)
@@ -103,7 +129,7 @@ class AdminEndpointAuthTest(unittest.TestCase):
 
     def test_forged_role_claim_is_not_enough(self):
         """token 里写着 admin 但库里那个人不是 admin → 401。角色以库为准,不以 token 为准。"""
-        uid = portal_state.USER_DB.get_user_by_email("u@example.com")["id"]
+        uid = portal_state.USER_DB.get_user_by_email("u@gmail.com")["id"]
         forged = auth.issue_token(uid, role="admin")
         self.assertEqual(self._stats(forged), 401)
 
@@ -113,7 +139,7 @@ class AdminEndpointAuthTest(unittest.TestCase):
         time.sleep(1.1)
         portal_state.USER_DB.set_password(self.admin_id, auth.hash_password("secret456"))
         self.assertEqual(self._stats(tok), 401)
-        fresh = self.client.post("/api/login", json={"email": "root@example.com",
+        fresh = self.client.post("/api/login", json={"email": "root@gmail.com",
                                                     "password": "secret456"}).json()["token"]
         self.assertEqual(self._stats(fresh), 200)
 

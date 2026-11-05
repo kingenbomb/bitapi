@@ -1,31 +1,168 @@
 {
-  "_comment": "内置价目表种子(Token 模型单位为美元/1M token)。初始值取上游官方公开定价,见 _sources;管理员可在管理台改,存库后覆盖本文件。仓库自带的 grok 渠道在列;自建渠道(数据渠道)的价由管理员自行配置。",
+  "_comment": "bit-api 内置价格目录。Token 模型单位为美元/1M token；per_request 模型单位为美元/次。文本价格按 2026-09-02 官网公开价核对；图片售价默认按站点规则为 $1/次，GPT Image 2.5 文生图按官网 Token 价；视频以官网标准成本为基准加价并按规格取易读售价。管理员数据库定价始终优先于本文件。",
   "_checked_at": "2026-09-02",
   "_sources": {
-    "xai": "https://docs.x.ai/developers/pricing"
+    "openai": "https://developers.openai.com/api/docs/models",
+    "xai": "https://docs.x.ai/developers/pricing",
+    "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "google": "https://ai.google.dev/gemini-api/docs/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "minimax": "https://platform.minimax.io/subscribe/token-plan?tab=api-enterprise",
+    "kimi": "https://platform.kimi.ai/docs/pricing/chat-k26",
+    "fireworks": "https://fireworks.ai/models",
+    "inception": "https://docs.inceptionlabs.ai/get-started/models",
+    "kling": "https://kling.ai/docs/point-policy",
+    "pixverse": "https://docs.platform.pixverse.ai/pricing-796039m0",
+    "seedance": "https://docs.byteplus.com/docs/ModelArk/1099320",
+    "wan": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+    "zai": "https://docs.z.ai/guides/overview/pricing",
+    "together": "https://docs.together.ai/docs/serverless/models",
+    "jev": "https://vercel.com/ai-gateway/models/jev"
   },
   "pricing": [
     {
-      "model_pattern": "grok-4.6",
+      "model_pattern": "gpt-image-2.5-flare",
       "billing_mode": "token",
-      "input_price": 2,
-      "output_price": 6,
-      "cache_read_price": 0.5,
-      "long_threshold": 199999,
-      "long_input_price": 4,
-      "long_output_price": 12,
-      "long_cache_read_price": 1
+      "input_price": 5,
+      "output_price": 30,
+      "cache_read_price": 1.25,
+      "cache_write_price": 0,
+      "notes": "2026-11-03 核对 OpenAI 官网标准价，文生图文字输入与图片输出按实际 Token 计费：https://developers.openai.com/api/docs/models/gpt-image-2.5-flare"
     },
     {
-      "model_pattern": "grok-4.5",
+      "model_pattern": "gpt-image-2.5-sunburst",
+      "billing_mode": "token",
+      "input_price": 5,
+      "output_price": 30,
+      "cache_read_price": 1.25,
+      "cache_write_price": 0,
+      "notes": "2026-11-03 核对 OpenAI 官网标准价，文生图文字输入与图片输出按实际 Token 计费：https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst"
+    },
+    {
+      "model_pattern": "gpt-5.6-luna",
+      "billing_mode": "token",
+      "input_price": 0.2,
+      "output_price": 1.2,
+      "cache_read_price": 0.02,
+      "cache_write_price": 0.25,
+      "long_threshold": 272000,
+      "long_input_price": 0.4,
+      "long_output_price": 1.8,
+      "long_cache_read_price": 0.04,
+      "long_cache_write_price": 0.5,
+      "notes": "GPT OAuth 渠道，沿用既有 kg-gpt-5.6-luna 价格种子"
+    },
+    {
+      "model_pattern": "gpt-5.6-sol",
+      "billing_mode": "token",
+      "input_price": 4,
+      "output_price": 20,
+      "cache_read_price": 0.4,
+      "cache_write_price": 5,
+      "long_threshold": 272000,
+      "long_input_price": 8,
+      "long_output_price": 30,
+      "long_cache_read_price": 0.8,
+      "long_cache_write_price": 10,
+      "notes": "GPT OAuth 渠道，沿用既有 kg-gpt-5.6-sol 价格种子"
+    },
+    {
+      "model_pattern": "gpt-5.6-terra",
       "billing_mode": "token",
       "input_price": 2,
-      "output_price": 6,
-      "cache_read_price": 0.3,
-      "long_threshold": 199999,
+      "output_price": 12,
+      "cache_read_price": 0.2,
+      "cache_write_price": 2.5,
+      "long_threshold": 272000,
       "long_input_price": 4,
-      "long_output_price": 12,
-      "long_cache_read_price": 0.6
+      "long_output_price": 18,
+      "long_cache_read_price": 0.4,
+      "long_cache_write_price": 5,
+      "notes": "GPT OAuth 渠道，沿用既有 kg-gpt-5.6-terra 价格种子"
+    },
+    {
+      "model_pattern": "google/gemma-4-31b-it",
+      "billing_mode": "token",
+      "input_price": 0.09,
+      "output_price": 0.34,
+      "cache_read_price": 0.05,
+      "notes": "Gemma 4 31B 公开 Token 价"
+    },
+    {
+      "model_pattern": "deepseek-ai/deepseek-v4.1-flash",
+      "billing_mode": "token",
+      "input_price": 0.3,
+      "output_price": 1.2,
+      "cache_read_price": 0.006,
+      "notes": "2026-10-04 核对 DeepSeek V4.1 Flash 官网高峰价；本站使用固定单价，不区分峰谷"
+    },
+    {
+      "model_pattern": "poolside/laguna-xs-2.1",
+      "billing_mode": "token",
+      "input_price": 0.06,
+      "output_price": 0.12,
+      "cache_read_price": 0.03,
+      "notes": "取自 LiteLLM 价目表 openrouter/poolside/laguna-xs-2.1。补于 2026-09-16:此前一直没配,上线以来 76 次调用全记 $0 —— LiteLLM 的键带 openrouter/ 前缀,与我们的对外名对不上,兜底查不到就按 0 计"
+    },
+    {
+      "model_pattern": "kumo-relational",
+      "billing_mode": "token",
+      "input_price": 0.04,
+      "output_price": 0,
+      "notes": "2026-10-04 用户确认按 Jev 列价：输入 $0.04/1M token，输出免费；无上游 token 用量时估算完整请求 JSON"
+    },
+    {
+      "model_pattern": "DeepSeek-V4-Flash",
+      "billing_mode": "token",
+      "input_price": 0.14,
+      "output_price": 0.28,
+      "cache_read_price": 0.0028,
+      "notes": "AMD GPU Cloud 标的 pts/1M(与其 usage.cost_details 一致)"
+    },
+    {
+      "model_pattern": "Qwen3.8-Flash-Next",
+      "billing_mode": "token",
+      "input_price": 0.15,
+      "output_price": 0.47,
+      "cache_read_price": 0.016,
+      "notes": "AMD GPU Cloud 标的 pts/1M"
+    },
+    {
+      "model_pattern": "jina-embeddings-v5-text-small",
+      "billing_mode": "token",
+      "input_price": 0.05,
+      "output_price": 0,
+      "notes": "Jina AI 向量模型,价取自上游 GET /v1/models 的 pricing.prompt(0.00000005/token)。向量没有输出 token,output_price 恒为 0 —— 上游只回 total_tokens,adapter 会把它补成 prompt_tokens,见 adapters/openai_compat.py 的 _normalize_embedding_usage"
+    },
+    {
+      "model_pattern": "jina-embeddings-v5-text-nano",
+      "billing_mode": "token",
+      "input_price": 0.02,
+      "output_price": 0,
+      "notes": "Jina AI 向量模型,价取自上游 GET /v1/models 的 pricing.prompt(0.00000002/token)"
+    },
+    {
+      "model_pattern": "jina-embeddings-v4",
+      "billing_mode": "token",
+      "input_price": 0.05,
+      "output_price": 0,
+      "notes": "Jina AI 向量模型,价取自上游 GET /v1/models 的 pricing.prompt(0.00000005/token)。另支持图片输入,本仓按文本向量上架"
+    },
+    {
+      "model_pattern": "minimaxai/minimax-m3.1-flash",
+      "billing_mode": "token",
+      "input_price": 0.15,
+      "output_price": 0.6,
+      "cache_read_price": 0.015,
+      "notes": "MiniMax M3.1 Flash 价,2026-10-27 取自 LiteLLM 价目表(键 opencode_go/minimax-m3.1-flash,上游 NIM 实测可答)"
+    },
+    {
+      "model_pattern": "stepfun-ai/step-5-preview",
+      "billing_mode": "token",
+      "input_price": 1.0,
+      "output_price": 2.7,
+      "cache_read_price": 0.1,
+      "notes": "Step 5 Preview 价,2026-10-27 取自 LiteLLM 价目表(键 opencode_go/step-5-preview;思考型模型,reasoning 计入输出 token)"
     }
   ]
 }

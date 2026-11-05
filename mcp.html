@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="使用 bit-api API 密钥接入 TinyFish MCP：Codex、Claude Code、Cursor、OpenCode 配置，网页搜索与抓取示例，以及费用和常见问题。">
+  <title>MCP 接入与使用指南 · bit-api</title>
+  <link rel="icon" type="image/png" href="/static/bit-api-icon-32.png">
+  <link rel="stylesheet" href="/static/portal-console.css">
+  <link rel="stylesheet" href="/static/mcp-guide.css">
+  <script src="/static/mcp-guide.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#content">跳到正文</a>
+  <header class="guide-header">
+    <a class="guide-brand" href="/portal" aria-label="bit-api 控制台"><img src="/static/bit-api-icon-32.png" width="28" height="28" alt="">bit<span>·</span>api</a>
+    <div class="header-actions">
+      <button class="quiet-button" id="theme-toggle" type="button" aria-label="切换深色模式" hidden>深色模式</button>
+      <a class="quiet-button" href="/portal">返回控制台 <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+  <div class="guide-layout">
+    <aside class="guide-aside">
+      <nav aria-label="本页目录">
+        <p class="eyebrow">接入指南 / MCP</p>
+        <a href="#prepare"><span>01</span> 准备密钥</a>
+        <a href="#connect"><span>02</span> 配置客户端</a>
+        <a href="#use"><span>03</span> 开始使用</a>
+        <a href="#usage">费用与限制</a>
+        <a href="#faq">常见问题</a>
+      </nav>
+    </aside>
+    <main id="content">
+      <div class="guide-intro">
+        <p class="eyebrow">TINYFISH × BIT-API</p>
+        <h1>让 AI 助手<br>搜索、读取网页。</h1>
+        <p class="intro-text">用一把 bit-api 密钥，把 TinyFish 的网页工具接到你正在使用的 AI 客户端。配置一次，之后直接用自然语言提问。</p>
+        <div class="endpoint-box">
+          <div class="endpoint-label"><span>MCP 服务地址</span><span class="protocol">Streamable HTTP</span></div>
+          <div class="endpoint-value"><code id="endpoint">https://ai.baipiao.co/mcp</code><button class="copy-button" type="button" data-copy="endpoint" aria-label="复制 MCP 服务地址" hidden>复制地址</button></div>
+          <p>使用本站 API 密钥鉴权，无需另行注册 TinyFish。</p>
+        </div>
+      </div>
+
+      <section id="prepare" class="guide-section" aria-labelledby="prepare-title">
+        <div class="section-title"><span class="step-number">01</span><h2 id="prepare-title">准备一把本站密钥</h2></div>
+        <ol class="instructions">
+          <li>进入 <a href="/portal#/keys" data-key-link>控制台 → API 密钥</a>，登录或注册 bit-api 账号。</li>
+          <li>点击「创建密钥」，建议命名为 <code>TinyFish MCP</code>；也可以使用已有的有效密钥。</li>
+          <li>复制完整密钥，将下方配置中的 <code>YOUR_BITAPI_KEY</code> 替换为它，保留前面的 <code>Bearer </code> 和空格。</li>
+        </ol>
+        <p class="callout">请妥善保管配置中的密钥。不要把含真实密钥的配置提交到代码仓库，或贴进公开截图和对话。</p>
+      </section>
+
+      <section id="connect" class="guide-section" aria-labelledby="connect-title">
+        <div class="section-title"><span class="step-number">02</span><h2 id="connect-title">选择你的客户端</h2></div>
+        <p>展开对应说明，完成其中一种配置即可。已有配置文件时，只合并 <code>tinyfish</code> 这一项，保留原来的其他设置。</p>
+        <div class="client-list">
+          <details class="client" open>
+            <summary><span>Codex <small>桌面端 / CLI / IDE</small></span></summary>
+            <div class="client-content">
+              <p>在用户目录下的 <code>~/.codex/config.toml</code> 加入以下内容。Windows 默认位置是 <code>%USERPROFILE%\.codex\config.toml</code>；如果设置过 <code>CODEX_HOME</code>，使用该目录中的配置文件。</p>
+              <div class="code-block"><div class="code-heading"><span>config.toml</span><button class="copy-button" type="button" data-copy="codex-config" aria-label="复制 Codex 配置" hidden>复制配置</button></div><pre tabindex="0" aria-label="Codex 配置"><code id="codex-config">[mcp_servers.tinyfish]
+url = "https://ai.baipiao.co/mcp"
+http_headers = { Authorization = "Bearer YOUR_BITAPI_KEY" }</code></pre></div>
+              <p>保存后重启 Codex，在 MCP 工具列表中检查 <code>tinyfish</code>；CLI 也可以运行 <code>codex mcp list</code> 查看是否已添加。</p>
+              <p class="supporting">如果希望通过环境变量提供密钥，可将 <code>http_headers</code> 一行改为 <code>bearer_token_env_var = "BITAPI_MCP_KEY"</code>，并在启动 Codex 前设置此变量。桌面端需要完全退出并重新打开，才能读取新的环境变量。<a href="https://developers.openai.com/codex/mcp" target="_blank" rel="noopener noreferrer">Codex 官方说明 ↗</a></p>
+            </div>
+          </details>
+          <details class="client">
+            <summary><span>Claude Code <small>终端命令</small></span></summary>
+            <div class="client-content">
+              <p>在终端执行下面这条完整命令。<code>--scope user</code> 让此配置在你的不同项目中都可使用。</p>
+              <div class="code-block"><div class="code-heading"><span>Terminal · 单行命令</span><button class="copy-button" type="button" data-copy="claude-config" aria-label="复制 Claude Code 命令" hidden>复制命令</button></div><pre tabindex="0" aria-label="Claude Code 命令"><code id="claude-config">claude mcp add --transport http --scope user tinyfish https://ai.baipiao.co/mcp --header "Authorization: Bearer YOUR_BITAPI_KEY"</code></pre></div>
+              <p>重新打开 Claude Code，输入 <code>/mcp</code> 检查连接状态；也可以在终端运行 <code>claude mcp list</code>。看到 <code>tinyfish</code> 已连接后，再发送下方示例。</p>
+              <p class="supporting">这是 Claude Code 的配置方式。<a href="https://code.claude.com/docs/en/mcp" target="_blank" rel="noopener noreferrer">Claude Code 官方说明 ↗</a></p>
+            </div>
+          </details>
+          <details class="client">
+            <summary><span>Cursor <small>mcp.json</small></span></summary>
+            <div class="client-content">
+              <p>在用户目录下的 <code>~/.cursor/mcp.json</code> 中加入配置。Windows 默认位置是 <code>%USERPROFILE%\.cursor\mcp.json</code>。</p>
+              <div class="code-block"><div class="code-heading"><span>mcp.json</span><button class="copy-button" type="button" data-copy="cursor-config" aria-label="复制 Cursor 配置" hidden>复制配置</button></div><pre tabindex="0" aria-label="Cursor 配置"><code id="cursor-config">{
+  "mcpServers": {
+    "tinyfish": {
+      "url": "https://ai.baipiao.co/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_BITAPI_KEY"
+      }
+    }
+  }
+}</code></pre></div>
+              <p>保存后在 Cursor 的 MCP 设置中确认 <code>tinyfish</code> 已启用、工具已加载，再在 Agent 对话中使用。未刷新时重新打开 Cursor。</p>
+              <p class="supporting"><a href="https://cursor.com/docs/mcp" target="_blank" rel="noopener noreferrer">Cursor 官方说明 ↗</a></p>
+            </div>
+          </details>
+          <details class="client">
+            <summary><span>OpenCode <small>opencode.json</small></span></summary>
+            <div class="client-content">
+              <p>将以下 <code>mcp</code> 配置合并到你的 <code>opencode.json</code> 或 <code>opencode.jsonc</code>。这里使用 <code>type: "remote"</code>，并关闭 OAuth，直接通过本站密钥连接。</p>
+              <div class="code-block"><div class="code-heading"><span>opencode.json</span><button class="copy-button" type="button" data-copy="opencode-config" aria-label="复制 OpenCode 配置" hidden>复制配置</button></div><pre tabindex="0" aria-label="OpenCode 配置"><code id="opencode-config">{
+  "mcp": {
+    "tinyfish": {
+      "type": "remote",
+      "url": "https://ai.baipiao.co/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer YOUR_BITAPI_KEY"
+      }
+    }
+  }
+}</code></pre></div>
+              <p>保存后重新打开 OpenCode，运行 <code>opencode mcp list</code> 查看状态，再在对话中指定使用 <code>tinyfish</code> 工具。</p>
+              <p class="supporting"><a href="https://opencode.ai/docs/mcp-servers/" target="_blank" rel="noopener noreferrer">OpenCode 官方说明 ↗</a></p>
+            </div>
+          </details>
+          <details class="client">
+            <summary><span>其他 MCP 客户端 <small>通用连接信息</small></span></summary>
+            <div class="client-content">
+              <dl class="connection-fields"><dt>类型</dt><dd>远程 MCP / Streamable HTTP</dd><dt>地址</dt><dd><code>https://ai.baipiao.co/mcp</code></dd><dt>请求头</dt><dd><code>Authorization: Bearer YOUR_BITAPI_KEY</code></dd></dl>
+              <p>如果客户端只有 URL 输入框、不支持请求头，可使用下方兼容地址。替换密钥后再填入客户端。</p>
+              <div class="code-block"><div class="code-heading"><span>仅 URL 的兼容方式</span><button class="copy-button" type="button" data-copy="url-config" aria-label="复制兼容地址" hidden>复制地址</button></div><pre tabindex="0" aria-label="兼容地址"><code id="url-config">https://ai.baipiao.co/mcp?key=YOUR_BITAPI_KEY</code></pre></div>
+              <p class="supporting">优先用请求头。兼容地址包含密钥，可能出现在历史记录或日志中，请勿公开分享。仅支持本地 stdio 的客户端需要自行配置支持 HTTP 的桥接工具。</p>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <section id="use" class="guide-section" aria-labelledby="use-title">
+        <div class="section-title"><span class="step-number">03</span><h2 id="use-title">在对话里试一次</h2></div>
+        <p>先确认客户端已加载 <code>tinyfish</code> 工具，再复制下面的话发送给 AI。客户端询问是否允许工具调用时，按需确认。</p>
+        <article class="example">
+          <div class="example-heading"><h3>搜索公开网页</h3><code>search</code></div>
+          <p id="search-example" class="prompt">请使用 tinyfish 的 search 搜索 Python asyncio 官方文档，列出前 3 条结果的标题、链接和简短说明。</p>
+          <div class="example-footer"><span>确认结果：看到真实搜索结果及来源链接。</span><button class="copy-button" type="button" data-copy="search-example" aria-label="复制搜索示例" hidden>复制示例</button></div>
+        </article>
+        <article class="example">
+          <div class="example-heading"><h3>读取指定网页</h3><code>fetch_content</code></div>
+          <p id="fetch-example" class="prompt">请使用 tinyfish 的 fetch_content 抓取 https://example.com，以 Markdown 读取正文，然后告诉我页面标题和主要内容。</p>
+          <div class="example-footer"><span>确认结果：返回内容包含「Example Domain」。</span><button class="copy-button" type="button" data-copy="fetch-example" aria-label="复制网页抓取示例" hidden>复制示例</button></div>
+        </article>
+        <p class="supporting">只回复「可以帮你搜索」不代表工具已运行。展开客户端的工具调用记录，确认调用的是 <code>tinyfish</code> 下的 <code>search</code> 或 <code>fetch_content</code>，并且返回了内容。以上两条路径已于 2026 年 10 月 13 日通过本站线上端点实测。</p>
+        <details class="more-tools"><summary>还可以用来做什么？</summary><p>日常可以先搜索资料，再抓取其中的网页，要求 AI 对比、提取要点并附来源。TinyFish 还提供 <code>run_web_automation</code>、<code>create_browser_session</code>、<code>create_monitor</code> 等工具；可用项和参数以客户端实际加载的列表为准，涉及外部网站操作时先确认目标和操作范围。这些进阶工具不在上述搜索、抓取实测范围内。</p><p><a href="https://docs.tinyfish.ai/mcp-integration" target="_blank" rel="noopener noreferrer">查看 TinyFish 工具说明 ↗</a></p></details>
+      </section>
+
+      <section id="usage" class="guide-section" aria-labelledby="usage-title">
+        <h2 id="usage-title">费用与使用限制</h2>
+        <dl class="usage-list">
+          <div><dt>本站 MCP 费用</dt><dd>当前工具调用记录为免费用量，不扣 bit-api 余额。AI 模型的对话费用仍由你使用的客户端或模型服务另行计算。</dd></div>
+          <div><dt>请求频率</dt><dd>默认每位用户每分钟最多 <strong>60 次 MCP 请求</strong>，同一用户的多把密钥共用额度。初始化、读取工具列表等协议请求也计入，实际限制以服务返回提示为准。</dd></div>
+          <div><dt>查看用量</dt><dd>到 <a href="/portal#/usage">控制台 → 使用记录</a> 查看调用；工具名如 <code>search</code>、<code>fetch_content</code> 会显示在模型字段中。调用记录本身不代表抓取成功，应以工具返回结果为准。</dd></div>
+          <div><dt>上游可用性</dt><dd>工具仍受 TinyFish 的配额及目标网站限制。自动化、远程浏览器和监控等功能会消耗上游服务额度，本站免费不代表上游无限量。</dd></div>
+        </dl>
+      </section>
+
+      <section id="faq" class="guide-section" aria-labelledby="faq-title">
+        <h2 id="faq-title">遇到问题时</h2>
+        <div class="faq-list">
+          <details><summary>401 / Unauthorized：密钥未通过验证</summary><p>确认使用的是 bit-api「API 密钥」页复制的完整密钥，已替换 <code>YOUR_BITAPI_KEY</code>，且密钥仍有效。请求头必须保留 <code>Authorization: Bearer </code>，不要使用登录密码或 TinyFish 官方密钥。</p></details>
+          <details><summary>429：请求过于频繁</summary><p>暂停调用约一分钟，减少并发或反复重连，再试一次。换同一账号下的另一把密钥不会增加每用户限额；如果提示来自上游，以其返回的配额说明为准。</p></details>
+          <details><summary>502 / 503：上游暂时不可用</summary><p>可能是上游连接失败或暂时没有可用额度。稍后重试；持续出现时，向管理员提供发生时间、工具名称和脱敏后的错误信息。</p></details>
+          <details><summary>工具没有出现，或连接中断</summary><p>确认地址以 <code>/mcp</code> 结尾、类型为 HTTP / Streamable HTTP，配置已保存且客户端已重启。MCP 应添加到客户端的工具设置中，不填入模型的 Base URL。重连后仍失败时，查看客户端日志中的 HTTP 状态码；代理或网络需要支持流式响应。</p></details>
+          <details><summary>能连接，但网页抓取失败或结果为空</summary><p>先运行上面的 <code>example.com</code> 示例。它成功而目标页失败时，可能是目标网站需要登录、禁止访问或有反爬限制。请检查 URL，或换一个公开可访问的页面；搜索能找到链接不代表每个网页都能抓取。</p></details>
+        </div>
+      </section>
+      <footer class="guide-footer"><span>bit-api · MCP 接入指南</span><a href="#content">回到顶部 ↑</a></footer>
+    </main>
+  </div>
+  <div class="copy-status" id="copy-status" role="status" aria-live="polite"></div>
+</body>
+</html>

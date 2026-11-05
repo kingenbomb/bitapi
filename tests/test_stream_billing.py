@@ -9,7 +9,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ["BITAPI_DB"] = os.path.join(_TMP, "s.db")
-os.environ["BITAPI_GROK_AUTH_DIR"] = os.path.join(_TMP, "nx")
 os.environ["BITAPI_PRICING_PATH"] = os.path.join(_TMP, "nopricing.json")
 os.environ["BITAPI_PRICING_URL"] = ""
 
@@ -144,6 +143,20 @@ class SyntheticStreamTest(unittest.TestCase):
         self.assertEqual(settled["reason"], "eof")
         self.assertFalse(holder.get("terminal"))
 
+    def test_sse_worker_exception_after_terminal_is_failure(self):
+        class BrokenSse:
+            def stream_chat(self, _acct, _model, _body, on_sse=None):
+                on_sse(_chunk(content="partial"))
+                on_sse(_chunk(finish="stop"))
+                raise RuntimeError("upstream transport failed")
+
+        holder, settled = {}, {}
+        with mock.patch.object(server, "POOL", self._Pool()):
+            list(server._billed_stream(
+                server._stream_sse(BrokenSse(), "fake", "m1", {}, usage_holder=holder),
+                holder, lambda reason: settled.setdefault("reason", reason)))
+        self.assertEqual(settled["reason"], "scanner_error")
+
     def test_virtual_tool_stream_is_sniffed(self):
         routed = {"model": "m1", "messages": [], "stream": True}
         response = {
@@ -158,13 +171,13 @@ class SyntheticStreamTest(unittest.TestCase):
         def fake_nonstream(_body, served=None):
             # 与真实 _openai_nonstream 同一契约:served 里报实际渠道与上游真实 usage
             if served is not None:
-                served.update({"channel": "grok",
+                served.update({"channel": "magicpatterns",
                                "upstream_usage": response["usage"]})
             return response
 
         with mock.patch.object(server, "_resolve_routes",
                                return_value=(None, None, routed,
-                                             [("grok", object())])), \
+                                             [("magicpatterns", object())])), \
              mock.patch.object(server, "_virtual_tooling_requested",
                                return_value=True), \
              mock.patch.object(server, "_openai_nonstream",
@@ -174,7 +187,7 @@ class SyntheticStreamTest(unittest.TestCase):
         self.assertTrue(holder["terminal"])
         self.assertEqual(holder["text"], "answer")
         self.assertEqual(holder["usage"]["completion_tokens"], 2)
-        self.assertEqual(holder["channel"], "grok")
+        self.assertEqual(holder["channel"], "magicpatterns")
 
     def test_virtual_tool_stream_does_not_pass_estimate_off_as_upstream(self):
         """合成终止帧里的 usage 是估算值:客户端要看到,计量层不能当真实值。"""
@@ -187,11 +200,11 @@ class SyntheticStreamTest(unittest.TestCase):
 
         def fake_nonstream(_body, served=None):
             if served is not None:
-                served.update({"channel": "xai", "upstream_usage": None})
+                served.update({"channel": "kogo", "upstream_usage": None})
             return response
 
         with mock.patch.object(server, "_resolve_routes",
-                               return_value=(None, None, routed, [("xai", object())])), \
+                               return_value=(None, None, routed, [("kogo", object())])), \
              mock.patch.object(server, "_virtual_tooling_requested", return_value=True), \
              mock.patch.object(server, "_openai_nonstream", side_effect=fake_nonstream):
             out = "".join(server._openai_stream(routed, holder))
@@ -271,6 +284,42 @@ class BilledStreamTest(unittest.TestCase):
             list(server._billed_stream(broken(), h, lambda r: seen.setdefault("r", r)))
         self.assertEqual(seen["r"], "scanner_error")
 
+    def test_error_or_bad_json_cannot_be_overridden_by_done(self):
+        for failed_frame, expected in (
+            (_sse({"error": {"message": "quota exceeded"}}), "error"),
+            (_chunk(finish="error"), "error"),
+            ("data: {broken\n\n", "scanner_error"),
+        ):
+            with self.subTest(expected=expected, frame=failed_frame):
+                holder, seen = {}, {}
+
+                def upstream():
+                    for line in (failed_frame, _chunk(finish="stop"), "data: [DONE]\n\n"):
+                        server._sniff_usage(line, holder)
+                        yield line
+
+                list(server._billed_stream(upstream(), holder,
+                                          lambda reason: seen.setdefault("reason", reason)))
+                self.assertEqual(seen["reason"], expected)
+
+    def test_client_disconnect_with_upstream_failure_is_not_billable(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                holder, seen = {}, {}
+
+                def upstream():
+                    line = _chunk(content="partial")
+                    server._sniff_usage(line, holder)
+                    yield line
+                    if raises:
+                        raise RuntimeError("upstream broke while draining")
+
+                gen = server._billed_stream(upstream(), holder,
+                                           lambda reason: seen.setdefault("reason", reason))
+                next(gen)
+                gen.close()
+                self.assertEqual(seen["reason"], "scanner_error" if raises else "eof")
+
     def test_settle_failure_does_not_break_stream(self):
         h = {}
 
@@ -332,6 +381,39 @@ class SettlementTest(unittest.TestCase):
         self.assertEqual([e for e in db.list_ledger(user["id"])
                           if e["reason"] == "usage"], [])
         self.assertAlmostEqual(db.get_user(user["id"])["balance"], 10.0)
+
+    def test_failed_requests_keep_logs_but_do_not_charge_any_budget_or_hook(self):
+        db, billing, user, group = _setup("failed-fees.db")
+        C.credit(user["id"], 10.0, "recharge", "r1")
+        kid = db.create_api_key(user["id"], "sk-failed-fees", name="test")
+        user = dict(user, _api_key_id=kid)
+        for mode in ("token", "per_request"):
+            db.upsert_pricing("m1", None, billing_mode=mode,
+                              input_price=1, output_price=2, per_request_price=3)
+            billing.pricing.invalidate()
+            for reason in ("eof", "scanner_error", "error"):
+                with self.subTest(mode=mode, reason=reason), mock.patch("core.billing.emit") as emit:
+                    billing.record_usage(user, group, "ch", "m1", adapter=_Upstream(),
+                                         upstream_usage={"prompt_tokens": 1_000_000,
+                                                         "completion_tokens": 500_000},
+                                         stream=True, request_id=mode+reason, end_reason=reason)
+                    log = db.recent_usage(user["id"], limit=1)[0]
+                    self.assertEqual(log["pricing_snapshot"]["end_reason"], reason)
+                    self.assertEqual(log["input_tokens"], 1_000_000)
+                    self.assertEqual((log["cost"], log["actual_cost"]), (0, 0))
+                    self.assertEqual(emit.call_args.kwargs["actual_cost"], 0)
+        self.assertEqual(db.get_user(user["id"])["balance"], 10.0)
+        self.assertEqual(db.get_api_key_by_id(kid)["used_quota"], 0)
+        self.assertEqual([e for e in db.list_ledger(user["id"]) if e["reason"] == "usage"], [])
+
+    def test_client_disconnect_before_output_is_free(self):
+        db, billing, user, group = _setup("client-empty.db")
+        C.credit(user["id"], 10.0, "recharge", "r1")
+        billing.record_usage(user, group, "ch", "m1", adapter=_Upstream(),
+                             upstream_usage={"prompt_tokens": 1_000_000, "completion_tokens": 0},
+                             stream=True, request_id="client-empty", end_reason="client_gone")
+        self.assertEqual(db.recent_usage(user["id"], limit=1)[0]["actual_cost"], 0)
+        self.assertEqual(db.get_user(user["id"])["balance"], 10)
 
     def test_duplicate_settlement_charges_once(self):
         db, billing, user, group = _setup("st4.db")

@@ -5,7 +5,7 @@
 
 与号池库(core/db.py 的 accounts 表)共用同一个 SQLite 文件,但表相互独立。
 分组套餐模式(subscription 型):用户属于某 group,group 决定可用模型白名单、
-倍率、日/周/月用量上限、RPM。不扣余额,usage_logs 仅记录用量供展示与限流聚合。
+倍率、日/周/月用量上限、每用户并发。不扣余额,usage_logs 仅记录用量供展示与限额聚合。
 """
 import json
 import sqlite3
@@ -27,9 +27,9 @@ CREATE TABLE IF NOT EXISTS groups (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL UNIQUE,
     rate_multiplier   REAL DEFAULT 1.0,
-    supported_models  TEXT,            -- JSON: ["kg-*","grok-4.5",...] 支持前缀通配
+    supported_models  TEXT,            -- JSON: ["kg-*","xxx-yyy",...] 支持前缀通配
     billing_policy    TEXT DEFAULT 'free',  -- balance | quota | free
-    rpm_limit         INTEGER DEFAULT 0,   -- 每分钟请求上限,0=不限
+    concurrency_limit INTEGER DEFAULT 0,   -- 每用户同时处理的请求上限,0=不限
     daily_limit       INTEGER DEFAULT 0,   -- 日用量上限(单位 limit_unit),0=不限
     weekly_limit      INTEGER DEFAULT 0,
     monthly_limit     INTEGER DEFAULT 0,
@@ -91,7 +91,6 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     user_id          INTEGER NOT NULL,
     api_key_id       INTEGER,
     channel          TEXT,
-    account_id       INTEGER,                   -- 实际作答的号池账号(accounts.id)
     model            TEXT,
     input_tokens     INTEGER DEFAULT 0,
     output_tokens    INTEGER DEFAULT 0,
@@ -105,6 +104,7 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     created_at       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_logs(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_logs(api_key_id, created_at);
 
 CREATE TABLE IF NOT EXISTS email_verifications (
@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS community_auth_flows (
     nonce_hash        TEXT NOT NULL UNIQUE,
     purpose           TEXT NOT NULL CHECK(purpose IN ('login','bind')),
     initiator_user_id INTEGER,
-    referral_code    TEXT,
+    referral_code     TEXT,
     status            TEXT NOT NULL DEFAULT 'pending',
     subject           TEXT,
     username          TEXT,
@@ -231,6 +231,8 @@ CREATE TABLE IF NOT EXISTS orders (
     -- 下单那一刻算出的应收人民币。冻在这里而不是回调时按汇率反算:汇率是可变配置,
     -- 乘一次再除回去,中途改一次两边就永久对不上,金额校验也就不可能成立。
     pay_amount_cny   REAL,
+    pay_amount_mao   INTEGER,
+    pay_merchant_id  TEXT,
     provider         TEXT NOT NULL,
     payment_trade_no TEXT,                  -- 三方单号
     status           TEXT DEFAULT 'pending', -- pending|paid|recharging|completed|expired|failed
@@ -256,6 +258,7 @@ CREATE TABLE IF NOT EXISTS channels (
     model_map   TEXT,                             -- JSON 对象:对外名 → 上游名
     headers     TEXT,                             -- JSON 对象:额外请求头
     timeout     INTEGER DEFAULT 0,                -- 秒,0 = 用 BITAPI_TIMEOUT
+    key_concurrency INTEGER DEFAULT 0,            -- 每个号同时处理的请求上限,0=不限
     notes       TEXT,
     created_at  INTEGER,
     updated_at  INTEGER
@@ -286,21 +289,27 @@ CREATE TABLE IF NOT EXISTS model_pricing (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_pricing_pattern_group
     ON model_pricing(model_pattern, IFNULL(group_id, -1));
 CREATE INDEX IF NOT EXISTS idx_pricing_group ON model_pricing(group_id);
+
+-- 模型状态(小时级巡检,追加式历史):每次检测一行,保留 7 天。
+-- ok 1=实测通过 0=实测失败 -1=号池空(没法测,对用户=暂不可用);
+-- ttft_ms 首字延迟(流式探测才有);error 存上游原话(截断)。
+-- 界面状态条 = 最近 7 天按天聚合(红/绿/黄),最新状态 = 每键最新一行。
+CREATE TABLE IF NOT EXISTS model_status (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel     TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    ok          INTEGER NOT NULL,
+    latency_ms  INTEGER DEFAULT 0,
+    ttft_ms     INTEGER,
+    error       TEXT,
+    checked_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_model_status_key_time
+    ON model_status(channel, model, checked_at);
 """
 
 _JSON_COLS = {"supported_models", "meta", "pricing_snapshot",
               "allowed_models", "allowed_ips", "models", "model_map", "headers"}
-
-
-class RegistrationCodeError(ValueError):
-    pass
-
-
-class RegistrationCodeCooldown(ValueError):
-    def __init__(self, retry_after):
-        self.retry_after = retry_after
-        super().__init__(f"请 {retry_after} 秒后再发送验证码")
-
 
 
 class CommunityFlowError(RuntimeError):
@@ -308,6 +317,10 @@ class CommunityFlowError(RuntimeError):
 
 
 class CommunityInviteError(RuntimeError):
+    pass
+
+
+class CommunityLevelError(RuntimeError):
     pass
 
 
@@ -325,6 +338,16 @@ class CommunityUserDisabled(RuntimeError):
 
 class CommunityAffCodeConflict(RuntimeError):
     pass
+
+
+class RegistrationCodeError(ValueError):
+    pass
+
+
+class RegistrationCodeCooldown(ValueError):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"请 {retry_after} 秒后再发送验证码")
 
 
 class UserDB:
@@ -345,6 +368,31 @@ class UserDB:
         def cols(table):
             return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
 
+        if "attempts" not in cols("email_verifications"):
+            c.execute("ALTER TABLE email_verifications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        c.execute("""CREATE TABLE IF NOT EXISTS admin_audit (
+            id INTEGER PRIMARY KEY, at INTEGER NOT NULL, actor TEXT NOT NULL,
+            action TEXT NOT NULL, target TEXT, before_state TEXT, after_state TEXT,
+            changes TEXT, ip TEXT, status INTEGER NOT NULL DEFAULT 0)""")
+
+        # model_status 旧版是 (channel,model) 主键的"只存最新"表,还带 probe 列;
+        # 改成追加式历史表。该表数据由小时巡检可再生,直接重建(SCHEMA 全是
+        # IF NOT EXISTS,重跑只会补回这一张)。
+        ms_cols = cols("model_status")
+        if ms_cols and ("probe" in ms_cols or "id" not in ms_cols):
+            c.execute("DROP TABLE model_status")
+            c.executescript(SCHEMA)
+
+        # 现有分组数值直接改为并发含义,保留分组与订阅引用。重复启动不重复迁移。
+        if "rpm_limit" in cols("groups"):
+            c.execute("ALTER TABLE groups RENAME COLUMN rpm_limit TO concurrency_limit")
+
+        # 数据渠道的「每号并发」:老库没有这一列,0 = 沿用原来不限并发的口径。
+        if "key_concurrency" not in cols("channels"):
+            c.execute("ALTER TABLE channels ADD COLUMN key_concurrency INTEGER DEFAULT 0")
+
+        if "community_level" not in cols("community_auth_flows"):
+            c.execute("ALTER TABLE community_auth_flows ADD COLUMN community_level INTEGER")
         if "referral_code" not in cols("community_auth_flows"):
             c.execute("ALTER TABLE community_auth_flows ADD COLUMN referral_code TEXT")
 
@@ -354,11 +402,13 @@ class UserDB:
                 ("actual_cost", "REAL DEFAULT 0"),
                 ("billing_mode", "TEXT DEFAULT 'free'"),
                 ("pricing_snapshot", "TEXT"),
-                # 按号统计的锚点。不加这一列,面板上的「该账号用量」就只能是
-                # 渠道级汇总 —— 一个渠道几十个号时那个数对站长没有意义。
-                ("account_id", "INTEGER")):
+                ("upstream_account_id", "INTEGER"),
+                ("account_cost", "REAL")):
             if name not in added:
                 c.execute(f"ALTER TABLE usage_logs ADD COLUMN {name} {ddl}")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_usage_account_time ON usage_logs(upstream_account_id, created_at)")
+        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('pool_usage_tracking_since',?)",
+                  (json.dumps(int(time.time())),))
 
         ucols = cols("users")
         for name, ddl in (("balance", "REAL DEFAULT 0"),
@@ -412,6 +462,10 @@ class UserDB:
         # 处理(见 core/orders.py),不能拿 NULL 当 0 去比,否则老单全被判少付。
         if "pay_amount_cny" not in cols("orders"):
             c.execute("ALTER TABLE orders ADD COLUMN pay_amount_cny REAL")
+        if "pay_amount_mao" not in cols("orders"):
+            c.execute("ALTER TABLE orders ADD COLUMN pay_amount_mao INTEGER")
+        if "pay_merchant_id" not in cols("orders"):
+            c.execute("ALTER TABLE orders ADD COLUMN pay_merchant_id TEXT")
 
     def _conn(self):
         return self._conns.get()
@@ -432,7 +486,7 @@ class UserDB:
     # ---- groups ----
 
     def create_group(self, name, rate_multiplier=1.0, supported_models=None,
-                     rpm_limit=0, daily_limit=0, weekly_limit=0, monthly_limit=0,
+                     concurrency_limit=0, daily_limit=0, weekly_limit=0, monthly_limit=0,
                      limit_unit="requests", is_default=0, status="active",
                      billing_policy="free", listed=0, price=0.0,
                      duration_hours=0, notes=None):
@@ -442,12 +496,12 @@ class UserDB:
                 c.execute("UPDATE groups SET is_default=0")
             cur = c.execute(
                 "INSERT INTO groups(name,rate_multiplier,supported_models,billing_policy,"
-                "rpm_limit,daily_limit,weekly_limit,monthly_limit,limit_unit,"
+                "concurrency_limit,daily_limit,weekly_limit,monthly_limit,limit_unit,"
                 "is_default,status,listed,price,duration_hours,notes,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (name, rate_multiplier,
                  json.dumps(supported_models or []), billing_policy,
-                 rpm_limit, daily_limit, weekly_limit, monthly_limit,
+                 concurrency_limit, daily_limit, weekly_limit, monthly_limit,
                  limit_unit, is_default, status, listed, price,
                  duration_hours, notes, now))
             return cur.lastrowid
@@ -551,7 +605,6 @@ class UserDB:
                       "(email,code_hash,created_at,expires_at,attempts,sent) VALUES(?,?,?,?,0,0)",
                       (email, code_hash, now, now + 900))
 
-
     def finish_registration_mail(self, email, code_hash, sent):
         with self._conn() as c:
             if sent:
@@ -560,7 +613,6 @@ class UserDB:
             else:
                 c.execute("DELETE FROM registration_codes WHERE email=? AND code_hash=?",
                           (email, code_hash))
-
 
     def register_verified_user(self, email, code, password_hash, aff_code,
                                group_id, invite_code, require_invite):
@@ -610,7 +662,6 @@ class UserDB:
             c.execute("DELETE FROM registration_codes WHERE email=?", (email,))
             return uid, role, inviter_id
 
-
     def create_user(self, email, password_hash, aff_code, group_id=None,
                     inviter_id=None, role="user", status=US_ACTIVE):
         now = int(time.time())
@@ -647,16 +698,6 @@ class UserDB:
                 "SELECT COUNT(*) n FROM users WHERE inviter_id=?",
                 (user_id,)).fetchone()["n"]
 
-    def update_user(self, user_id, **fields):
-        if not fields:
-            return
-        cols = ",".join(f"{k}=?" for k in fields)
-        vals = list(fields.values()) + [user_id]
-        with self._conn() as c:
-            c.execute(f"UPDATE users SET {cols} WHERE id=?", vals)
-
-    # ---- 白嫖社区登录 ----
-
     def _grant_invite_reward(self, conn, user_id, now):
         """注册事务内判定资格、人数上限并入账，和建号共同提交。"""
         from core import site_settings as settings
@@ -681,13 +722,21 @@ class UserDB:
                           meta={"kind": "fixed_invite", "source_user_id": user_id},
                           transaction=conn, now=now)
 
-
     def invite_reward_count(self, user_id):
         with self._conn() as conn:
             return conn.execute(
                 "SELECT COUNT(*) FROM credit_ledger WHERE user_id=? AND reason='affiliate' "
                 "AND json_extract(meta,'$.kind')='fixed_invite'", (user_id,)).fetchone()[0]
 
+    def update_user(self, user_id, **fields):
+        if not fields:
+            return
+        cols = ",".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [user_id]
+        with self._conn() as c:
+            c.execute(f"UPDATE users SET {cols} WHERE id=?", vals)
+
+    # ---- 白嫖社区登录 ----
 
     def create_community_flow(self, state_hash, nonce_hash, purpose,
                               initiator_user_id, expires_at, referral_code=""):
@@ -702,7 +751,6 @@ class UserDB:
                 (state_hash, nonce_hash, purpose, initiator_user_id,
                  "pending", expires_at, now, referral_code))
             return cur.lastrowid
-
 
     def claim_community_flow(self, state_hash, nonce_hash, now=None):
         """callback 原子占用 state；同一个回调只能有一个请求进入换 token。"""
@@ -724,10 +772,11 @@ class UserDB:
         with self._conn() as c:
             return c.execute(
                 "UPDATE community_auth_flows SET status='ready',subject=?,"
-                "username=?,name=?,email=?,expires_at=? "
+                "username=?,name=?,email=?,community_level=?,expires_at=? "
                 "WHERE id=? AND status='exchanging'",
                 (profile["id"], profile["username"], profile.get("name"),
-                 profile["email"], expires_at, flow_id)).rowcount == 1
+                 profile["email"], profile.get("community_level"),
+                 expires_at, flow_id)).rowcount == 1
 
     def get_ready_community_flow(self, nonce_hash, now=None):
         now = int(time.time()) if now is None else int(now)
@@ -841,17 +890,13 @@ class UserDB:
                 c.rollback()
             raise
 
-    def register_community_user(self, flow_id, invite_code, aff_code,
+    def register_community_user(self, flow_id, aff_code,
                                 group_id=None, now=None):
-        """邀请码、用户、社区身份和 flow 在一个写事务里落地。
+        """按当前社区等级门槛建号、绑定和消费 flow 同事务；只创建普通用户。"""
+        import config
+        from core import site_settings
 
-        社区首次建号永远是普通用户且永远要邀请码，不走本地注册的首用户免码。
-        这里只接受 unused 且未过期的一次性 invitation 码；个人返佣码不能注册。
-        """
         now = int(time.time()) if now is None else int(now)
-        code = str(invite_code or "").strip().upper()
-        if not code:
-            raise CommunityInviteError("invite code required")
         c = self._conn()
         try:
             c.execute("BEGIN IMMEDIATE")
@@ -861,6 +906,18 @@ class UserDB:
                 (flow_id, now)).fetchone()
             if flow is None:
                 raise CommunityFlowError("community flow invalid or expired")
+            level = flow["community_level"]
+            # 与建号串行化：授权后调高门槛也不能沿用旧值；不能在此调用
+            # get_setting，它的连接上下文会提前提交当前事务。
+            setting = c.execute(
+                "SELECT value FROM settings WHERE key='community_min_level'").fetchone()
+            min_level = site_settings.community_min_level(stored=(
+                json.loads(setting["value"]) if setting else config.COMMUNITY_MIN_LEVEL))
+            if level is None:
+                raise CommunityLevelError("未能获取社区等级，请重新授权后重试")
+            if not min_level <= level <= 6:
+                raise CommunityLevelError(
+                    f"注册需要白嫖社区 Lv{min_level} 及以上，当前为 Lv{level}")
             if c.execute(
                     "SELECT 1 FROM community_identities WHERE subject=?",
                     (flow["subject"],)).fetchone():
@@ -869,13 +926,6 @@ class UserDB:
             email = str(flow["email"] or "").strip().lower()
             if c.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
                 raise CommunityEmailConflict("community email already registered")
-
-            rec = c.execute(
-                "SELECT * FROM redeem_codes WHERE code=?", (code,)).fetchone()
-            if (rec is None or rec["type"] != "invitation" or
-                    rec["status"] != "unused" or
-                    (rec["expires_at"] and rec["expires_at"] < now)):
-                raise CommunityInviteError("invalid invite code")
 
             inviter_id = None
             if flow["referral_code"]:
@@ -899,13 +949,6 @@ class UserDB:
                 "VALUES(?,?,?,?,?,?,?)",
                 (flow["subject"], user_id, flow["username"], flow["name"],
                  flow["email"], now, now))
-            changed = c.execute(
-                "UPDATE redeem_codes SET status='used',used_by=?,used_at=? "
-                "WHERE code=? AND type='invitation' AND status='unused' "
-                "AND (expires_at=0 OR expires_at>=?)",
-                (user_id, now, code, now)).rowcount
-            if changed != 1:
-                raise CommunityInviteError("invalid invite code")
             self._consume_community_flow(c, flow_id, now)
             c.commit()
             return {"user_id": user_id, "inviter_id": inviter_id,
@@ -924,7 +967,6 @@ class UserDB:
             if c.in_transaction:
                 c.rollback()
             raise
-
 
     def list_users(self, limit=100, offset=0):
         with self._conn() as c:
@@ -1074,54 +1116,46 @@ class UserDB:
     def add_usage(self, user_id, api_key_id=None, channel=None, model=None,
                   input_tokens=0, output_tokens=0, cost=0.0, actual_cost=0.0,
                   billing_mode="free", pricing_snapshot=None, stream=0,
-                  duration_ms=0, token_source="estimate", account_id=None):
+                  duration_ms=0, token_source="estimate", upstream_account_id=None,
+                  account_cost=None, *, transaction=None):
+        """写一条 usage_logs。
+
+        transaction: 调用方已开启的事务连接。传了就复用(不自己提交),让"扣费 + 写日志"
+        落在同一个事务里 —— 否则扣费成功而这里失败,用户被扣钱却查不到用量明细,
+        且重试会因幂等键已存在而静默跳过。不传则维持原行为(自带事务)。
+        """
         now = int(time.time())
         snap = (json.dumps(pricing_snapshot, ensure_ascii=False)
                 if pricing_snapshot is not None else None)
+        if transaction is not None:
+            return self._add_usage_row(transaction, user_id, api_key_id, channel,
+                                       model, input_tokens, output_tokens, cost,
+                                       actual_cost, billing_mode, snap, stream,
+                                       duration_ms, token_source,
+                                       upstream_account_id, account_cost, now)
         with self._conn() as c:
-            cur = c.execute(
-                "INSERT INTO usage_logs(user_id,api_key_id,channel,account_id,model,"
-                "input_tokens,output_tokens,cost,actual_cost,billing_mode,"
-                "pricing_snapshot,token_source,stream,duration_ms,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (user_id, api_key_id, channel, account_id, model, input_tokens,
-                 output_tokens, cost, actual_cost, billing_mode, snap,
-                 token_source, 1 if stream else 0, duration_ms, now))
-            return cur.lastrowid
+            return self._add_usage_row(c, user_id, api_key_id, channel, model,
+                                       input_tokens, output_tokens, cost,
+                                       actual_cost, billing_mode, snap, stream,
+                                       duration_ms, token_source,
+                                       upstream_account_id, account_cost, now)
 
-    def account_usage(self, account_ids, since=0):
-        """按账号聚合用量:请求数、token、实扣、最后使用时间。
-
-        只统计有 account_id 的行 —— 加这一列之前的历史日志归属不到号上,
-        把它们算进某个号等于编数。面板显示的是「可核对的那部分」。
-        """
-        ids = [int(i) for i in (account_ids or [])]
-        if not ids:
-            return {}
-        ph = ",".join("?" for _ in ids)
-        with self._conn() as c:
-            rows = c.execute(
-                f"SELECT account_id, COUNT(*) reqs, "
-                f"COALESCE(SUM(input_tokens),0) in_tok, "
-                f"COALESCE(SUM(output_tokens),0) out_tok, "
-                f"COALESCE(SUM(actual_cost),0) cost, "
-                f"COALESCE(AVG(duration_ms),0) avg_ms, "
-                f"MAX(created_at) last_at "
-                f"FROM usage_logs WHERE account_id IN ({ph}) AND created_at>=? "
-                f"GROUP BY account_id", [*ids, since]).fetchall()
-        return {r["account_id"]: dict(r) for r in rows}
-
-    def account_usage_daily(self, account_id, days=14):
-        """某个号近 N 天的日序列,给统计弹窗画趋势。"""
-        since = int(time.time()) - days * 86400
-        with self._conn() as c:
-            rows = c.execute(
-                "SELECT date(created_at,'unixepoch','localtime') d, "
-                "COUNT(*) reqs, COALESCE(SUM(input_tokens+output_tokens),0) tok, "
-                "COALESCE(SUM(actual_cost),0) cost FROM usage_logs "
-                "WHERE account_id=? AND created_at>=? GROUP BY d ORDER BY d",
-                (int(account_id), since)).fetchall()
-        return [dict(r) for r in rows]
+    @staticmethod
+    def _add_usage_row(c, user_id, api_key_id, channel, model, input_tokens,
+                       output_tokens, cost, actual_cost, billing_mode, snap,
+                       stream, duration_ms, token_source, upstream_account_id,
+                       account_cost, now):
+        """所有 usage_logs 写入共用这一条;调用方负责事务边界。"""
+        cur = c.execute(
+            "INSERT INTO usage_logs(user_id,api_key_id,channel,model,"
+            "input_tokens,output_tokens,cost,actual_cost,billing_mode,"
+            "pricing_snapshot,token_source,stream,duration_ms,created_at,upstream_account_id,account_cost) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, api_key_id, channel, model, input_tokens,
+             output_tokens, cost, actual_cost, billing_mode, snap,
+             token_source, 1 if stream else 0, duration_ms, now,
+             upstream_account_id, account_cost))
+        return cur.lastrowid
 
     def usage_overview(self, user_id, since=0):
         """概览用的一次性聚合:请求数、输入/输出 token、原价与实扣、耗时。
@@ -1164,7 +1198,7 @@ class UserDB:
     def token_leaderboard(self, user_id, since=0, until=None, page=1, page_size=20):
         """启用账号的用量榜；无调用账号也在主体集合内，分页和本人排名用同一快照。
 
-        排名只统计输入 + 输出；缓存另外展示，不计入排名。
+        与 usage_overview 一致：输入 + 输出 + 从 total_ctx 反推的缓存。
         并列用量同名次，分页顺序按用户 ID 稳定排列。
         """
         until = int(time.time()) if until is None else until
@@ -1208,11 +1242,10 @@ class UserDB:
             "total_tokens": records[0]["all_tokens"] if records else 0,
         }
 
-
     def usage_daily(self, user_id, days=14):
-        """按本地日历日分桶的近 N 天用量,供概览折线/柱状图。
+        """按北京时间日历日分桶的近 N 天用量,供概览折线/柱状图。
 
-        用 date(...,'localtime') 而不是「now - k*86400」滚动窗口:图表的 X 轴
+        用 date(...,'+8 hours') 而不是「now - k*86400」滚动窗口:图表的 X 轴
         是日期标签,滚动窗口切出来的桶边界落在半天上,标签会对不上。
         只返回有记录的日子,补零交给前端(它才知道要画多少格)。
 
@@ -1221,7 +1254,7 @@ class UserDB:
         since = int(time.time()) - max(1, days) * 86400
         with self._conn() as c:
             rows = c.execute(
-                "SELECT date(created_at,'unixepoch','localtime') d, "
+                "SELECT date(created_at,'unixepoch','+8 hours') d, "
                 "COUNT(*) reqs, "
                 "COALESCE(SUM(input_tokens),0) in_tok, "
                 "COALESCE(SUM(output_tokens),0) out_tok, "
@@ -1364,6 +1397,79 @@ class UserDB:
                 args + [int(limit), int(offset)]).fetchall()
         return [self._row(r) for r in rows], total
 
+    def live_usage(self, now, day_start, *, user_id=None):
+        """全站或指定用户的今日实扣与最近 60 秒请求/Token，使用同一统计时点。"""
+        minute_start = now - 60
+        scope = " AND user_id=?" if user_id is not None else ""
+        args = (day_start, minute_start, minute_start, min(day_start, minute_start), now)
+        if user_id is not None:
+            args += (user_id,)
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COALESCE(SUM(CASE WHEN created_at>=? THEN actual_cost ELSE 0 END),0) today_cost, "
+                "COUNT(CASE WHEN created_at>? THEN 1 END) rpm, "
+                "COALESCE(SUM(CASE WHEN created_at>? THEN "
+                "COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+"
+                "COALESCE(MAX(json_extract(pricing_snapshot,'$.total_ctx')-input_tokens,0),0) "
+                "ELSE 0 END),0) tpm "
+                "FROM usage_logs WHERE created_at>=? AND created_at<=?" + scope, args).fetchone()
+        return {"today_cost": row["today_cost"], "rpm": row["rpm"], "tpm": row["tpm"]}
+
+    @staticmethod
+    def _cache_usage_row(values):
+        row = dict(values)
+        row["total_input_tokens"] = row["input_tokens"] + (row["cache_tokens"] or 0)
+        row["tokens"] = row["total_input_tokens"] + row["output_tokens"]
+        row["cache_rate"] = (row["cache_tokens"] / row["total_input_tokens"] * 100
+                             if row["cache_tokens"] is not None and row["total_input_tokens"] else None)
+        return row
+
+    @classmethod
+    def cache_usage_summary(cls, rows):
+        fields = ("requests", "input_tokens", "output_tokens", "cache_rows",
+                  "cache_read_rows", "cache_write_rows", "actual_cost", "cost")
+        summary = {field: sum(row[field] for row in rows) for field in fields}
+        for field in ("cache_tokens", "cache_read_tokens", "cache_write_tokens"):
+            known = [row[field] for row in rows if row[field] is not None]
+            summary[field] = sum(known) if known else None
+        return cls._cache_usage_row(summary)
+
+    def model_cache_usage(self, *, user_id=None, since=0, until=None, model=None, models=None, daily=False):
+        """按模型或北京时间日期聚合缓存；多模型比较保留各自日期，模型精确匹配。"""
+        where, args = self._usage_where(user_id=user_id, since=since, until=until)
+        if model is not None:
+            where += " AND COALESCE(NULLIF(l.model,''),'未记录模型')=?"
+            args.append(model)
+        if models:
+            where += " AND COALESCE(NULLIF(l.model,''),'未记录模型') IN (SELECT value FROM json_each(?))"
+            args.append(json.dumps(models, ensure_ascii=False))
+        dimension = "date(created_at,'unixepoch','+8 hours') AS date" if daily else "model"
+        grouping = "date" if daily else "model"
+        if daily and models:
+            dimension = "model, " + dimension
+            grouping = "model, date"
+        with self._conn() as c:
+            raw = c.execute(
+                "WITH samples AS (SELECT COALESCE(NULLIF(l.model,''),'未记录模型') model, l.created_at, l.input_tokens, l.output_tokens, l.actual_cost, l.cost, "
+                "CASE WHEN json_extract(l.pricing_snapshot,'$.total_ctx') IS NOT NULL "
+                "THEN MAX(json_extract(l.pricing_snapshot,'$.total_ctx')-l.input_tokens,0) END cache_tok, "
+                "json_extract(l.pricing_snapshot,'$.cache_read_tokens') read_tok, "
+                "CASE WHEN COALESCE(json_extract(l.pricing_snapshot,'$.cache_usage_version'),0)>0 "
+                "OR json_extract(l.pricing_snapshot,'$.cache_write_tokens')<>0 "
+                "THEN json_extract(l.pricing_snapshot,'$.cache_write_tokens') END write_tok "
+                f"FROM usage_logs l WHERE {where}) "
+                f"SELECT {dimension}, COUNT(*) requests, COALESCE(SUM(input_tokens),0) input_tokens, "
+                "COALESCE(SUM(output_tokens),0) output_tokens, SUM(cache_tok) cache_tokens, "
+                "COUNT(cache_tok) cache_rows, SUM(read_tok) cache_read_tokens, COUNT(read_tok) cache_read_rows, "
+                "SUM(write_tok) cache_write_tokens, COUNT(write_tok) cache_write_rows, "
+                f"COALESCE(SUM(actual_cost),0) actual_cost, COALESCE(SUM(cost),0) cost FROM samples GROUP BY {grouping}", args).fetchall()
+        rows = [self._cache_usage_row(row) for row in raw]
+        if daily:
+            rows.sort(key=lambda row: (row["date"], row.get("model", "")))
+        else:
+            rows.sort(key=lambda row: (-(row["cache_tokens"] or 0), -row["requests"], row["model"] or ""))
+        return {"series" if daily else "models": rows, "summary": self.cache_usage_summary(rows)}
+
     def usage_totals(self, **filters):
         """一组过滤条件下的合计:请求、token(含由 total_ctx 反推的缓存)、原价/实扣、
         活跃用户数、平均耗时与首字、长上下文次数,以及按 end_reason 的分布
@@ -1404,11 +1510,11 @@ class UserDB:
         }
 
     def usage_daily_all(self, days=14):
-        """全站按本地日历日的日序列(请求、token、实扣、活跃用户)。补零交给前端。"""
+        """全站按北京时间日历日的日序列(请求、token、实扣、活跃用户)。补零交给前端。"""
         since = int(time.time()) - max(1, days) * 86400
         with self._conn() as c:
             rows = c.execute(
-                "SELECT date(created_at,'unixepoch','localtime') d, COUNT(*) reqs, "
+                "SELECT date(created_at,'unixepoch','+8 hours') d, COUNT(*) reqs, "
                 "COUNT(DISTINCT user_id) users, "
                 "COALESCE(SUM(input_tokens+output_tokens),0) tokens, "
                 "COALESCE(SUM(actual_cost),0) cost "
@@ -1463,9 +1569,10 @@ class UserDB:
         return {r["reason"]: {"amount": r["s"], "count": r["n"]} for r in rows}
 
     def orders_completed(self, since=0, until=None):
-        """真金白银:已完成订单的笔数、美元额度、人民币实收。"""
+        """已完成订单的美元额度，以及分开统计的人民币与毛。"""
         q = ("SELECT COUNT(*) n, COALESCE(SUM(amount),0) usd, "
-             "COALESCE(SUM(pay_amount_cny),0) cny FROM orders "
+             "COALESCE(SUM(pay_amount_cny),0) cny, "
+             "COALESCE(SUM(pay_amount_mao),0) mao FROM orders "
              "WHERE status='completed' AND completed_at>=?")
         args = [int(since)]
         if until:
@@ -1473,7 +1580,7 @@ class UserDB:
             args.append(int(until))
         with self._conn() as c:
             r = c.execute(q, args).fetchone()
-        return {"count": r["n"], "usd": r["usd"], "cny": r["cny"]}
+        return {"count": r["n"], "usd": r["usd"], "cny": r["cny"], "mao": r["mao"]}
 
     def balance_totals(self):
         """所有用户余额之和 —— 这是站长对用户的负债,看板上必须有这个数。"""
@@ -1484,15 +1591,58 @@ class UserDB:
                 "COUNT(*) users FROM users").fetchone()
         return {"owed": r["owed"], "overdrawn": r["overdrawn"], "users": r["users"]}
 
+    def start_admin_audit(self, actor, action, target, before, ip):
+        with self._conn() as c:
+            return c.execute("INSERT INTO admin_audit(at,actor,action,target,before_state,ip) VALUES(?,?,?,?,?,?)",
+                (int(time.time()), actor, action, json.dumps(target), json.dumps(before), ip)).lastrowid
+
+    def finish_admin_audit(self, audit_id, status, changes, after):
+        with self._conn() as c:
+            c.execute("UPDATE admin_audit SET status=?,changes=?,after_state=? WHERE id=?",
+                      (status, json.dumps(changes), json.dumps(after), audit_id))
+
+    def list_admin_audit(self, limit=100, offset=0):
+        with self._conn() as c:
+            rows = [dict(row) for row in c.execute("SELECT * FROM admin_audit ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (max(1, min(limit, 500)), max(0, offset)))]
+        for row in rows:
+            for key in ("target", "before_state", "after_state", "changes"):
+                row[key] = json.loads(row[key]) if row[key] else None
+        return rows
+
     # ---- email_verifications ----
 
     def add_email_verification(self, user_id, email, code, ttl=900):
+        import hashlib
         now = int(time.time())
         with self._conn() as c:
+            c.execute("UPDATE email_verifications SET verified_at=? WHERE user_id=? AND verified_at=0",
+                      (now, user_id))
             cur = c.execute(
                 "INSERT INTO email_verifications(user_id,email,code,expires_at,created_at) "
-                "VALUES(?,?,?,?,?)", (user_id, email, code, now + ttl, now))
+                "VALUES(?,?,?,?,?)", (user_id, email, hashlib.sha256(code.encode()).hexdigest(), now + ttl, now))
             return cur.lastrowid
+
+    def verify_and_bind_email(self, user_id, code):
+        import hashlib
+        from core.security import secret_equal
+        now, error = int(time.time()), None
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            proof = c.execute("SELECT * FROM email_verifications WHERE user_id=? ORDER BY id DESC LIMIT 1",
+                              (user_id,)).fetchone()
+            if not proof or proof["verified_at"] or proof["expires_at"] <= now or proof["attempts"] >= 5:
+                error = "验证码无效或已过期，请重新获取"
+            elif not secret_equal(hashlib.sha256(code.encode()).hexdigest(), proof["code"]):
+                c.execute("UPDATE email_verifications SET attempts=attempts+1 WHERE id=?", (proof["id"],))
+                error = "验证码不正确"
+            elif c.execute("SELECT 1 FROM users WHERE email=? AND id<>?", (proof["email"], user_id)).fetchone():
+                error = "该邮箱已被其他账号绑定"
+            else:
+                c.execute("UPDATE users SET email=?,email_verified_at=? WHERE id=?", (proof["email"], now, user_id))
+                c.execute("UPDATE email_verifications SET verified_at=? WHERE id=?", (now, proof["id"]))
+        if error:
+            raise ValueError(error)
 
     def get_latest_verification(self, user_id, email):
         with self._conn() as c:
@@ -1573,17 +1723,6 @@ class UserDB:
         with self._conn() as c:
             return c.execute("DELETE FROM settings WHERE key=?", (key,)).rowcount
 
-    def all_settings(self):
-        with self._conn() as c:
-            rows = c.execute("SELECT key,value FROM settings").fetchall()
-        out = {}
-        for r in rows:
-            try:
-                out[r["key"]] = json.loads(r["value"])
-            except Exception:
-                out[r["key"]] = r["value"]
-        return out
-
     # ---- 公告已读状态(正文在 settings,已读按用户落表) ----
 
     def announcement_reads(self, user_id):
@@ -1628,6 +1767,9 @@ class UserDB:
     def apply_credit(self, user_id, amount, reason, idem_key, meta=None, *, transaction=None, now=None):
         """单事务写流水 + 增量更新余额。返回 (ledger_row, created:bool)。
         idem_key 已存在则不重复记账,返回既有记录与 created=False。"""
+        import math
+        if not math.isfinite(float(amount)):
+            raise ValueError("amount must be finite")
         now = int(time.time()) if now is None else now
         if transaction is not None:
             return self._apply_credit_row(transaction, user_id, amount, reason, idem_key, meta, now)
@@ -1639,7 +1781,6 @@ class UserDB:
             conn.execute("BEGIN IMMEDIATE")
             return self._apply_credit_row(conn, user_id, amount, reason, idem_key, meta, now)
 
-
     def _apply_credit_row(self, conn, user_id, amount, reason, idem_key, meta, now):
         """所有入账共用同一条事实写入；调用方负责事务边界。"""
         existing = conn.execute("SELECT * FROM credit_ledger WHERE idem_key=?", (idem_key,)).fetchone()
@@ -1649,14 +1790,16 @@ class UserDB:
             "UPDATE users SET balance = COALESCE(balance,0) + ?, "
             "total_spent = COALESCE(total_spent,0) + ? WHERE id=?",
             (amount, -amount if amount < 0 else 0, user_id))
-        row = conn.execute("SELECT balance FROM users WHERE id=?", (user_id,)).fetchone()
+        row = conn.execute("SELECT balance,total_spent FROM users WHERE id=?", (user_id,)).fetchone()
+        import math
+        if row and not all(math.isfinite(float(row[key] or 0)) for key in ("balance", "total_spent")):
+            raise ValueError("resulting balance and total_spent must be finite")
         balance_after = row["balance"] if row else None
         cur = conn.execute(
             "INSERT INTO credit_ledger(user_id,amount,reason,idem_key,meta,balance_after,created_at) "
             "VALUES(?,?,?,?,?,?,?)", (user_id, amount, reason, idem_key,
              json.dumps(meta, ensure_ascii=False) if meta is not None else None, balance_after, now))
         return self._row(conn.execute("SELECT * FROM credit_ledger WHERE id=?", (cur.lastrowid,)).fetchone()), True
-
 
     def get_ledger_by_idem(self, idem_key):
         with self._conn() as c:
@@ -1685,6 +1828,17 @@ class UserDB:
         with self._conn() as c:
             return c.execute(q, args).fetchone()["s"] or 0.0
 
+    def count_ledger(self, user_id, reason=None):
+        """某用户某类流水有几笔。共享 Key 的每人上限按这个数判 —— 走流水而不是
+        另建一张表:奖励本来就是流水的一行,数一遍就是事实,不必再存一份可能对不上。"""
+        q = "SELECT COUNT(*) n FROM credit_ledger WHERE user_id=?"
+        args = [user_id]
+        if reason:
+            q += " AND reason=?"
+            args.append(reason)
+        with self._conn() as c:
+            return c.execute(q, args).fetchone()["n"]
+
     # ---- redeem_codes ----
 
     def create_code(self, code, value, type="balance", expires_at=0, notes=None):
@@ -1704,9 +1858,8 @@ class UserDB:
     def claim_code(self, code, user_id):
         """原子占用:仅当 status='unused' 时置为 used。返回是否抢到(rowcount==1)。
 
-        user_id 允许为 None —— 注册用的邀请码必须先占用再建号(反过来的话并发的
-        两个注册都能通过校验,一张一次性码进两个人),占用那一刻还没有用户 id,
-        建号之后再用 bind_code_user 回填。
+        user_id 允许为 None —— 给「码先占位、用户后建」的流程留口子。当前唯一调用方
+        (core/redeem.py)在调用时已有用户 id,这个口子暂时用不到。
         """
         now = int(time.time())
         with self._conn() as c:
@@ -1714,13 +1867,6 @@ class UserDB:
                 "UPDATE redeem_codes SET status='used', used_by=?, used_at=? "
                 "WHERE code=? AND status='unused'",
                 (user_id, now, code)).rowcount == 1
-
-    def bind_code_user(self, code, user_id):
-        """给已占用但还没绑人的码补上使用者。见 claim_code 的两步说明。"""
-        with self._conn() as c:
-            return c.execute(
-                "UPDATE redeem_codes SET used_by=? "
-                "WHERE code=? AND used_by IS NULL", (user_id, code)).rowcount
 
     def list_codes(self, status=None, type=None, limit=100, offset=0):
         q, args = "SELECT * FROM redeem_codes WHERE 1=1", []
@@ -1774,6 +1920,14 @@ class UserDB:
         with self._conn() as c:
             return self._row(c.execute(
                 "SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+
+    def set_order_mao_quote(self, out_trade_no, mao, merchant_id):
+        """毛支付报价与收款商户一同冻结，不混入人民币统计。"""
+        with self._conn() as c:
+            return c.execute(
+                "UPDATE orders SET pay_amount_mao=?,pay_merchant_id=? "
+                "WHERE out_trade_no=? AND status='pending' AND pay_amount_mao IS NULL",
+                (int(mao), str(merchant_id), out_trade_no)).rowcount == 1
 
     def get_order_by_trade_no(self, out_trade_no):
         with self._conn() as c:
@@ -1843,7 +1997,7 @@ class UserDB:
     # ---- channels(数据渠道) ----
 
     CHANNEL_FIELDS = ("type", "base_url", "chat_path", "models", "model_map",
-                      "headers", "timeout", "notes")
+                      "headers", "timeout", "key_concurrency", "notes")
 
     def list_channels(self):
         with self._conn() as c:
@@ -1884,7 +2038,53 @@ class UserDB:
 
     def delete_channel_config(self, name):
         with self._conn() as c:
+            c.execute("DELETE FROM model_status WHERE channel=?", (name,))
             return c.execute("DELETE FROM channels WHERE name=?", (name,)).rowcount == 1
+
+    # ---- model_status(模型状态巡检,追加式历史) ----
+
+    def add_model_status(self, channel, model, ok, latency_ms=0, ttft_ms=None,
+                         error=None, checked_at=None):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO model_status(channel,model,ok,latency_ms,ttft_ms,"
+                "error,checked_at) VALUES(?,?,?,?,?,?,?)",
+                (channel, model, int(ok), int(latency_ms or 0),
+                 int(ttft_ms) if ttft_ms else None,
+                 (str(error)[:500] if error else None),
+                 int(checked_at or time.time())))
+
+    def latest_model_status(self, channel=None):
+        """每个 (channel, model) 的最近一行。channel 给定时只看该渠道。"""
+        sql = ("SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
+               "(PARTITION BY channel, model ORDER BY checked_at DESC, id DESC) rn "
+               "FROM model_status")
+        args = []
+        if channel:
+            sql += " WHERE channel=?"
+            args.append(channel)
+        sql += ") WHERE rn=1 ORDER BY channel, model"
+        with self._conn() as c:
+            return [self._row(r) for r in c.execute(sql, args).fetchall()]
+
+    def history_model_status(self, since):
+        """最近 7 天的原始检测行(状态条按天聚合用)。"""
+        with self._conn() as c:
+            return [self._row(r) for r in c.execute(
+                "SELECT * FROM model_status WHERE checked_at>=? ORDER BY checked_at",
+                (int(since),)).fetchall()]
+
+    def get_model_status(self, channel, model):
+        with self._conn() as c:
+            return self._row(c.execute(
+                "SELECT * FROM model_status WHERE channel=? AND model=? "
+                "ORDER BY checked_at DESC, id DESC LIMIT 1",
+                (channel, model)).fetchone())
+
+    def prune_model_status(self, before):
+        with self._conn() as c:
+            return c.execute("DELETE FROM model_status WHERE checked_at<?",
+                             (int(before),)).rowcount
 
     # ---- model_pricing ----
 

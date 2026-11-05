@@ -51,11 +51,21 @@ python main.py                 # 默认 0.0.0.0:8080;密钥是默认值时会拒
 
 `/pay/notify/` 必须能从公网打进来;`/admin/*` 号池端点现在认管理密钥也认管理员 JWT,管理台自己就能操作号池,不再需要 nginx 层注入密钥。
 
+应用默认不读取代理头。使用反代时，限制源站只能由可信反代访问，设置
+`BITAPI_TRUST_PROXY_HEADERS=1`，并沿用样板覆盖 `X-Forwarded-For` 的配置。
+浏览器登录使用 HttpOnly cookie 与 CSRF token；升级后需重新登录。脚本客户端继续使用 Bearer。
+请求体默认上限 12 MiB，音频转录为 26 MiB，可用 `BITAPI_MAX_REQUEST_BYTES` /
+`BITAPI_MAX_AUDIO_BYTES` 调整；音频与分块上传也受应用层限制。
+
+Compose 使用只读根文件系统、可写 `/data` 和 `/tmp`；产号结果随数据库目录存放。
+镜像只携带 `data/pricing_seed.json`。此规则不能清除旧镜像层：若旧镜像已分发，
+还需定位并清除旧镜像，作废其中的上游 key。
+
 ## 上线前核对
 
 - [ ] 三个密钥已改;`BITAPI_SITE_URL` 是公网域名(支付回调、找回密码链接都用它)
 - [ ] 管理台「站点设置」:注册是否要邀请码、默认分组、SMTP(点「发测试邮件」)、支付渠道
-- [ ] 管理台「渠道」:上游地址、导 key、逐个「测试」;「模型定价」给每个模型配价(没配价按免费计)
+- [ ] 管理台「渠道」:上游地址、导 key、逐个「测试」;「模型定价」给每个模型配价，免费模型也显式配置 free；缺价会拒绝调用
 - [ ] `BITAPI_PLUGINS` 含 `alert_webhook` 且 `BITAPI_ALERT_WEBHOOK_URL` 已设 —— 号池打空、订单卡住、备份失败、SMTP 坏了都靠它通知
 - [ ] 「运行状态」里看到第一份备份已生成
 

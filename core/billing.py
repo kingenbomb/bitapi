@@ -6,7 +6,7 @@
 三种计费策略(groups.billing_policy)平级可选:
   balance  余额扣费。预检 balance > 0,结算走 credit(-actual_cost)
   quota    日/周/月用量限额(不扣钱)
-  free     不计费,只限速
+  free     不计费,只限制并发
 
 密钥级管控(api_keys 的 quota / allowed_models / allowed_ips)只能在分组基础上
 「收紧」,不能扩权:模型必须同时过分组白名单与密钥白名单;额度是本密钥的累计
@@ -16,9 +16,10 @@
 价格由 core.pricing 解析(手配定价 → 内置目录价 → LiteLLM → 免费);
 钱的变动一律经 core.credit(幂等)。结算后 emit("usage.recorded")。
 
-限流状态(RPM)用进程内滑动窗口,依赖单 worker。日/周/月额度从 usage_logs 实时聚合。
+并发状态按用户计数,依赖单 worker。日/周/月额度从 usage_logs 实时聚合。
 """
 import ipaddress
+import json
 import threading
 import time
 
@@ -26,7 +27,7 @@ import config
 from core.hooks import emit
 
 # 限流/计费错误码
-LIMIT_RPM = "RPM_LIMIT_EXCEEDED"
+LIMIT_CONCURRENCY = "CONCURRENCY_LIMIT_EXCEEDED"
 LIMIT_DAILY = "DAILY_LIMIT_EXCEEDED"
 LIMIT_WEEKLY = "WEEKLY_LIMIT_EXCEEDED"
 LIMIT_MONTHLY = "MONTHLY_LIMIT_EXCEEDED"
@@ -80,8 +81,8 @@ class Billing:
         self.pricing = pricing
         self._cache = {}
         self._cache_lock = threading.Lock()
-        self._rpm = {}
-        self._rpm_lock = threading.Lock()
+        self._inflight = {}
+        self._inflight_lock = threading.Lock()
 
     # ---- 鉴权解析 ----
 
@@ -187,24 +188,15 @@ class Billing:
     # ---- 请求前预检 ----
 
     def precheck(self, user, group):
-        """RPM → 密钥额度 → 按 billing_policy 分流。超限抛 RateLimitError,
+        """密钥额度 → 按 billing_policy 分流。超限抛 RateLimitError,
         余额不足抛 InsufficientBalanceError,密钥额度用尽抛 KeyQuotaError。
         group 为 None 时只跳过分组额度检查,密钥额度仍然生效。"""
+        from core.account_runtime import bind_group
+        bind_group(group)
         self._check_key_quota(user)
         if not group:
             return
         uid = user["id"]
-
-        rpm = group.get("rpm_limit") or 0
-        if rpm > 0:
-            now = time.time()
-            with self._rpm_lock:
-                window = [t for t in self._rpm.get(uid, []) if now - t < 60]
-                if len(window) >= rpm:
-                    self._rpm[uid] = window
-                    raise RateLimitError(LIMIT_RPM, f"rate limit {rpm}/min exceeded")
-                window.append(now)
-                self._rpm[uid] = window
 
         policy = self.policy_of(group)
         if policy == POLICY_BALANCE:
@@ -215,6 +207,36 @@ class Billing:
                     f"balance {balance:.6f} is not enough", balance=balance)
         elif policy == POLICY_QUOTA:
             self._check_quota(uid, group)
+
+    def acquire_concurrency(self, user, group):
+        """占用一个用户并发名额,返回幂等释放函数。所有密钥与在线体验共用。
+
+        不限额时也计数,让管理员调低上限后仍能正确识别正在执行的请求。
+        调用方在完整响应结束(流式含断连后的排空与结算)后释放。
+        """
+        uid = user["id"]
+        limit = (group or {}).get("concurrency_limit") or 0
+        with self._inflight_lock:
+            active = self._inflight.get(uid, 0)
+            if limit > 0 and active >= limit:
+                raise RateLimitError(
+                    LIMIT_CONCURRENCY, f"concurrent request limit {limit} exceeded")
+            self._inflight[uid] = active + 1
+        released = False
+
+        def release():
+            nonlocal released
+            with self._inflight_lock:
+                if released:
+                    return
+                released = True
+                remaining = self._inflight[uid] - 1
+                if remaining:
+                    self._inflight[uid] = remaining
+                else:
+                    del self._inflight[uid]
+
+        return release
 
     def _check_key_quota(self, user):
         """密钥自身的消费上限。不预占:与余额透支同策略,允许本次超,下次拦住。
@@ -259,31 +281,45 @@ class Billing:
                      upstream_usage=None, request_messages=None, output_text=None,
                      stream=False, duration_ms=0, units=1,
                      request_id=None, end_reason=None, first_token_ms=None,
-                     account_id=None):
+                      client_ip=None, upstream_account_id=None, account_multiplier=None, estimated_usage=None):
         """写 usage_logs 并按策略扣费。返回 usage_log 的 id(重复结算返回既有 id)。
 
           adapter          : 命中的 adapter(读 billing_mode 作计量提示)
-          upstream_usage   : 上游 usage dict(上游如实返回时才有)
+          upstream_usage   : 上游 usage dict(官方反代/inceptionlabs 有)
           request_messages : 入站 OpenAI messages(估算 input)
           output_text      : 模型输出文本(估算 output)
           units            : per_request 模式的计费份数(图片张数等)
           request_id       : 幂等键来源。同一 request_id 重复结算只扣一次
           end_reason       : done | eof | client_gone | scanner_error | error
           first_token_ms   : 首字延迟(ms),流式争议时的复盘依据
-          account_id       : 实际作答的号池账号(accounts.id)。面板按号统计靠它,
-                             不参与计费 —— 归不到号上时传 None,日志照写。
+          client_ip        : 按站点反代规则识别的客户端 IP
 
         透支策略(对齐 sub2api):不做额度预占,允许本次请求把余额扣成负数,
         保证进行中的请求能完成;下一次请求由 precheck 的 balance<=0 拦住。
         风险上界 = 单个 in-flight 批次,不随时间累积。
         """
         from core.adapter import BILL_ESTIMATE
-        from core.metering import resolve_usage
+        from core.metering import cache_tokens, cache_write_ttls, resolve_usage
+
+        if self.pricing:
+            model = self.pricing.canonical(model)
 
         mode_hint = getattr(adapter, "billing_mode", BILL_ESTIMATE) if adapter else BILL_ESTIMATE
+        if callable(getattr(adapter, "billing_mode_for", None)):
+            mode_hint = adapter.billing_mode_for(model)
         in_tok, out_tok, source = resolve_usage(
-            mode_hint, upstream_usage, request_messages, output_text)
-        cache_read, cache_write = _cache_tokens(upstream_usage)
+            mode_hint, upstream_usage, request_messages, output_text, estimated_usage=estimated_usage)
+        reported_read, reported_write = cache_tokens(upstream_usage)
+        reported_ttls = cache_write_ttls(upstream_usage)
+        cache_read, cache_write = reported_read or 0, reported_write or 0
+        # 上游报的 prompt_tokens 是**总输入**(含缓存命中/写入的那部分):
+        #   OpenAI 口径 prompt_tokens 含 cached;Anthropic 口径我们已在桥里
+        #   拼成 input+cache_read+cache_write。
+        # 而 compute() 会把 cache_read / cache_write 单独按缓存单价再算一遍 ——
+        # 不把这两块从 in_tok 里扣掉,就等于**按输入价又收了一次缓存钱**。
+        # 扣掉之后 total_ctx = in_tok + cache_write + cache_read 仍是真实总输入。
+        if cache_read or cache_write:
+            in_tok = max(0, int(in_tok) - cache_read - cache_write)
 
         mult = (group.get("rate_multiplier") if group else 1.0) or 1.0
         policy = self.policy_of(group)
@@ -293,14 +329,32 @@ class Billing:
             cost, actual_cost, snapshot = self.pricing.compute(
                 priced, in_tok=in_tok, out_tok=out_tok,
                 cache_read=cache_read, cache_write=cache_write,
-                units=units, rate_multiplier=mult)
+                units=units, rate_multiplier=mult, cache_write_ttls=reported_ttls)
             billing_mode = snapshot.get("mode", "free")
         else:
             cost = actual_cost = 0.0
             billing_mode = "free"
             snapshot = {"mode": "free", "tier": "official", "rate_multiplier": mult}
 
+        # 上游失败保留用量日志，但不扣余额、密钥额度或产生消费返佣。
+        # 主动断开只有实际产生输出才计费；旧调用没有 end_reason 时沿用成功结算。
+        if (end_reason in {"eof", "scanner_error", "error", "idle_timeout", "first_output_timeout"}
+                or (end_reason == "client_gone" and out_tok <= 0)):
+            cost = actual_cost = 0.0
+
+        # 保留实际参与计费的缓存读写量，日志无需再由 total_ctx 倒推。
+        # 估算请求拿不到缓存明细，null 与上游明确的 0 分开。
+        snapshot["cache_usage_version"] = 3
+        snapshot["cache_read_tokens"] = reported_read
+        snapshot["cache_write_tokens"] = reported_write
+        if client_ip:
+            try:
+                snapshot["client_ip"] = str(ipaddress.ip_address(client_ip))
+            except ValueError:
+                pass  # 只保存有效 IP，代理头里的任意文本不能进入日志/CSV。
         snapshot["policy"] = policy
+        if source == "estimate" and estimated_usage and estimated_usage.get("image_token_estimate"):
+            snapshot["image_token_estimate"] = estimated_usage["image_token_estimate"]
         if request_id:
             snapshot["request_id"] = request_id
         if end_reason:
@@ -308,32 +362,59 @@ class Billing:
         if first_token_ms is not None:
             snapshot["frt_ms"] = first_token_ms
 
-        # 幂等:优先用 request_id 做扣费键。先扣费(抢到幂等键者才写日志),
-        # 避免"日志写了但重复扣费"或"重复日志"。
+        from core.account_runtime import attribution
+        account = attribution(channel)
+        if upstream_account_id is None and account:
+            upstream_account_id = account["id"]
+        if account_multiplier is None:
+            account_multiplier = account["rate_multiplier"] if account else 1
+
+        # 幂等:优先用 request_id 作扣费键。扣费与写日志必须同一个事务 —— 分开写时,
+        # 扣费成功而 add_usage 失败会留下"钱扣了、用量查不到"的窟窿,而且重试会因
+        # 幂等键已存在直接放行(_existing_log_id 找不到就返回 None),永远不会自愈。
         idem = f"usage:{request_id}" if request_id else None
-        if policy == POLICY_BALANCE and actual_cost > 0 and idem:
-            from core.credit import REASON_USAGE, credit
-            _row, created = credit(
-                user["id"], -actual_cost, REASON_USAGE, idem,
-                meta={"model": model, "channel": channel,
-                      "request_id": request_id, "end_reason": end_reason})
-            if not created:
-                # 该 request_id 已结算过:不重复写 usage_log,返回既有日志 id
-                return _existing_log_id(self.db, user["id"], request_id)
-
-        log_id = self.db.add_usage(
-            user_id=user["id"], api_key_id=user.get("_api_key_id"),
-            channel=channel, model=model, account_id=account_id,
-            input_tokens=in_tok, output_tokens=out_tok,
-            cost=cost, actual_cost=actual_cost, billing_mode=billing_mode,
-            pricing_snapshot=snapshot, stream=stream,
-            duration_ms=duration_ms, token_source=source)
-
-        # 无 request_id(非网关路径/旧调用)时退化用 log_id 作幂等键
-        if policy == POLICY_BALANCE and actual_cost > 0 and not idem:
-            from core.credit import REASON_USAGE, credit
-            credit(user["id"], -actual_cost, REASON_USAGE, f"usage:log:{log_id}",
-                   meta={"model": model, "channel": channel, "log_id": log_id})
+        charged = policy == POLICY_BALANCE and actual_cost > 0
+        conn = self.db._conn()
+        broadcast = []          # 扣费行:提交成功后才广播,回滚了就不能发
+        duplicate = None        # 重复结算时既有日志 id
+        with conn:  # BEGIN..COMMIT,异常整体回滚,扣费不会单独生效
+            conn.execute("BEGIN IMMEDIATE")
+            if charged and idem:
+                from core.credit import REASON_USAGE, credit
+                row, created = credit(
+                    user["id"], -actual_cost, REASON_USAGE, idem,
+                    meta={"model": model, "channel": channel,
+                          "request_id": request_id, "end_reason": end_reason},
+                    transaction=conn)
+                if not created:
+                    # 该 request_id 已结算过:不重复写 usage_log,返回既有日志 id
+                    duplicate = _existing_log_id(self.db, user["id"], request_id)
+                else:
+                    broadcast.append(row)
+            if duplicate is None:
+                log_id = self.db.add_usage(
+                    user_id=user["id"], api_key_id=user.get("_api_key_id"),
+                    channel=channel, model=model,
+                    input_tokens=in_tok, output_tokens=out_tok,
+                    cost=cost, actual_cost=actual_cost, billing_mode=billing_mode,
+                    pricing_snapshot=snapshot, stream=stream,
+                    duration_ms=duration_ms, token_source=source,
+                    upstream_account_id=upstream_account_id,
+                    account_cost=cost * account_multiplier if upstream_account_id is not None else None,
+                    transaction=conn)
+                # 无 request_id(非网关路径/旧调用)时退化用 log_id 作幂等键,同一事务内完成
+                if charged and not idem:
+                    from core.credit import REASON_USAGE, credit
+                    row, _created = credit(
+                        user["id"], -actual_cost, REASON_USAGE, f"usage:log:{log_id}",
+                        meta={"model": model, "channel": channel, "log_id": log_id},
+                        transaction=conn)
+                    broadcast.append(row)
+        if duplicate is not None:
+            return duplicate
+        from core.credit import publish_balance_change
+        for row in broadcast:
+            publish_balance_change(row)
 
         # 密钥的最后使用时间与已用额度:放在幂等闸门之后,重复结算不会重复累加。
         # 不清鉴权缓存 —— 额度判定在 _check_key_quota 里读实时行,缓存里的
@@ -363,14 +444,7 @@ def _existing_log_id(db, user_id, request_id):
 
 
 def _cache_tokens(usage):
-    """从上游 usage 里抠缓存 token(OpenAI / Anthropic 两种字段名)。"""
-    if not isinstance(usage, dict):
-        return 0, 0
-    read = (usage.get("cache_read_input_tokens")
-            or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
-            or 0)
-    write = usage.get("cache_creation_input_tokens") or 0
-    try:
-        return int(read or 0), int(write or 0)
-    except (TypeError, ValueError):
-        return 0, 0
+    """Numeric compatibility entry; snapshots retain omitted fields as None."""
+    from core.metering import cache_tokens
+    read, write = cache_tokens(usage)
+    return read or 0, write or 0

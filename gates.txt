@@ -1,0 +1,19 @@
+# 门禁清单 —— 这个仓里所有检查的唯一登记处。
+#
+# 格式:<仓内路径>|<谁执行它 / 它抓什么>
+# 豁免:# exempt:<仓内路径>|<谁执行它,以及为什么 CI 跑不到>
+#
+# 规矩(由 tests/test_executor_coverage.py 守着,不是靠自觉):
+#   1. 登记的路径必须真存在 —— 不许有幽灵登记。
+#   2. scripts/check_*.py 每一个都必须登记 —— 写了检查器却没接执行器,就是「配了没跑」。
+#   3. 登记的每条都必须被 .github/workflows/assurance.yml 真调到,否则得写进豁免并说明由谁执行。
+#
+# 为什么不逐个登记 tests/test_*.py:它们被 `pytest tests/` 整目录带走,新增一个不需要
+# 任何接线。清单只登记「需要自己接线才会被跑」的东西,否则清单变噪音,人就不看了。
+
+tests/|python -m pytest tests/ -q —— 单元与集成,CI 第一步
+tests/e2e/|python -m pytest tests/e2e -q —— 端到端计费闭环。被 tests/conftest.py 排除在默认收集外,所以必须在 CI 里单独点名
+tests/test_executor_coverage.py|本清单自己的门禁:登记 == 盘上的检查器 + 豁免
+scripts/check_dead_code.py|死面扫描:未使用的导入、变量、不可达分支。零容忍
+.github/workflows/assurance.yml|非本机执行器。元规则二要的不是多跑一遍,是从干净克隆、在别人机器上跑
+

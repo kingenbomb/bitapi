@@ -3,11 +3,14 @@
 """
 用户接入层 REST API(/api/*)—— 注册/登录/资料/密钥/用量/计费/钱包/兑码/订单/管理端。
 
-注册强制邀请码(settings.require_invite 覆盖 config.REQUIRE_INVITE)时,invite_code
+社区专用注册按后台最低社区等级校验，关闭邮箱建号。独立部署的邮箱注册模式
+强制邀请码(settings.require_invite 覆盖 config.REQUIRE_INVITE)时,invite_code
 只接受管理台发的一次性注册邀请码(invitation 型兑换码)。老用户的 aff_code 仅在
 开放注册时用于绑定返佣关系,不能绕过邀请制。首个用户(库空)免码成为 admin。
-会话用 JWT(Authorization: Bearer <jwt>),与网关 /v1/* 的 sk- key 鉴权分离。
+浏览器用 HttpOnly cookie 会话与 CSRF token；脚本继续用 JWT Bearer。
+与网关 /v1/* 的 sk- key 鉴权分离。
 """
+import asyncio
 import hashlib
 import ipaddress
 import os
@@ -16,22 +19,27 @@ import threading
 import time
 from datetime import date as _date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from core.credit import publish_balance_change
 
 import config
 from core import auth
+from core.clock import SITE_TZ, day_start as site_day_start
 from core import adapter as adapter_mod
 from core import channels as channels_mod
 from core import community_auth
 from core import mailer
+from core import model_status
 from core import pool_state
+from core import share as share_mod
 from core import orders as orders_mod
 from core import pricing_catalog
+from core.registration import primary_email
 from core import throttle
 from core import totp
-from core.credit import (publish_balance_change, REASON_ADMIN, REASON_CHECKIN, REASON_PLAN,
+from core.credit import (REASON_ADMIN, REASON_CHECKIN, REASON_PLAN,
                          REASON_SIGNUP, credit)
 from core.hooks import emit
 from core import site_settings as S
@@ -42,44 +50,44 @@ from core.redeem import (TYPE_BALANCE, TYPE_INVITATION, RedeemError,
                          generate_codes, redeem)
 from core.user_db import (CommunityAffCodeConflict, CommunityEmailConflict,
                           CommunityFlowError, CommunityIdentityConflict,
-                          CommunityInviteError, CommunityUserDisabled,
-                          RegistrationCodeError, RegistrationCodeCooldown)
+                          CommunityInviteError, CommunityLevelError, CommunityUserDisabled,
+                          RegistrationCodeCooldown, RegistrationCodeError)
 
-router = APIRouter(prefix="/api")
+from core.session import SessionRoute, clear_session
+
+# router 与共用依赖/模型都在 portal_shared —— 那里建一次 /api 实例,本文件和管理端
+# 子模块往同一个实例上注册。这里**不要**再新建 APIRouter。
+from routers.portal_shared import (AdminResetPwReq, GroupReq, GroupUpdateReq,
+                                   OTHER_SETTING_KEYS, PAY_KEYS, SettingsReq,
+                                   UserAdminReq, _ANN_KEY, _ANN_LEVELS, _ANN_MODES,
+                                   _CSV_MAX, _RANGE_SPAN, _ann_all, _ann_find,
+                                   _ann_lock, _ann_sorted, _ann_visible,
+                                   _channel_names, _live_usage_snapshot,
+                                   _usage_csv, _usage_filters, current_user,
+                                   optional_user, require_admin, router)
+# 管理端路由挂在同一个 router 上。用 import 语句(而不是 from ... import name)
+# 触发注册:后者要等目标模块执行完才能取属性,而在本模块导入途中触发时,
+# Python 会把它当循环导入,导致 portal_admin 的装饰器注册被跳过。
+from routers import portal_admin as _portal_admin  # noqa: E402,F401
+
+
+@router.post("/logout")
+def logout(response: Response, request: Request):
+    clear_session(response, request)
+    return {"ok": True}
 
 
 # ---- 依赖:JWT 当前用户 ----
 
-def current_user(authorization: str = Header(None)):
-    token = (authorization or "").replace("Bearer ", "").strip()
-    payload = auth.decode_session_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="invalid or expired token")
-    user = USER_DB.get_user(int(payload["sub"]))
-    if not user or user["status"] != "active":
-        raise HTTPException(status_code=401, detail="user not found or disabled")
-    # 改过密码之后,之前签发的会话一律作废。找回密码的意义之一就是把偷走会话的
-    # 人踢出去;JWT 无状态,能做到这一点的只有「签发时间 < 改密时间 → 拒」。
-    if int(payload.get("iat") or 0) < int(user.get("password_changed_at") or 0):
-        raise HTTPException(status_code=401, detail="session expired after password change")
-    return user
 
 
-def require_admin(user=Depends(current_user)):
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="admin only")
-    return user
 
 
-def optional_user(authorization: str = Header(None)):
-    """不带 Authorization 就按游客放行,带了就必须是有效登录。
+@router.get("/admin/audit")
+def admin_audit(limit: int = 100, offset: int = 0, user=Depends(require_admin)):
+    return {"rows": USER_DB.list_admin_audit(limit, offset)}
 
-    token 存在但过期/无效仍然 401,不静默降级成游客 —— 否则一个自认为已登录的
-    用户会看到游客口径的价,而页面上没有任何迹象说明他其实掉线了。
-    """
-    if not (authorization or "").strip():
-        return None
-    return current_user(authorization)
+
 
 
 # ---- 请求体 ----
@@ -95,7 +103,6 @@ class RegistrationCodeReq(BaseModel):
     email: EmailStr
 
 
-
 class LoginReq(BaseModel):
     email: EmailStr
     password: str
@@ -106,25 +113,20 @@ class CommunityStartReq(BaseModel):
     referral_code: str = Field(default="", max_length=64)
 
 
-
-class CommunityFinishReq(BaseModel):
-    invite_code: str = Field(default="", max_length=128)
-
-
 class KeyCreateReq(BaseModel):
-    name: str = ""
+    name: str = Field(default="", max_length=64)
     count: int = Field(default=1, ge=1, le=50)
     expires_at: int = 0          # unix 秒,0=永不过期
-    quota: float = Field(default=0, ge=0)     # 本密钥消费上限(美元),0=不限
+    quota: float = Field(default=0, ge=0, allow_inf_nan=False)     # 本密钥消费上限(美元),0=不限
     allowed_models: list[str] | None = None   # 空/None=跟随分组
     allowed_ips: list[str] | None = None      # 空/None=不限
 
 
 class KeyUpdateReq(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=64)
     status: str | None = None
     expires_at: int | None = None
-    quota: float | None = Field(default=None, ge=0)
+    quota: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     allowed_models: list[str] | None = None
     allowed_ips: list[str] | None = None
 
@@ -146,10 +148,23 @@ class EmailBindReq(BaseModel):
 
 
 class EmailVerifyReq(BaseModel):
-    code: str
+    code: str = Field(max_length=64)
 
 
 # ---- 认证 ----
+
+@router.get("/registration-policy")
+def registration_policy():
+    return {"community_only": config.COMMUNITY_REGISTRATION_ONLY,
+            "community_min_level": S.community_min_level()}
+
+
+def _require_email_registration():
+    if config.COMMUNITY_REGISTRATION_ONLY:
+        raise HTTPException(
+            status_code=403,
+            detail=f"请使用白嫖社区账号注册，需达到 Lv{S.community_min_level()} 及以上，无需邀请码")
+
 
 def _require_invite():
     """运行时优先:settings.require_invite 覆盖 config.REQUIRE_INVITE。"""
@@ -171,7 +186,6 @@ def _publish_registered_invite_reward(user_id):
         publish_balance_change(row)
 
 
-
 def _throttled(e):
     """AuthThrottled → 429。带 Retry-After 头,前端据此显示「N 秒后再试」。
     同时发 auth.throttled:有人在撞库是站长该知道的事,告警插件按 key 去重后推。"""
@@ -184,9 +198,17 @@ def _throttled(e):
         headers={"Retry-After": str(e.retry_after)})
 
 
+def _registration_email(value):
+    try:
+        return primary_email(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @router.post("/register/code")
 def registration_code(req: RegistrationCodeReq, request: Request):
-    email = str(req.email).strip().lower()
+    _require_email_registration()
+    email = _registration_email(req.email)
     if USER_DB.get_user_by_email(email):
         raise HTTPException(status_code=409, detail="该邮箱已注册，请直接登录")
     if not mailer.configured():
@@ -213,10 +235,10 @@ def registration_code(req: RegistrationCodeReq, request: Request):
     return {"ok": True, "sent": True, "retry_after": 60, "expires_in": 900}
 
 
-
 @router.post("/register")
 def register(req: RegisterReq, request: Request = None):
-    email = str(req.email).strip().lower()
+    _require_email_registration()
+    email = _registration_email(req.email)
     ip = throttle.client_ip(request)
     try:
         throttle.check((throttle.REGISTER_IP, ip, "register"))
@@ -251,7 +273,6 @@ def register(req: RegisterReq, request: Request = None):
     token = auth.issue_token(uid, role=role)
     return {"ok": True, "user_id": uid, "token": token, "role": role,
             "aff_code": aff}
-
 
 
 @router.post("/login")
@@ -345,7 +366,8 @@ def community_auth_start(req: CommunityStartReq, response: Response,
     state = community_auth.new_secret()
     nonce = community_auth.new_secret()
     try:
-        authorize_url = community_auth.authorize_url(state)
+        # 私有 HttpOnly flow cookie 同时持有 PKCE verifier，数据库仅保存其摘要。
+        authorize_url = community_auth.authorize_url(state, nonce)
     except community_auth.CommunityAuthError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     now = int(time.time())
@@ -358,10 +380,10 @@ def community_auth_start(req: CommunityStartReq, response: Response,
     return {"ok": True, "authorize_url": authorize_url}
 
 
-def community_oauth_callback(request: Request, code="", state=""):
+def community_oauth_callback(request: Request, code="", state="", error=""):
     """生产登记的无 `/api` callback；由 server.py 的公开路由调用。"""
     nonce = request.cookies.get(community_auth.FLOW_COOKIE, "")
-    if not code or not state or not nonce:
+    if (not code and not error) or not state or not nonce:
         raise HTTPException(status_code=400,
                             detail="community authorization state is missing")
     now = int(time.time())
@@ -370,8 +392,14 @@ def community_oauth_callback(request: Request, code="", state=""):
     if not flow:
         raise HTTPException(status_code=400,
                             detail="community authorization state is invalid or expired")
+    if error:
+        # 不透传上游错误正文；拒绝授权仍校验并消费 state，返回可重试的页面。
+        reason = "access_denied" if error == "access_denied" else "failed"
+        response = RedirectResponse("/portal#/community-callback?error=" + reason, status_code=302)
+        _clear_community_flow_cookie(response)
+        return response
     try:
-        upstream_token = community_auth.exchange_code(code)
+        upstream_token = community_auth.exchange_code(code, nonce)
         profile = community_auth.get_userinfo(upstream_token)
     except community_auth.CommunityAuthError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -386,7 +414,7 @@ def community_oauth_callback(request: Request, code="", state=""):
 
 
 @router.post("/community/auth/finish")
-def community_auth_finish(req: CommunityFinishReq, request: Request,
+def community_auth_finish(request: Request,
                           response: Response,
                           user=Depends(optional_user)):
     nonce = request.cookies.get(community_auth.FLOW_COOKIE, "")
@@ -431,26 +459,22 @@ def community_auth_finish(req: CommunityFinishReq, request: Request,
                                           role=logged_in["role"]),
                 "role": logged_in["role"]}
 
-    code = auth.normalize_aff_code(req.invite_code)
-    if not code:
-        # 不消费 ready flow；前端补邀请码后可用同一个 HttpOnly cookie 再提交。
-        return {"ok": True, "needs_invite": True,
-                "community": _public_community(flow)}
-
+    _registration_email(flow["email"])
     group = ensure_default_group()
     created = None
     for _ in range(10):
         aff = _alloc_aff_code()
         try:
             created = USER_DB.register_community_user(
-                flow["id"], code, aff,
+                flow["id"], aff,
                 group_id=group["id"] if group else None)
             break
         except CommunityAffCodeConflict:
             continue
+        except CommunityLevelError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
         except CommunityInviteError as e:
-            raise HTTPException(status_code=403,
-                                detail="invalid invite code") from e
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except CommunityEmailConflict as e:
             raise HTTPException(
                 status_code=409,
@@ -498,7 +522,7 @@ def me(user=Depends(current_user)):
         "avatar": fresh.get("avatar") or "",
         "balance": fresh.get("balance") or 0.0,
         "total_spent": fresh.get("total_spent") or 0.0,
-        "rpm_limit": (group or {}).get("rpm_limit") or 0,
+        "concurrency_limit": (group or {}).get("concurrency_limit") or 0,
         "has_password": str(fresh.get("password_hash") or "").startswith(
             "pbkdf2$"),
         "totp_enabled": bool(fresh.get("totp_secret")),
@@ -666,17 +690,22 @@ def password_reset(req: ResetReq):
 # ---- 邮箱绑定 ----
 
 @router.post("/email/bind")
-def email_bind(req: EmailBindReq, user=Depends(current_user)):
-    """发验证码。配了 SMTP 就真发;没配就退回原来的「写日志」口径并如实告知
-    (sent=False),前端据此提示「站点未接邮件,请联系站长」而不是「已发送」。"""
-    code = auth.generate_email_code()
+def email_bind(req: EmailBindReq, request: Request, user=Depends(current_user)):
+    """在用户、IP 和收件邮箱限速内发码；未配置 SMTP 时明确拒绝，不向日志写码。"""
     email = req.email.lower().strip()
-    USER_DB.add_email_verification(user["id"], email, code)
+    owner = USER_DB.get_user_by_email(email)
+    if owner and owner["id"] != user["id"]:
+        raise HTTPException(409, "该邮箱已被其他账号绑定")
     if not mailer.configured():
-        print(f"[portal] email verify code for user {user['id']} "
-              f"({email}): {code}", flush=True)
-        return {"ok": True, "sent": False,
-                "message": "站点未配置邮件服务,验证码已写入服务端日志"}
+        raise HTTPException(503, "站点未配置邮件服务，请联系站长")
+    for limiter, key, scope in (
+            (throttle.BIND_MAIL_IP, throttle.client_ip(request), "bind_mail_ip"),
+            (throttle.BIND_MAIL_EMAIL, email, "bind_mail_email"),
+            (throttle.BIND_MAIL_USER, str(user["id"]), "bind_mail_user")):
+        if key and limiter.hit(key):
+            raise _throttled(throttle.AuthThrottled(scope, limiter.retry_after(key), key))
+    code = auth.generate_email_code()
+    USER_DB.add_email_verification(user["id"], email, code)
     subject, text, html = mailer.verify_email_mail(S.site_name(), code, 15)
     try:
         mailer.send(email, subject, text, html)
@@ -687,17 +716,11 @@ def email_bind(req: EmailBindReq, user=Depends(current_user)):
 
 @router.post("/email/verify")
 def email_verify(req: EmailVerifyReq, user=Depends(current_user)):
-    verif = USER_DB.get_latest_verification_by_user(user["id"])
-    if not verif:
-        raise HTTPException(status_code=400, detail="no pending verification")
-    if verif.get("verified_at"):
-        raise HTTPException(status_code=400, detail="already verified")
-    if verif["expires_at"] < int(time.time()):
-        raise HTTPException(status_code=400, detail="code expired")
-    if req.code.strip() != verif["code"]:
-        raise HTTPException(status_code=400, detail="wrong code")
-    USER_DB.mark_verification_used(verif["id"])
-    USER_DB.update_user(user["id"], email_verified_at=int(time.time()))
+    try:
+        USER_DB.verify_and_bind_email(user["id"], req.code.strip())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    BILLING.invalidate()
     return {"ok": True}
 
 
@@ -758,7 +781,7 @@ def list_keys(user=Depends(current_user)):
     })
     now = int(time.time())
     all_usage = USER_DB.api_key_usage_map(user["id"])
-    today_usage = USER_DB.api_key_usage_map(user["id"], since=now - 86400)
+    today_usage = USER_DB.api_key_usage_map(user["id"], since=site_day_start(now))
     empty = {"requests": 0, "tokens": 0, "cost": 0.0}
     out = []
     active = 0
@@ -868,69 +891,14 @@ def delete_key(key_id: int, user=Depends(current_user)):
 
 # ---- 使用记录 ----
 
-def _usage_filters(model, channel, since, until, end_reason, api_key_id=None):
-    """用户侧与管理端共用的检索条件整理。since/until 是 unix 秒;
-    since 传 0/None = 不限。"""
-    f = {"model": (model or "").strip() or None,
-         "channel": (channel or "").strip() or None,
-         "since": int(since) if since else 0,
-         "until": int(until) if until else None,
-         "end_reason": (end_reason or "").strip() or None}
-    if api_key_id is not None:
-        f["api_key_id"] = api_key_id
-    return f
 
-
-_CSV_MAX = 10000   # 单次导出上限。再大走分段:一次把全表拉进内存会把 1G 的机器顶爆
-
-
-def _usage_csv(rows, with_user=False, filename="usage.csv"):
-    """usage_logs 行 → CSV 响应。列顺序固定,快照里的字段(首字延迟/结束原因/档位)
-    抠出来平铺 —— 拿去 Excel 里对账的人不该自己解析 JSON。"""
-    import csv
-    import io
-
-    from fastapi.responses import Response
-
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    head = ["id", "time", "channel", "model", "input_tokens", "output_tokens",
-            "cache_tokens", "cost", "actual_cost", "billing_mode", "token_source",
-            "stream", "duration_ms", "first_token_ms", "end_reason", "tier",
-            "request_id"]
-    if with_user:
-        head[2:2] = ["email", "key"]
-    w.writerow(head)
-    for r in rows:
-        snap = r.get("pricing_snapshot") or {}
-        if not isinstance(snap, dict):
-            snap = {}
-        total_ctx = snap.get("total_ctx")
-        cache = max((total_ctx or 0) - (r.get("input_tokens") or 0), 0) if total_ctx else ""
-        line = [r.get("id"),
-                datetime.fromtimestamp(r.get("created_at") or 0).strftime("%Y-%m-%d %H:%M:%S"),
-                r.get("channel") or "", r.get("model") or "",
-                r.get("input_tokens") or 0, r.get("output_tokens") or 0, cache,
-                r.get("cost") or 0, r.get("actual_cost") or 0,
-                r.get("billing_mode") or "", r.get("token_source") or "",
-                1 if r.get("stream") else 0, r.get("duration_ms") or 0,
-                snap.get("frt_ms", ""), snap.get("end_reason", ""),
-                snap.get("tier", ""), snap.get("request_id", "")]
-        if with_user:
-            line[2:2] = [r.get("email") or "", r.get("key_name") or ""]
-        w.writerow(line)
-    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-
-_RANGE_SPAN = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400}
 
 
 def _user_usage_filters(range, model, channel, api_key_id, since, until, end_reason):
     """用户侧列表 / 合计 / 导出共用的条件。时间窗:显式传 since/until 就用它们,
     否则按 range 取窗口 —— 三处必须同一口径,否则「今日」页面上导出的却是全部历史。"""
     if not since and not until:
-        since = int(time.time()) - _RANGE_SPAN.get(range, 86400)
+        since = site_day_start() if range == "day" else int(time.time()) - _RANGE_SPAN.get(range, 86400)
     return _usage_filters(model, channel, since, until, end_reason, api_key_id)
 
 
@@ -946,16 +914,103 @@ def usage(range: str = "day", limit: int = 50, offset: int = 0,
     分页与筛选是后加的:原先只回最近 50 条,用户查「上周三那次为什么扣了 2 美元」
     翻不到。"""
     summary = USER_DB.usage_summary(
-        user["id"], int(time.time()) - _RANGE_SPAN.get(range, 86400))
+        user["id"], site_day_start() if range == "day" else int(time.time()) - _RANGE_SPAN.get(range, 86400))
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
     f = _user_usage_filters(range, model, channel, api_key_id, since, until, end_reason)
     rows, total = USER_DB.query_usage(limit=limit, offset=offset,
                                       user_id=user["id"], **f)
+    for row in rows:
+        row.pop("upstream_account_id", None)
+        row.pop("account_cost", None)
     totals = USER_DB.usage_totals(user_id=user["id"], **f)
     return {"range": range, "summary": summary, "recent": rows, "totals": totals,
             "total": total, "limit": limit, "offset": offset,
             "since": f["since"], "until": f["until"]}
+
+
+
+
+@router.get("/usage/live")
+def user_live_usage(user=Depends(current_user)):
+    """当前用户所有密钥及在线体验的当日用量与最近一分钟读数。"""
+    return _live_usage_snapshot(user["id"])
+
+
+def _cache_period(range, as_of=None):
+    if range not in (*_RANGE_SPAN, "all"):
+        raise HTTPException(400, "请选择 day、week、month 或 all")
+    now = int(time.time())
+    cutoff = min(now, as_of) if as_of is not None else now
+    return cutoff, (site_day_start(cutoff) if range == "day" else
+                    cutoff - _RANGE_SPAN[range] if range != "all" else 0)
+
+
+def _model_cache_snapshot(range, user_id=None):
+    now, since = _cache_period(range)
+    # Completed seconds keep model totals and a later trend request on the same snapshot.
+    return {**USER_DB.model_cache_usage(user_id=user_id, since=since, until=now),
+            "range": range, "since": since, "until": now, "as_of": now}
+
+
+@router.get("/usage/cache")
+def user_model_cache(range: str = "all", user=Depends(current_user)):
+    return _model_cache_snapshot(range, user["id"])
+
+
+@router.get("/admin/usage/cache")
+def admin_model_cache(range: str = "week", user=Depends(require_admin)):
+    return _model_cache_snapshot(range)
+
+
+def _model_cache_trend_snapshot(range, model=None, user_id=None, as_of=None, models=None):
+    if model is not None and models:
+        raise HTTPException(400, "model 和 models 不能同时指定")
+    if models and any(not name or len(name) > 256 for name in models):
+        raise HTTPException(422, "模型名称长度须为 1–256 个字符")
+    selected = list(dict.fromkeys(models or []))
+    cutoff, since = _cache_period(range, as_of)
+    result = USER_DB.model_cache_usage(user_id=user_id, since=since, until=cutoff,
+                                      model=model, models=selected, daily=True)
+    rows_by_day = {}
+    rows_by_model = {name: {} for name in selected}
+    for row in result["series"]:
+        rows_by_day.setdefault(row["date"], []).append(row)
+        if selected:
+            rows_by_model[row["model"]][row["date"]] = row
+    last_day = datetime.fromtimestamp(cutoff, _CHECKIN_TZ).date()
+    first_day = (min(rows_by_day) if rows_by_day else None) if range == "all" else datetime.fromtimestamp(since, _CHECKIN_TZ).date().isoformat()
+    dates = []
+    if first_day is not None:
+        day = _date.fromisoformat(first_day)
+        while day <= last_day:
+            dates.append(day.isoformat())
+            day += timedelta(days=1)
+    empty = USER_DB.cache_usage_summary([])
+    series = [{**USER_DB.cache_usage_summary(rows_by_day.get(stamp, [])), "date": stamp} for stamp in dates]
+    response = {**result, "series": series, "range": range, "model": model, "since": since,
+                "until": cutoff, "as_of": cutoff, "timezone": "Asia/Shanghai"}
+    if selected:
+        response["models"] = selected
+        response["model_series"] = [
+            {"model": name, "summary": USER_DB.cache_usage_summary(list(rows_by_model[name].values())),
+             "series": [rows_by_model[name].get(stamp, {**empty, "date": stamp}) for stamp in dates]}
+            for name in selected]
+    return response
+
+
+@router.get("/usage/cache/trend")
+def user_model_cache_trend(range: str = "all", model: str = Query(None, min_length=1, max_length=256),
+                           as_of: int = Query(None, ge=1), models: list[str] = Query(None),
+                           user=Depends(current_user)):
+    return _model_cache_trend_snapshot(range, model, user["id"], as_of, models)
+
+
+@router.get("/admin/usage/cache/trend")
+def admin_model_cache_trend(range: str = "week", model: str = Query(None, min_length=1, max_length=256),
+                            as_of: int = Query(None, ge=1), models: list[str] = Query(None),
+                            user=Depends(require_admin)):
+    return _model_cache_trend_snapshot(range, model, as_of=as_of, models=models)
 
 
 @router.get("/usage/export.csv")
@@ -968,7 +1023,7 @@ def usage_export(range: str = "day", model: str = None, channel: str = None,
                       filename=f"usage-{_date.today().isoformat()}.csv")
 
 
-_CHECKIN_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+_CHECKIN_TZ = SITE_TZ
 _CHECKIN_SCALE = 10_000
 
 
@@ -1003,11 +1058,11 @@ def overview(user=Depends(current_user)):
     """概览页的一次性数据源:今日 + 累计两个窗口 + 密钥计数 + 性能指标。
 
     原先概览要打 /billing + /usage?range=day + /usage?range=month 三次,
-    且 month 只是近 30 天不是「累计」。这里今日走 24 小时窗口、累计走全量,
+    且 month 只是近 30 天不是「累计」。这里今日走北京时间自然日、累计走全量,
     另附 RPM/TPM(按有记录的时间跨度平摊)与平均响应时长。
     """
     now = int(time.time())
-    today = USER_DB.usage_overview(user["id"], since=now - 86400)
+    today = USER_DB.usage_overview(user["id"], since=site_day_start(now))
     total = USER_DB.usage_overview(user["id"])
     keys = USER_DB.list_api_keys(user["id"])
     active = 0
@@ -1042,7 +1097,7 @@ def overview(user=Depends(current_user)):
     raw = {r["date"]: r for r in USER_DB.usage_daily(user["id"], days=14)}
     series = []
     for k in range(13, -1, -1):
-        d = _date.fromtimestamp(now - k * 86400).isoformat()
+        d = datetime.fromtimestamp(now - k * 86400, SITE_TZ).date().isoformat()
         r = raw.get(d) or {"requests": 0, "input_tokens": 0, "output_tokens": 0,
                            "cache_tokens": 0, "tokens": 0, "cost": 0.0}
         series.append({"date": d, "label": d[5:],
@@ -1063,7 +1118,7 @@ def overview(user=Depends(current_user)):
         "policy": policy,
         "group": (group or {}).get("name"),
         "rate_multiplier": (group or {}).get("rate_multiplier"),
-        "rpm_limit": (group or {}).get("rpm_limit") or 0,
+        "concurrency_limit": (group or {}).get("concurrency_limit") or 0,
         "limit_unit": (group or {}).get("limit_unit") or "requests",
         "supported_models": (group or {}).get("supported_models") or [],
         "group_status": (group or {}).get("status"),
@@ -1128,7 +1183,7 @@ def billing(user=Depends(current_user)):
         "policy": policy,
         "rate_multiplier": group["rate_multiplier"],
         "supported_models": group.get("supported_models") or [],
-        "rpm_limit": group["rpm_limit"],
+        "concurrency_limit": group["concurrency_limit"],
         "limit_unit": unit,
         "balance": fresh.get("balance") or 0.0,
         "total_spent": fresh.get("total_spent") or 0.0,
@@ -1165,13 +1220,19 @@ def billing(user=Depends(current_user)):
 
 # ---- 模型广场 ----
 
-# 图/视频模型把规格编进模型名第 3 段起(如 foo-vid/model-x/1080p/10s),
+# 图/视频模型把规格编进模型名第 3 段起(oreate-vid/kling-3-0/1080p/10s),
 # 同一模型能展开出十几条。广场按前两段折叠成一张卡,规格进 variants。
+#
+# 只对**生成型**渠道折叠:对话型渠道的模型名里斜杠是命名空间
+# (corvex/deepseek-ai/DeepSeek-V4-Flash-0731),前两段不是模型、折出来的
+# 卡名调不通 —— 在线体验直接把卡名发出去就是 404 unknown model。
 _SPEC_SEGMENTS = 3
 
 
-def _collapse_key(model):
-    """返回 (卡片名, 规格后缀)。段数不足 3 的模型不折叠,后缀为空。"""
+def _collapse_key(model, fold=True):
+    """返回 (卡片名, 规格后缀)。段数不足 3 或 fold=False 时不折叠,后缀为空。"""
+    if not fold:
+        return model, ""
     parts = model.split("/")
     if len(parts) < _SPEC_SEGMENTS:
         return model, ""
@@ -1194,37 +1255,38 @@ def list_plaza_models(user=Depends(optional_user)):
     下线的渠道整条不出现(enabled_adapters),与清单同一口径。
     单价是原价,分组倍率单独给,由前端乘 —— 和计费页同一口径。
     """
-    from core.adapter import CAP_CHAT, enabled_adapters, model_to_channel
+    from core.adapter import enabled_adapters, model_to_channel
 
     if user:
         group = USER_DB.effective_group(user)
     else:
         group = ensure_default_group()
     gid = group["id"] if group else None
-    primary = model_to_channel()
     cards = {}
     for channel, ad in enabled_adapters().items():
-        # 能不能在线体验,取渠道自己声明的 CAP_CHAT —— 图/视频渠道
-        # 走 /v1/images|videos/generations,塞进对话框只会得到 404。
-        can_chat = ad.has(CAP_CHAT)
+        # 只有生成型渠道按「前两段」折叠规格;对话型渠道的名字原样当卡名,
+        # 否则 corvex/deepseek-ai/... 会被折成 corvex/deepseek-ai,体验即 404。
+        fold = getattr(ad, "kind", None) == "generation"
         for m in ad.models:
+            can_chat = ad.supports_chat(m)
             if group and not BILLING.check_model_allowed(group, m):
                 continue
-            name, spec = _collapse_key(m)
-            pr = PRICING.resolve(m, gid)
+            name, spec = _collapse_key(m, fold=fold)
+            try:
+                pr = PRICING.resolve(m, gid)
+            except ValueError:
+                continue  # 缺价模型不能调用，也不在广场显示成免费。
             row = cards.get(name)
             if row is None:
-                # 同一模型挂多个渠道时卡片归首选渠道,channels 记全部 —— 广场上的
-                # 「渠道」是产品口径的归属,备胎数量只作提示
+                # 对外不再暴露渠道归属：模型广场只给模型口径。渠道是内部实现，
+                # 备胎数量、首选渠道都不该出现在用户侧响应里。
                 row = cards[name] = {
-                    "model": name, "channel": primary.get(m, channel), "chat": can_chat,
-                    "channels": [], "billing_mode": pr.get("billing_mode"),
+                    "model": name, "chat": can_chat,
+                    "billing_mode": pr.get("billing_mode"),
                     "price_source": pr.get("source"),
                     "variants": [],
                 }
                 row.update({k: pr.get(k) for k in _PRICE_KEYS})
-            if channel not in row["channels"]:
-                row["channels"].append(channel)
             if spec:
                 row["variants"].append(
                     {"spec": spec, "model": m,
@@ -1233,6 +1295,17 @@ def list_plaza_models(user=Depends(optional_user)):
                      "per_request_price": pr.get("per_request_price")})
     for row in cards.values():
         _fold_variants(row)
+    # 卡片状态:对话卡带巡检结果与 7 天状态条;生成类(图/视频)不巡检,不带。
+    # 渠道名与上游原话照例不出网关 —— 卡片只有「能不能用 + 首字多快」。
+    stored = {(r["channel"], r["model"]): r
+              for r in USER_DB.latest_model_status()}
+    since = time.time() - model_status.RETENTION
+    hist = {}
+    for r in USER_DB.history_model_status(since):
+        hist.setdefault((r["channel"], r["model"]), []).append(r)
+    smap = model_status.user_status_map(enabled_adapters(), stored, hist)
+    for row in cards.values():
+        row["status"] = smap.get(row["model"]) if row["chat"] else None
     return {
         "guest": user is None,
         "group": group["name"] if group else None,
@@ -1280,10 +1353,19 @@ class RedeemReq(BaseModel):
 
 
 @router.post("/redeem")
-def redeem_code(req: RedeemReq, user=Depends(current_user)):
+def redeem_code(req: RedeemReq, request: Request, user=Depends(current_user)):
+    uid, ip = str(user["id"]), throttle.client_ip(request)
+    try:
+        throttle.check((throttle.REDEEM_USER, uid, "redeem_user"),
+                       (throttle.REDEEM_IP, ip, "redeem_ip"))
+    except throttle.AuthThrottled as exc:
+        raise _throttled(exc) from exc
     try:
         ledger_row, code_row = redeem(USER_DB, req.code, user)
     except RedeemError as e:
+        throttle.REDEEM_USER.hit(uid)
+        if ip:
+            throttle.REDEEM_IP.hit(ip)
         raise HTTPException(status_code=400,
                             detail={"code": e.code, "message": e.detail}) from e
     BILLING.invalidate()
@@ -1292,7 +1374,7 @@ def redeem_code(req: RedeemReq, user=Depends(current_user)):
 
 
 class OrderReq(BaseModel):
-    amount: float = Field(gt=0)
+    amount: float = Field(gt=0, allow_inf_nan=False)
     provider: str = "mock"
 
 
@@ -1307,7 +1389,7 @@ def _plan_view(g):
         "notes": g.get("notes") or "",
         "billing_policy": g.get("billing_policy"),
         "rate_multiplier": g.get("rate_multiplier"),
-        "rpm_limit": g.get("rpm_limit") or 0,
+        "concurrency_limit": g.get("concurrency_limit") or 0,
         "daily_limit": g.get("daily_limit") or 0,
         "weekly_limit": g.get("weekly_limit") or 0,
         "monthly_limit": g.get("monthly_limit") or 0,
@@ -1396,7 +1478,7 @@ def payment_providers(user=Depends(current_user)):
     return {"providers": [
         {"name": p.name, "display_name": getattr(p, "display_name", p.name)}
         for n, p in all_providers().items() if n in S.payment_providers()],
-        "min_topup": S.min_topup()}
+        "min_topup": S.min_topup(), "mao_per_usd": S.mao_per_usd()}
 
 
 @router.post("/orders")
@@ -1428,7 +1510,7 @@ def list_my_orders(limit: int = 50, offset: int = 0, user=Depends(current_user))
                                           limit=min(limit, 200), offset=offset)}
 
 
-# ---- 邀请 ----
+# ---- Token 消耗榜 ----
 
 @router.get("/leaderboard")
 def token_leaderboard(range: str = Query(default="all", pattern="^(all|7d|30d)$"),
@@ -1459,6 +1541,7 @@ def token_leaderboard(range: str = Query(default="all", pattern="^(all|7d|30d)$"
             "total_users": result["total_users"], "total_tokens": result["total_tokens"]}
 
 
+# ---- 邀请 ----
 
 @router.get("/invite")
 def invite(user=Depends(current_user)):
@@ -1468,56 +1551,12 @@ def invite(user=Depends(current_user)):
         "earned": USER_DB.ledger_sum(user["id"], reason="affiliate"),
         "reward_policy": S.invite_rewards(),
         "rewarded_invitees": USER_DB.invite_reward_count(user["id"]),
+        "registration_policy": registration_policy(),
         "require_invite": _require_invite(),
     }
 
 
-
 # ---- 公告 ----
-
-_ANN_KEY = "announcements"
-_ANN_LEVELS = ("info", "success", "warning", "error")
-_ANN_MODES = ("silent", "popup")
-# 公告正文存 settings 里的一个 JSON 列表,不单开表:一个自托管站的公告是个位数量级,
-# 建表要连带迁移、索引、清理三件事,不值当。代价是写入必须读改写,不是原子操作,
-# 所以加一把进程内锁 —— 单 worker 本来就是本项目的部署前提(见 README)。
-# 已读状态是另一回事:它按用户增长且必须跨设备一致,落在 announcement_reads 表。
-_ann_lock = threading.Lock()
-
-
-def _ann_all():
-    raw = USER_DB.get_setting(_ANN_KEY) or []
-    return raw if isinstance(raw, list) else []
-
-
-def _ann_sorted(items):
-    """置顶优先,同组内按发布时间倒序。"""
-    return sorted(items, key=lambda a: (0 if a.get("pinned") else 1,
-                                        -(a.get("created_at") or 0)))
-
-
-def _ann_find(items, aid):
-    for i, a in enumerate(items):
-        if a.get("id") == aid:
-            return i
-    return -1
-
-
-def _ann_visible(now=None):
-    """当前该展示的公告:已发布 + 落在展示窗口内。"""
-    ts = int(now if now is not None else time.time())
-    out = []
-    for a in _ann_all():
-        if not a.get("active"):
-            continue
-        starts = a.get("starts_at") or 0
-        ends = a.get("ends_at") or 0
-        if starts and ts < starts:
-            continue
-        if ends and ts > ends:
-            continue
-        out.append(a)
-    return _ann_sorted(out)
 
 
 @router.get("/announcements")
@@ -1552,440 +1591,122 @@ def mark_announcements_read(req: AnnouncementReadReq, user=Depends(current_user)
     n = USER_DB.mark_announcements_read(user["id"], ids)
     return {"ok": True, "marked": n}
 
+# ---- 模型状态(小时级巡检) ----
 
-# ---- 管理端(admin only) ----
+@router.get("/admin/model-status")
+def admin_model_status(user=Depends(require_admin)):
+    """在营渠道每个模型的最近一次检测结果 + 最近 24 次心跳 + 7 天按天状态条。
 
-class GroupReq(BaseModel):
-    name: str
-    rate_multiplier: float = 1.0
-    supported_models: list = []
-    billing_policy: str = "free"
-    rpm_limit: int = 0
-    daily_limit: int = 0
-    weekly_limit: int = 0
-    monthly_limit: int = 0
-    limit_unit: str = "requests"
-    is_default: int = 0
-    status: str = "active"
-    # 订阅套餐。listed=0 时这个分组只是管理员内部分配用的档位,不进用户端可购列表。
-    listed: int = 0
-    price: float = Field(default=0, ge=0)
-    duration_hours: int = Field(default=0, ge=0)   # 1=小时卡 24=天卡 720=月卡 0=不限时
-    notes: str | None = None
-
-
-class GroupUpdateReq(BaseModel):
-    rate_multiplier: float | None = None
-    supported_models: list | None = None
-    billing_policy: str | None = None
-    rpm_limit: int | None = None
-    daily_limit: int | None = None
-    weekly_limit: int | None = None
-    monthly_limit: int | None = None
-    limit_unit: str | None = None
-    is_default: int | None = None
-    status: str | None = None
-    listed: int | None = None
-    price: float | None = Field(default=None, ge=0)
-    duration_hours: int | None = Field(default=None, ge=0)
-    notes: str | None = None
-
-
-class UserAdminReq(BaseModel):
-    group_id: int | None = None
-    status: str | None = None
-    role: str | None = None
-
-
-class AdminResetPwReq(BaseModel):
-    new_password: str = Field(min_length=6, max_length=128)
-
-
-class InviteRewardsReq(BaseModel):
-    model_config = {"extra": "forbid"}
-    enabled: bool = Field(strict=True)
-    amount: float = Field(strict=True, ge=0, allow_inf_nan=False)
-    max_invitees: int = Field(strict=True, ge=0)
-
-
-
-class SettingsReq(BaseModel):
-    invite_rewards: InviteRewardsReq | None = None
-    require_invite: bool | None = None
-    default_group: str | None = None
-    checkin_min: float | None = None
-    checkin_max: float | None = None
-    # 支付设置。None = 本次不改;给值 = 存库并从此覆盖环境变量。
-    # 想恢复环境变量默认值走 DELETE /admin/settings/{key},不是往框里填空 ——
-    # 空串在这里是「明确设为空」(等于停用),两个意图不能混成一个。
-    payment_providers: list | None = None
-    min_topup: float | None = None
-    site_url: str | None = None
-    epay_api_url: str | None = None
-    epay_pid: str | None = None
-    epay_key: str | None = None
-    epay_usd_rate: float | None = None
-    # 渠道上下线。传全量列表(不是增删单个):开关是一排复选,一次提交一份完整状态。
-    disabled_channels: list | None = None
-    # 渠道路由 {name: {priority, weight}},全量映射。单个渠道改用
-    # PATCH /admin/channels/{name}/routing 更顺手。
-    channel_routing: dict | None = None
-    # 邮件设置。smtp_pass 只写不读,留空 = 不改。
-    smtp_host: str | None = None
-    smtp_port: int | None = None
-    smtp_user: str | None = None
-    smtp_pass: str | None = None
-    smtp_from: str | None = None
-    smtp_from_name: str | None = None
-    smtp_security: str | None = None
-    site_name: str | None = None
-
-
-PAY_KEYS = ("payment_providers", "min_topup", "site_url",
-            "epay_api_url", "epay_pid", "epay_key", "epay_usd_rate")
-# 存库的其它设置项。与 PAY_KEYS 分开是因为支付那组有自己的「生效渠道」回执。
-OTHER_SETTING_KEYS = ("invite_rewards", "disabled_channels", "channel_routing", "checkin_min",
-                      "checkin_max") + S.SMTP_KEYS
-
-
-class AnnouncementReq(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
-    body: str = Field(min_length=1, max_length=4000)
-    level: str = "info"
-    pinned: bool = False
-    active: bool = True
-    # silent=只进铃铛;popup=登录后弹一次(弹过即已读,不再弹)
-    notify_mode: str = "silent"
-    starts_at: int = 0      # 0=立即生效
-    ends_at: int = 0        # 0=永久
-
-
-class AnnouncementUpdateReq(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=120)
-    body: str | None = Field(default=None, min_length=1, max_length=4000)
-    level: str | None = None
-    pinned: bool | None = None
-    active: bool | None = None
-    notify_mode: str | None = None
-    starts_at: int | None = None
-    ends_at: int | None = None
-
-
-def _ann_check_window(starts, ends):
-    if starts and ends and ends <= starts:
-        raise HTTPException(status_code=400,
-                            detail="ends_at must be later than starts_at")
-
-
-@router.get("/admin/announcements")
-def admin_list_announcements(user=Depends(require_admin)):
-    """管理端看全部,含草稿与已过期的,并带每条的已读人数。
-
-    read_count 是站长发完公告后第一个想知道的数,所以在列表里就给,
-    不另开一个 read-status 端点。
-    """
-    items = []
-    total_users = USER_DB.count_users()
-    for a in _ann_sorted(_ann_all()):
-        row = dict(a)
-        row["read_count"] = USER_DB.announcement_read_count(a["id"])
-        row["user_count"] = total_users
-        items.append(row)
-    return {"announcements": items}
-
-
-@router.post("/admin/announcements")
-def admin_create_announcement(req: AnnouncementReq, user=Depends(require_admin)):
-    if req.level not in _ANN_LEVELS:
-        raise HTTPException(status_code=400,
-                            detail="level must be " + "|".join(_ANN_LEVELS))
-    if req.notify_mode not in _ANN_MODES:
-        raise HTTPException(status_code=400,
-                            detail="notify_mode must be " + "|".join(_ANN_MODES))
-    _ann_check_window(req.starts_at, req.ends_at)
-    now = int(time.time())
-    with _ann_lock:
-        items = _ann_all()
-        if len(items) >= 50:
-            raise HTTPException(status_code=400,
-                                detail="too many announcements, delete some first")
-        row = {"id": secrets.token_hex(6), "title": req.title.strip(),
-               "body": req.body.strip(), "level": req.level,
-               "pinned": bool(req.pinned), "active": bool(req.active),
-               "notify_mode": req.notify_mode,
-               "starts_at": int(req.starts_at or 0),
-               "ends_at": int(req.ends_at or 0),
-               "created_at": now, "updated_at": now, "by": user["email"]}
-        items.append(row)
-        USER_DB.set_setting(_ANN_KEY, items)
-    return {"ok": True, "announcement": row}
-
-
-@router.patch("/admin/announcements/{ann_id}")
-def admin_update_announcement(ann_id: str, req: AnnouncementUpdateReq,
-                              user=Depends(require_admin)):
-    fields = {k: v for k, v in req.model_dump().items() if v is not None}
-    if fields.get("level") not in (None,) + _ANN_LEVELS:
-        raise HTTPException(status_code=400,
-                            detail="level must be " + "|".join(_ANN_LEVELS))
-    if fields.get("notify_mode") not in (None,) + _ANN_MODES:
-        raise HTTPException(status_code=400,
-                            detail="notify_mode must be " + "|".join(_ANN_MODES))
-    with _ann_lock:
-        items = _ann_all()
-        i = _ann_find(items, ann_id)
-        if i < 0:
-            raise HTTPException(status_code=404, detail="announcement not found")
-        for k in ("title", "body"):
-            if k in fields:
-                fields[k] = fields[k].strip()
-        merged = dict(items[i])
-        merged.update(fields)
-        _ann_check_window(merged.get("starts_at") or 0, merged.get("ends_at") or 0)
-        items[i] = merged
-        # 改了内容就抬 updated_at:read_at 落在它之前的人重新算未读。
-        if fields:
-            items[i]["updated_at"] = int(time.time())
-        USER_DB.set_setting(_ANN_KEY, items)
-        return {"ok": True, "announcement": items[i]}
-
-
-@router.delete("/admin/announcements/{ann_id}")
-def admin_delete_announcement(ann_id: str, user=Depends(require_admin)):
-    with _ann_lock:
-        items = _ann_all()
-        i = _ann_find(items, ann_id)
-        if i < 0:
-            raise HTTPException(status_code=404, detail="announcement not found")
-        items.pop(i)
-        USER_DB.set_setting(_ANN_KEY, items)
-    # 已读记录跟着删,不留孤儿行(id 是随机的,不会被后来的公告复用)
-    USER_DB.drop_announcement_reads(ann_id)
-    return {"ok": True}
-
-
-def _common_prefix(items):
-    """一组字符串的公共前缀。min/max 那两个就够 —— 字典序最小与最大的公共前缀
-    就是全体的公共前缀。"""
-    if not items:
-        return ""
-    a, b = min(items), max(items)
-    i = 0
-    while i < len(a) and i < len(b) and a[i] == b[i]:
-        i += 1
-    return a[:i]
-
-
-def _channel_wildcard(models):
-    """整个渠道的通配写法,从模型名算出来,不猜。
-
-    渠道里若有裸名模型(比如既暴露 `foo` 又暴露 `foo-bar`),手写 `foo-*` 会漏掉它
-    —— 公共前缀给的是 `foo`,正好躲开这个坑。模型名是 vendor/model 形状的渠道没有
-    公共前缀,返回 None:那种渠道只能逐个选,给一个错的通配比不给更糟。
-    """
-    if len(models) < 2:
-        return None
-    pre = _common_prefix(models)
-    return pre + "*" if len(pre) >= 2 else None
-
-
-@router.get("/admin/channels")
-def admin_list_channels(user=Depends(require_admin)):
-    """渠道目录:每个渠道的模型清单 + 上下线状态 + 来源 + 号池计数。
-
-    给三处界面用:分组编辑里的「可用模型」下拉(要真实模型名,不能让管理员靠手打)、
-    站点设置里的渠道开关、以及「渠道」页。列全量含已下线的 —— 已下线的渠道也要能
-    出现在开关里,否则关了就再也开不回来。
-    """
-    off = set(adapter_mod.disabled_channels())
-    pool = pool_state.DB.stats()
-    # 每个模型挂了几个渠道:>1 的在界面上标出来,站长才知道哪些模型有备胎
-    owners = {}
-    for n, ad in adapter_mod.all_adapters().items():
-        for m in ad.models:
-            owners.setdefault(m, []).append(n)
+    ok: 1=实测通过 0=实测失败 -1=号池空(没法测);没有记录 = 还没轮到。
+    heartbeats: 按小时聚合(巡检每小时一轮),渠道视角取最差。
+    bars: 渠道视角按天取最差 —— 当天任一次失败就是红。生成类(图/视频)
+    不巡检(烧真金 credits),不出现在这里。"""
+    stored = {(r["channel"], r["model"]): r
+              for r in USER_DB.latest_model_status()}
+    since = time.time() - model_status.RETENTION
+    hist = {}
+    for r in USER_DB.history_model_status(since):
+        hist.setdefault((r["channel"], r["model"]), []).append(r)
     out = []
-    for name, ad in sorted(adapter_mod.all_adapters().items()):
-        models = sorted(ad.models)
-        st = pool.get(name) or {"total": 0, "by_status": {}}
-        priority, weight = adapter_mod.routing_of(name)
-        item = {"name": name, "kind": getattr(ad, "kind", "chat"),
-                "disabled": name in off, "models": models,
-                "wildcard": _channel_wildcard(models),
-                "priority": priority, "weight": weight,
-                "shared_models": sorted(m for m in models if len(owners.get(m, [])) > 1),
-                "source": "data" if channels_mod.is_data_channel(name) else "code",
-                "billing_mode": getattr(ad, "billing_mode", None),
-                "stateless_keys": bool(getattr(ad, "stateless_keys", False)),
-                "streaming": bool(getattr(ad, "streaming", False)),
-                "proxy": bool(getattr(ad, "proxy", False)),
-                "capabilities": list(getattr(ad, "capabilities", [])),
-                "pool": {"total": st["total"], **(st.get("by_status") or {})}}
-        if hasattr(ad, "describe"):
-            item["config"] = ad.describe()
-        out.append(item)
-    return {"channels": out}
+    for name, ad in sorted(adapter_mod.enabled_adapters().items()):
+        if getattr(ad, "kind", "chat") == "generation":
+            continue
+        for model in sorted(model_status.monitored_models(ad)):
+            r = stored.get((name, model)) or {}
+            rows = hist.get((name, model), [])
+            out.append({"channel": name, "model": model,
+                        "kind": getattr(ad, "kind", "chat"),
+                        "ok": r.get("ok"),
+                        "latency_ms": r.get("latency_ms") or 0,
+                        "ttft_ms": r.get("ttft_ms"),
+                        "error": r.get("error"),
+                        "checked_at": r.get("checked_at"),
+                        "heartbeats": model_status.hour_bars(rows, worst=True),
+                        "bars": model_status.day_bars(rows, worst=True)})
+    return {"interval": config.MODEL_STATUS_INTERVAL,
+            "running": model_status.is_running(),
+            "rows": out}
 
 
-class ChannelReq(BaseModel):
-    """数据渠道。models / model_map / headers 既收结构化值也收文本(多行 / a=b)。"""
-    name: str | None = None
-    type: str = "openai"
-    base_url: str
-    chat_path: str | None = "/chat/completions"
-    models: list | str | None = None
-    model_map: dict | str | None = None
-    headers: dict | str | None = None
-    timeout: int | None = 0
-    notes: str | None = None
+@router.post("/admin/model-status/run")
+async def admin_run_model_status(user=Depends(require_admin)):
+    """手动触发一轮检测,立刻返回 —— 一轮要几分钟,不能挂在 HTTP 请求上。
+
+    与定时轮共用一道闸:同时在跑的最多一轮。started=False 表示已有一轮在跑。"""
+    if model_status.is_running():
+        return {"ok": True, "started": False}
+    asyncio.get_running_loop().create_task(model_status.run_checked(
+        USER_DB, pool_state.POOL, pool_state.DB, adapter_mod.enabled_adapters))
+    return {"ok": True, "started": True}
 
 
-def _channel_row(name):
-    row = USER_DB.get_channel(name)
-    if row is None:
-        raise HTTPException(status_code=404, detail="channel not found")
-    return row
+@router.get("/model-status")
+def model_status_overview(user=Depends(current_user)):
+    """用户侧模型状态:按对外模型名聚合,故障与暂不可用排最前。
+
+    与管理台版本的区别:不出上游错误原话、不做手动触发 —— 用户只需要
+    「现在哪个模型能不能用」。每个模型附带当前承载它的渠道名(channels),
+    方便对照多渠道切换。bars 是用户视角的 7 天状态条:
+    按天取最好(多渠道故障切换,当天任一渠道能用就算绿)。"""
+    stored = {(r["channel"], r["model"]): r
+              for r in USER_DB.latest_model_status()}
+    since = time.time() - model_status.RETENTION
+    hist = {}
+    for r in USER_DB.history_model_status(since):
+        hist.setdefault((r["channel"], r["model"]), []).append(r)
+    smap = model_status.user_status_map(adapter_mod.enabled_adapters(), stored, hist,
+                                       with_channels=True)
+    rows = [{"model": m, **smap[m]} for m in sorted(smap)]
+    order = {model_status.FAIL: 0, model_status.SKIP: 1, None: 2, model_status.OK: 3}
+    rows.sort(key=lambda r: (order.get(r["ok"], 2), r["model"]))
+    summary = {"ok": 0, "slow": 0, "fail": 0, "pending": 0}
+    for r in rows:
+        if r["ok"] is None:
+            summary["pending"] += 1
+        elif model_status.grade_of(r["ok"], r["ttft_ms"], r["latency_ms"]) == \
+                model_status.BAR_YELLOW:
+            summary["slow"] += 1
+        elif r["ok"] == model_status.OK:
+            summary["ok"] += 1
+        else:
+            summary["fail"] += 1
+    return {"interval": config.MODEL_STATUS_INTERVAL,
+            "summary": summary, "rows": rows}
 
 
-def _reload_channels():
-    """增删改之后重放注册表并重推开关。渠道开关存的是名字,删了的渠道留在里面无害。"""
-    from core.portal_state import load_data_channels
-    load_data_channels()
-    apply_channel_switches()
-    BILLING.invalidate()
+# ---- 共享 Key ----
+#
+# 用户把自己在某条渠道上的 key 交上来换余额奖励,规则存 settings.share_rewards。
+# 收 key 这件事本身有副作用(入库 + 发钱 + 打一次上游),所以:
+#   * 只认登录用户(不挂 optional_user)
+#   * 失败一律 400 带原因,不吞成 500
+#   * 幂等由 credit_ledger 的 idem_key 兜底,重复提交不会重复发奖
+
+class ShareKeyReq(BaseModel):
+    channel: str = Field(min_length=1, max_length=64)
+    key: str = Field(min_length=8, max_length=512)
 
 
-@router.post("/admin/channels")
-def admin_create_channel(req: ChannelReq, user=Depends(require_admin)):
-    """建一个 OpenAI 兼容渠道。存库即注册,模型立刻出现在清单与路由里;
-    key 另导(/admin/channels/{name}/keys),没 key 之前调用会 503「没有可用账号」。"""
+@router.get("/share/keys")
+def share_keys_info(user=Depends(current_user)):
+    """共享规则 + 我交过的 key + 已经拿了多少。控制台「共享 Key」页一次拉全。"""
+    return share_mod.my_summary(USER_DB, user["id"])
+
+
+@router.post("/share/keys")
+def share_key_submit(req: ShareKeyReq, user=Depends(current_user)):
+    """交一把 key。验活通过才入库并按把发奖;不通过把上游原话回给用户。"""
     try:
-        data = channels_mod.validate(req.model_dump(), USER_DB)
-    except channels_mod.ChannelError as e:
+        return share_mod.submit(USER_DB, user["id"], req.channel, req.key)
+    except share_mod.ShareError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    name = data.pop("name")
-    USER_DB.create_channel(name, **data)
-    _reload_channels()
-    return {"ok": True, "name": name, "channel": USER_DB.get_channel(name)}
 
 
-@router.patch("/admin/channels/{name}")
-def admin_update_channel(name: str, req: ChannelReq, user=Depends(require_admin)):
-    _channel_row(name)
-    if not channels_mod.is_data_channel(name):
-        raise HTTPException(status_code=400, detail="代码渠道不能在管理台修改")
-    body = req.model_dump()
-    body["name"] = name       # 不支持改名:accounts.channel 挂在名字上,改名等于丢号池
-    try:
-        data = channels_mod.validate(body, USER_DB, editing=name)
-    except channels_mod.ChannelError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    data.pop("name")
-    USER_DB.update_channel(name, **data)
-    _reload_channels()
-    return {"ok": True, "channel": USER_DB.get_channel(name)}
-
-
-@router.delete("/admin/channels/{name}")
-def admin_delete_channel(name: str, user=Depends(require_admin)):
-    """删渠道连同它的号池。号挂在渠道名上,渠道没了号就没有任何路径能用到,
-    留着只会让号池面板上多一堆无主账号。"""
-    _channel_row(name)
-    if not channels_mod.is_data_channel(name):
-        raise HTTPException(status_code=400, detail="代码渠道不能在管理台删除")
-    deleted = pool_state.DB.delete_channel(name)
-    USER_DB.delete_channel_config(name)
-    _reload_channels()
-    return {"ok": True, "name": name, "accounts_deleted": deleted}
-
-
-class RoutingReq(BaseModel):
-    priority: int = Field(default=0, ge=-1000, le=1000)
-    weight: int = Field(default=1, ge=0, le=1000)
-
-
-@router.patch("/admin/channels/{name}/routing")
-def admin_set_channel_routing(name: str, req: RoutingReq, user=Depends(require_admin)):
-    """改一个渠道的 priority / weight。存进 settings.channel_routing(全量映射的一项),
-    立刻推进注册表 —— 同一模型挂多个渠道时,谁先谁后、同档怎么分流就看这两个数。"""
-    if adapter_mod.get_adapter(name) is None:
-        raise HTTPException(status_code=404, detail=f"unknown channel: {name}")
-    routing = dict(S.channel_routing())
-    routing[name] = {"priority": req.priority, "weight": req.weight}
-    try:
-        routing = S.validate("channel_routing", routing, known_channels=_channel_names())
-    except S.SettingError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    USER_DB.set_setting("channel_routing", routing)
-    apply_channel_switches()
-    return {"ok": True, "name": name, "priority": req.priority, "weight": req.weight,
-            "routing": adapter_mod.channel_routing()}
-
-
-class KeysReq(BaseModel):
-    keys: list | None = None
-    key: str | None = None
-
-
-@router.post("/admin/channels/{name}/keys")
-def admin_import_channel_keys(name: str, req: KeysReq, user=Depends(require_admin)):
-    """给任意 key 池型渠道(代码的或数据的)导 key。与 /admin/import-keys 同一份
-    去重逻辑(core/pool_state.import_keys)。"""
-    ad = adapter_mod.get_adapter(name)
-    if ad is None:
-        raise HTTPException(status_code=404, detail=f"unknown channel: {name}")
-    keys = pool_state.parse_keys(req.model_dump())
-    if not keys:
-        raise HTTPException(status_code=400, detail="keys required")
-    imported, skipped = pool_state.import_keys(ad, keys)
-    st = pool_state.DB.stats(name).get(name) or {"total": 0, "by_status": {}}
-    return {"ok": True, "channel": name, "imported": imported, "skipped": skipped,
-            "total": len(keys), "pool": {"total": st["total"], **(st.get("by_status") or {})}}
-
-
-class ChannelTestReq(BaseModel):
-    model: str | None = None
-    prompt: str = Field(default="Reply with the single word: pong", max_length=500)
-
-
-@router.post("/admin/channels/{name}/test")
-def admin_test_channel(name: str, req: ChannelTestReq, user=Depends(require_admin)):
-    """从号池取一把号,非流式发一句话,回耗时、上游模型名与回复片段;失败把上游
-    状态码与响应体原话回给管理员 —— 「401 invalid api key」和「404 model not found」
-    是两种要改的东西,只回「失败」等于没说。不计费、不写用量。"""
-    ad = adapter_mod.get_adapter(name)
-    if ad is None:
-        raise HTTPException(status_code=404, detail=f"unknown channel: {name}")
-    if not ad.has(adapter_mod.CAP_CHAT) or getattr(ad, "proxy", False):
-        raise HTTPException(status_code=400, detail="只有对话型 key 池渠道支持测试")
-    model = (req.model or "").strip() or (ad.models[0] if ad.models else "")
-    if model not in ad.models:
-        raise HTTPException(status_code=400, detail=f"{model} 不是该渠道的模型")
-    acct = pool_state.POOL.get_valid_account(name, ad)
-    if acct is None:
-        raise HTTPException(status_code=503, detail="号池里没有可用账号,先导入 key")
-    started = time.time()
-    try:
-        reply = ad.chat(acct, [{"role": "user", "content": req.prompt}],
-                        stream=False, model=model,
-                        body={"max_tokens": 32, "temperature": 0})
-    except Exception as e:
-        # 与网关同一套判定,让坏 key 在这里也退场;但不 raise 到 500
-        pool_state.POOL.mark_failure(acct["id"], e, adapter=ad)
-        return {"ok": False, "channel": name, "model": model,
-                "identity": acct.get("identity"),
-                "elapsed_ms": int((time.time() - started) * 1000),
-                "error": str(e)[:800]}
-    raw = (reply or {}).get("raw") if isinstance(reply, dict) else None
-    content = ""
-    if isinstance(raw, dict):
-        msg = ((raw.get("choices") or [{}])[0].get("message") or {})
-        content = msg.get("content") or ""
-    return {"ok": True, "channel": name, "model": model,
-            "identity": acct.get("identity"),
-            "elapsed_ms": int((time.time() - started) * 1000),
-            "reply": (content or "")[:200],
-            "usage": (raw or {}).get("usage") if isinstance(raw, dict) else None}
+@router.get("/admin/share/contributions")
+def admin_share_contributions(limit: int = Query(200, ge=1, le=1000),
+                              user=Depends(require_admin)):
+    """最近由用户共享进来的 key(脱敏 identity,无明文 key)。"""
+    return {"contributions": share_mod.contributions(limit=limit)}
 
 
 @router.get("/admin/groups")
@@ -2008,7 +1729,7 @@ def admin_create_group(req: GroupReq, user=Depends(require_admin)):
     gid = USER_DB.create_group(
         name=req.name, rate_multiplier=req.rate_multiplier,
         supported_models=req.supported_models, billing_policy=req.billing_policy,
-        rpm_limit=req.rpm_limit,
+        concurrency_limit=req.concurrency_limit,
         daily_limit=req.daily_limit, weekly_limit=req.weekly_limit,
         monthly_limit=req.monthly_limit, limit_unit=req.limit_unit,
         is_default=req.is_default, status=req.status,
@@ -2142,9 +1863,11 @@ def admin_get_settings(user=Depends(require_admin)):
     off = set(adapter_mod.disabled_channels())
     return {
         "require_invite": _require_invite(),
+        "registration_policy": registration_policy(),
         "default_group": USER_DB.get_setting("default_group", config.DEFAULT_GROUP),
         "defaults": {  # 环境变量里的默认值,便于对比。刻意不含 epay_key。
             "require_invite": config.REQUIRE_INVITE,
+            "community_min_level": config.COMMUNITY_MIN_LEVEL,
             "default_group": config.DEFAULT_GROUP,
             "payment_providers": config.PAYMENT_PROVIDERS,
             "min_topup": config.MIN_TOPUP,
@@ -2152,10 +1875,13 @@ def admin_get_settings(user=Depends(require_admin)):
             "epay_api_url": config.EPAY_API_URL,
             "epay_pid": config.EPAY_PID,
             "epay_usd_rate": config.EPAY_USD_RATE,
+            "baipiao_pid": config.BAIPIAO_PID,
+            "mao_per_usd": config.MAO_PER_USD,
             "disabled_channels": config.DISABLED_CHANNELS,
             "checkin_min": config.CHECKIN_MIN,
             "checkin_max": config.CHECKIN_MAX,
             "invite_rewards": S.invite_reward_defaults(),
+            "share_rewards": S.share_reward_defaults(),
         },
         "pricing_catalog": pricing_catalog.status(),
         # 生效值(库里有就是库里的)
@@ -2165,11 +1891,15 @@ def admin_get_settings(user=Depends(require_admin)):
         "epay_api_url": S.epay_api_url(),
         "epay_pid": S.epay_pid(),
         "epay_usd_rate": S.epay_usd_rate(),
+        "baipiao_pid": S.baipiao_pid(),
+        "baipiao_key_set": bool(S.baipiao_key()),
+        "mao_per_usd": S.mao_per_usd(),
         "epay_key_set": bool(key),
         "epay_key_tail": key[-4:] if len(key) >= 4 else "",
         "checkin_min": S.checkin_min(),
         "checkin_max": S.checkin_max(),
         "invite_rewards": S.invite_rewards(),
+        "share_rewards": S.share_rewards(),
         # 邮件。密码同 epay_key 口径:只回「设了没有」
         "smtp_host": S.smtp_host(),
         "smtp_port": S.smtp_port(),
@@ -2191,9 +1921,6 @@ def admin_get_settings(user=Depends(require_admin)):
     }
 
 
-def _channel_names():
-    """所有注册的渠道名,含已下线的。校验拿它挡拼错的名字。"""
-    return sorted(adapter_mod.all_adapters())
 
 
 @router.patch("/admin/settings")
@@ -2277,314 +2004,3 @@ def admin_mail_test(req: MailTestReq, user=Depends(require_admin)):
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"ok": True, "to": str(req.to)}
 
-
-# ---- 管理端 · 库备份 ----
-
-@router.get("/admin/backup")
-def admin_backup_status(user=Depends(require_admin)):
-    """最新一份在哪、多大、几份、下次几点。管理台据此显示「上次备份 N 小时前」——
-    没有这个读数,自动备份挂了三个月也没人知道。"""
-    from core import backup as backup_mod
-    return backup_mod.current_status()
-
-
-@router.post("/admin/backup")
-def admin_backup_now(user=Depends(require_admin)):
-    """立刻做一份。给「要动数据库之前先备一份」这个动作一个按钮。"""
-    from core import backup as backup_mod
-    try:
-        done = backup_mod.backup_once(config.DB_PATH, backup_mod.resolve_dir(),
-                                      keep=config.BACKUP_KEEP)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"backup failed: {e}") from e
-    return {"ok": True, "name": os.path.basename(done["path"]),
-            "size": done["size"], "pruned": done["pruned"],
-            "status": backup_mod.current_status()}
-
-
-# ---- 管理端 · 定价 ----
-
-class PricingReq(BaseModel):
-    model_pattern: str
-    group_id: int | None = None
-    billing_mode: str = "token"
-    input_price: float = 0
-    output_price: float = 0
-    cache_read_price: float = 0
-    cache_write_price: float = 0
-    per_request_price: float = 0
-    long_threshold: int = 0
-    long_input_price: float | None = None
-    long_output_price: float | None = None
-    long_cache_read_price: float | None = None
-    long_cache_write_price: float | None = None
-    notes: str | None = None
-
-
-class PricingImportReq(BaseModel):
-    pricing: list
-    replace: bool = False   # True=先清空同 scope 的旧定价
-
-
-@router.get("/admin/pricing")
-def admin_list_pricing(group_id: int = None, user=Depends(require_admin)):
-    rows = USER_DB.list_pricing(group_id if group_id is not None else "__all__")
-    return {"pricing": rows, "catalog": pricing_catalog.status()}
-
-
-@router.post("/admin/pricing")
-def admin_upsert_pricing(req: PricingReq, user=Depends(require_admin)):
-    if req.billing_mode not in ("token", "per_request", "free"):
-        raise HTTPException(status_code=400,
-                            detail="billing_mode must be token|per_request|free")
-    if req.group_id is not None and not USER_DB.get_group(req.group_id):
-        raise HTTPException(status_code=400, detail="group not found")
-    data = req.model_dump()
-    pattern = data.pop("model_pattern")
-    gid = data.pop("group_id")
-    pid = USER_DB.upsert_pricing(pattern, gid, **data)
-    PRICING.invalidate()
-    return {"ok": True, "id": pid}
-
-
-@router.delete("/admin/pricing/{pricing_id}")
-def admin_delete_pricing(pricing_id: int, user=Depends(require_admin)):
-    if not USER_DB.delete_pricing(pricing_id):
-        raise HTTPException(status_code=404, detail="pricing not found")
-    PRICING.invalidate()
-    return {"ok": True}
-
-
-@router.post("/admin/pricing/import")
-def admin_import_pricing(req: PricingImportReq, user=Depends(require_admin)):
-    """批量导入定价(与 GET /admin/pricing 的 pricing 字段格式一致,可往返)。"""
-    imported, skipped = 0, []
-    for row in req.pricing:
-        if not isinstance(row, dict) or not row.get("model_pattern"):
-            skipped.append(row)
-            continue
-        data = {k: v for k, v in row.items()
-                if k in USER_DB.PRICING_FIELDS and k not in ("model_pattern", "group_id")}
-        try:
-            USER_DB.upsert_pricing(row["model_pattern"], row.get("group_id"), **data)
-            imported += 1
-        except Exception as e:
-            skipped.append({"model_pattern": row.get("model_pattern"), "error": str(e)})
-    PRICING.invalidate()
-    return {"ok": True, "imported": imported, "skipped": skipped}
-
-
-# ---- 管理端 · 兑换码 / 订单 / 余额 ----
-
-class CodeGenReq(BaseModel):
-    count: int = Field(ge=1, le=1000)
-    # 邀请码不入账,面额恒 0,所以 value 可以不填;余额码填 0 会被 generate_codes 拒。
-    value: float = 0
-    expires_at: int = 0
-    notes: str | None = None
-    type: str = TYPE_BALANCE     # balance=余额兑换码 | invitation=注册邀请码
-
-
-@router.get("/admin/codes")
-def admin_list_codes(status: str = None, type: str = None, limit: int = 100,
-                     offset: int = 0, user=Depends(require_admin)):
-    """兑换码与邀请码同表,type 不传就是两种都给。管理台两个页面各自带上 type,
-    否则邀请码会混进兑换码列表里显示成一堆 $0.00 的码。"""
-    return {"codes": USER_DB.list_codes(status=status, type=type,
-                                        limit=min(limit, 500), offset=offset)}
-
-
-@router.post("/admin/codes")
-def admin_generate_codes(req: CodeGenReq, user=Depends(require_admin)):
-    if req.type not in (TYPE_BALANCE, TYPE_INVITATION):
-        raise HTTPException(
-            status_code=400, detail=f"type must be {TYPE_BALANCE}|{TYPE_INVITATION}")
-    # 邀请码的面额一律抹成 0:留一个非零面额在库里,迟早有人照余额码去理解它
-    value = 0 if req.type == TYPE_INVITATION else req.value
-    try:
-        codes = generate_codes(USER_DB, req.count, value, type=req.type,
-                               expires_at=req.expires_at, notes=req.notes)
-    except RedeemError as e:
-        raise HTTPException(status_code=400,
-                            detail={"code": e.code, "message": e.detail}) from e
-    return {"ok": True, "codes": codes}
-
-
-@router.delete("/admin/codes/{code}")
-def admin_disable_code(code: str, user=Depends(require_admin)):
-    if not USER_DB.disable_code(code.strip().upper()):
-        raise HTTPException(status_code=404, detail="code not found or already used")
-    return {"ok": True}
-
-
-@router.get("/admin/orders")
-def admin_list_orders(status: str = None, limit: int = 100, offset: int = 0,
-                      user=Depends(require_admin)):
-    return {"orders": USER_DB.list_orders(status=status, limit=min(limit, 500),
-                                          offset=offset)}
-
-
-@router.post("/admin/orders/{out_trade_no}/requery")
-def admin_requery_order(out_trade_no: str, user=Depends(require_admin)):
-    """人工触发一次查单 + 到账。
-
-    自动对账每 600 秒一跳,这个入口给的是「用户在线催单」和「自动路径也没救回来」
-    两种情况。它跟 /admin/users/{id}/balance 手工加钱的区别是可审计:
-    到账走的还是订单自己的 recharge_code,流水 reason=recharge 且带订单号,
-    手工调额那笔 reason=admin,事后对不上任何订单。
-    """
-    order = USER_DB.get_order_by_trade_no(out_trade_no)
-    if order is None:
-        raise HTTPException(status_code=404, detail="order not found")
-    provider = get_provider(order["provider"])
-    if provider is None:
-        raise HTTPException(status_code=400,
-                            detail=f"provider not loaded: {order['provider']}")
-    try:
-        res = provider.query_order(out_trade_no)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"query failed: {e}") from e
-    status = (res or {}).get("status")
-    credited = False
-    if status == "paid":
-        USER_DB.mark_order_paid(out_trade_no)
-        credited = orders_mod.fulfil(USER_DB, out_trade_no)
-    return {"ok": True, "upstream_status": status or "unknown",
-            "credited": credited,
-            "order": USER_DB.get_order_by_trade_no(out_trade_no)}
-
-
-class BalanceAdjustReq(BaseModel):
-    amount: float           # 正=加,负=扣
-    notes: str | None = None
-
-
-@router.post("/admin/users/{user_id}/balance")
-def admin_adjust_balance(user_id: int, req: BalanceAdjustReq,
-                         user=Depends(require_admin)):
-    """管理员调额。走 credit(),流水可查。amount 可正可负。"""
-    target = USER_DB.get_user(user_id)
-    if not target:
-        raise HTTPException(status_code=404, detail="user not found")
-    if req.amount == 0:
-        raise HTTPException(status_code=400, detail="amount must not be zero")
-    idem = f"admin:{user['id']}:{user_id}:{int(time.time() * 1000)}"
-    row, _ = credit(user_id, req.amount, REASON_ADMIN, idem,
-                    meta={"by": user["id"], "notes": req.notes})
-    BILLING.invalidate()
-    return {"ok": True, "balance": row.get("balance_after")}
-
-
-@router.get("/admin/ledger")
-def admin_user_ledger(user_id: int, limit: int = 100, offset: int = 0,
-                      user=Depends(require_admin)):
-    return {"entries": USER_DB.list_ledger(user_id, limit=min(limit, 500),
-                                           offset=offset)}
-
-
-# ---- 管理端 · 全站用量日志 / 看板 ----
-
-def _admin_usage_scope(email, user_id):
-    """email 与 user_id 二选一定位用户。邮箱查不到返回 -1:让检索结果为空,
-    而不是 404 —— 搜索框里敲错一个字母得到「0 条」比得到报错页顺手。"""
-    if email:
-        u = USER_DB.get_user_by_email(email.lower().strip())
-        return u["id"] if u else -1
-    return user_id
-
-
-@router.get("/admin/usage")
-def admin_usage(limit: int = 50, offset: int = 0, user_id: int = None,
-                email: str = None, api_key_id: int = None, model: str = None,
-                channel: str = None, since: int = None, until: int = None,
-                end_reason: str = None, user=Depends(require_admin)):
-    """全站用量日志,带邮箱与密钥名。这是「谁在半夜刷了 3000 次」「这个渠道
-    今天是不是一直 eof」这类问题的唯一入口 —— 原先只有用户看自己那 50 条。"""
-    limit = max(1, min(int(limit), 500))
-    f = _usage_filters(model, channel, since, until, end_reason, api_key_id)
-    f["user_id"] = _admin_usage_scope(email, user_id)
-    rows, total = USER_DB.query_usage(limit=limit, offset=max(0, offset),
-                                      with_user=True, **f)
-    return {"logs": rows, "total": total, "limit": limit, "offset": max(0, offset)}
-
-
-@router.get("/admin/usage/export.csv")
-def admin_usage_export(user_id: int = None, email: str = None, api_key_id: int = None,
-                       model: str = None, channel: str = None, since: int = None,
-                       until: int = None, end_reason: str = None,
-                       user=Depends(require_admin)):
-    f = _usage_filters(model, channel, since, until, end_reason, api_key_id)
-    f["user_id"] = _admin_usage_scope(email, user_id)
-    rows, _ = USER_DB.query_usage(limit=_CSV_MAX, offset=0, with_user=True, **f)
-    return _usage_csv(rows, with_user=True,
-                      filename=f"site-usage-{_date.today().isoformat()}.csv")
-
-
-def _window_stats(since, until=None):
-    """一个时间窗的经营读数:用量合计 + 流水按原因 + 已完成订单。"""
-    usage = USER_DB.usage_totals(since=since, until=until)
-    ledger = USER_DB.ledger_by_reason(since, until)
-    orders = USER_DB.orders_completed(since, until)
-
-    def amt(reason):
-        return (ledger.get(reason) or {}).get("amount") or 0.0
-
-    return {
-        "usage": usage,
-        "orders": orders,
-        # 进账:充值(订单真金白银)+ 兑换码(可能是站长送的也可能是卖的,分开列)
-        "recharge": amt("recharge"),
-        "redeem": amt("redeem"),
-        # 消费:balance 策略下真实从余额扣掉的钱(usage 流水是负数,取反)
-        "consumed": -amt("usage"),
-        # 套餐售卖:购买是负数流水,取反就是卖出的额度
-        "plans": -amt("plan"),
-        # 营销支出:签到 + 注册赠额 + 返佣 + 管理员手工加的
-        "giveaway": amt("checkin") + amt("signup") + amt("affiliate") + max(amt("admin"), 0.0),
-        "ledger": ledger,
-    }
-
-
-@router.get("/admin/stats")
-def admin_stats(days: int = 14, user=Depends(require_admin)):
-    """看板:今日 / 近 7 天 / 近 30 天三个窗口的经营读数、日序列、按渠道/模型/用户
-    的消耗排行、用户增长与余额负债。全部来自 usage_logs / credit_ledger / orders /
-    users 四张已有的表,没有新的写路径。"""
-    now = int(time.time())
-    days = max(1, min(int(days), 90))
-    day_start = int(datetime.combine(_date.today(), datetime.min.time()).timestamp())
-    windows = {
-        "today": _window_stats(day_start),
-        "week": _window_stats(now - 7 * 86400),
-        "month": _window_stats(now - 30 * 86400),
-    }
-    top_users = USER_DB.usage_group_by("user_id", since=now - 7 * 86400, limit=10)
-    brief = USER_DB.users_brief([x["key"] for x in top_users])
-    for x in top_users:
-        x.update(brief.get(x["key"], {}))
-    # 近 N 天按本地日历日补齐:没记录的日子也要有格子,折线不能把空天画成直连
-    raw = {r["date"]: r for r in USER_DB.usage_daily_all(days=days)}
-    series = []
-    for k in range(days - 1, -1, -1):
-        d = _date.fromtimestamp(now - k * 86400).isoformat()
-        r = raw.get(d) or {"requests": 0, "users": 0, "tokens": 0, "cost": 0.0}
-        series.append({"date": d, "label": d[5:], "requests": r["requests"],
-                       "users": r["users"], "tokens": r["tokens"], "cost": r["cost"]})
-    return {
-        "generated_at": now,
-        "windows": windows,
-        "series": series,
-        "by_channel": USER_DB.usage_group_by("channel", since=now - 7 * 86400),
-        "by_model": USER_DB.usage_group_by("model", since=now - 7 * 86400, limit=12),
-        "top_users": top_users,
-        "users": {
-            "total": USER_DB.count_users(),
-            "new_today": USER_DB.count_users_since(day_start),
-            "new_week": USER_DB.count_users_since(now - 7 * 86400),
-            "new_month": USER_DB.count_users_since(now - 30 * 86400),
-            "active_today": windows["today"]["usage"]["users"],
-            "active_week": windows["week"]["usage"]["users"],
-            "active_month": windows["month"]["usage"]["users"],
-        },
-        "balances": USER_DB.balance_totals(),
-    }

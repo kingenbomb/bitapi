@@ -14,7 +14,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ["BITAPI_DB"] = os.path.join(_TMP, "bitapi.db")
-os.environ["BITAPI_GROK_AUTH_DIR"] = os.path.join(_TMP, "noexist_auths")
 os.environ["BITAPI_JWT_SECRET"] = "kc-secret"
 os.environ["BITAPI_API_KEY"] = "sk-master-kc"
 os.environ["BITAPI_DEFAULT_GROUP"] = "free"
@@ -50,21 +49,21 @@ def setUpModule():
 class KeyControlUnitTest(unittest.TestCase):
     """不经 HTTP,直接钉死 Billing 的判定语义。"""
 
-    GROUP = {"supported_models": ["demo-*", "grok-4.5"], "billing_policy": "free"}
+    GROUP = {"supported_models": ["kg-*", "grok-4.5"], "billing_policy": "free"}
 
     def test_group_whitelist_unchanged_without_key_list(self):
-        self.assertTrue(BILL.check_model_allowed(self.GROUP, "demo-a", None))
+        self.assertTrue(BILL.check_model_allowed(self.GROUP, "kg-a", None))
         self.assertTrue(BILL.check_model_allowed(self.GROUP, "grok-4.5", None))
         self.assertFalse(BILL.check_model_allowed(self.GROUP, "gpt-5", None))
         # 空白名单 == 不额外收紧
         self.assertTrue(BILL.check_model_allowed(
-            self.GROUP, "demo-a", {"allowed_models": []}))
+            self.GROUP, "kg-a", {"allowed_models": []}))
 
     def test_key_models_can_only_narrow(self):
-        key = {"allowed_models": ["demo-b"]}
-        self.assertTrue(BILL.check_model_allowed(self.GROUP, "demo-b", key))
+        key = {"allowed_models": ["kg-b"]}
+        self.assertTrue(BILL.check_model_allowed(self.GROUP, "kg-b", key))
         # 分组允许但密钥不允许 → 拒
-        self.assertFalse(BILL.check_model_allowed(self.GROUP, "demo-a", key))
+        self.assertFalse(BILL.check_model_allowed(self.GROUP, "kg-a", key))
         # 密钥允许但分组不允许 → 仍拒(不能扩权)
         self.assertFalse(BILL.check_model_allowed(
             self.GROUP, "gpt-5", {"allowed_models": ["gpt-5"]}))
@@ -72,12 +71,12 @@ class KeyControlUnitTest(unittest.TestCase):
             self.GROUP, "gpt-5", {"allowed_models": ["*"]}))
 
     def test_key_models_support_prefix_wildcard(self):
-        key = {"allowed_models": ["demo-x*"]}
-        self.assertTrue(BILL.check_model_allowed(self.GROUP, "demo-x1", key))
-        self.assertFalse(BILL.check_model_allowed(self.GROUP, "demo-y1", key))
+        key = {"allowed_models": ["kg-x*"]}
+        self.assertTrue(BILL.check_model_allowed(self.GROUP, "kg-x1", key))
+        self.assertFalse(BILL.check_model_allowed(self.GROUP, "kg-y1", key))
 
     def test_no_group_still_denies(self):
-        self.assertFalse(BILL.check_model_allowed(None, "demo-a", None))
+        self.assertFalse(BILL.check_model_allowed(None, "kg-a", None))
 
     def test_ip_whitelist(self):
         self.assertTrue(BILL.check_key_ip(None, "1.2.3.4"))
@@ -101,7 +100,7 @@ class KeyControlUnitTest(unittest.TestCase):
         self.assertFalse(BILL.check_key_ip(k, "2001:dbf::1"))
 
     def test_quota_precheck(self):
-        uid = DB.create_user("q@example.com", "x", "AFFQ1")
+        uid = DB.create_user("q@gmail.com", "x", "AFFQ1")
         # quota=0 不限
         k0 = DB.create_api_key(uid, "sk-q0", quota=0)
         BILL.precheck({"id": uid, "_api_key_id": k0}, None)
@@ -117,7 +116,7 @@ class KeyControlUnitTest(unittest.TestCase):
         self.assertAlmostEqual(rec["used_quota"], 1.0, places=6)
 
     def test_touch_accumulates_and_sets_time(self):
-        uid = DB.create_user("t@example.com", "x", "AFFT1")
+        uid = DB.create_user("t@gmail.com", "x", "AFFT1")
         kid = DB.create_api_key(uid, "sk-t1")
         self.assertEqual(DB.get_api_key_by_id(kid)["last_used_at"], 0)
         DB.touch_api_key(kid, spent=0.25)
@@ -133,16 +132,16 @@ class KeyControlApiTest(unittest.TestCase):
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
         cls.client.post("/api/register", json={
-            "email": "owner@example.com", "password": "secret123"})
+            "email": "owner@gmail.com", "password": "secret123"})
         cls.tok = cls.client.post("/api/login", json={
-            "email": "owner@example.com", "password": "secret123"}).json()["token"]
+            "email": "owner@gmail.com", "password": "secret123"}).json()["token"]
         cls.h = {"Authorization": f"Bearer {cls.tok}"}
 
     def _create(self, **body):
         return self.client.post("/api/keys", json=body, headers=self.h)
 
     def test_list_shape_has_every_column(self):
-        r = self._create(name="cols", quota=5, allowed_models=["demo-a"],
+        r = self._create(name="cols", quota=5, allowed_models=["kg-a"],
                          allowed_ips=["10.0.0.0/8"])
         self.assertEqual(r.status_code, 200, r.text)
         kid = r.json()["id"]
@@ -158,7 +157,7 @@ class KeyControlApiTest(unittest.TestCase):
                   "last_used_at", "expires_at", "expired"):
             self.assertIn(f, row)
         self.assertEqual(row["quota"], 5)
-        self.assertEqual(row["allowed_models"], ["demo-a"])
+        self.assertEqual(row["allowed_models"], ["kg-a"])
         self.assertEqual(row["allowed_ips"], ["10.0.0.0/8"])
         # 列表不含完整明文;脱敏串保留首尾便于区分两把密钥
         self.assertNotIn("key", row)
@@ -214,7 +213,7 @@ class KeyControlApiTest(unittest.TestCase):
         """今日与累计是两个窗口:写一条 3 天前的用量只进累计,不进今日。"""
         created = self._create(name="split").json()
         kid = created["id"]
-        u = DB.get_user_by_email("owner@example.com")
+        u = DB.get_user_by_email("owner@gmail.com")
         now = int(__import__("time").time())
         DB.add_usage(user_id=u["id"], api_key_id=kid, channel="c", model="m",
                      input_tokens=10, output_tokens=5, cost=2.0, actual_cost=2.0)
@@ -235,9 +234,9 @@ class KeyControlApiTest(unittest.TestCase):
     def test_usage_map_matches_single_query(self):
         """批量聚合与逐把查询结果一致(前者是后者的 N+1 消除版)。"""
         keys = DB.list_api_keys(
-            DB.get_user_by_email("owner@example.com")["id"])
+            DB.get_user_by_email("owner@gmail.com")["id"])
         m = DB.api_key_usage_map(
-            DB.get_user_by_email("owner@example.com")["id"])
+            DB.get_user_by_email("owner@gmail.com")["id"])
         for k in keys:
             one = DB.api_key_usage(k["id"])
             got = m.get(k["id"], {"requests": 0, "tokens": 0, "cost": 0.0})
@@ -253,7 +252,7 @@ class KeyControlApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400, r.text)
 
     def test_patch_can_clear_lists(self):
-        kid = self._create(name="clearme", allowed_models=["demo-a"],
+        kid = self._create(name="clearme", allowed_models=["kg-a"],
                            allowed_ips=["1.2.3.4"]).json()["id"]
         r = self.client.patch(f"/api/keys/{kid}",
                               json={"allowed_models": [], "allowed_ips": []},
@@ -289,34 +288,34 @@ class KeyControlApiTest(unittest.TestCase):
         self.assertTrue(row["quota_exhausted"])
 
     def test_gateway_403_when_model_not_in_key_list(self):
-        """分组允许 * ,密钥只允许 demo-*,请求 grok 应 403(收紧生效)。"""
-        gid = DB.create_group(name="kc-all", supported_models=["*"], rpm_limit=0)
-        u = DB.get_user_by_email("owner@example.com")
+        """分组允许 * ,密钥只允许 kg-*,请求 grok 应 403(收紧生效)。"""
+        gid = DB.create_group(name="kc-all", supported_models=["*"], concurrency_limit=0)
+        u = DB.get_user_by_email("owner@gmail.com")
         old = u["group_id"]
         DB.update_user(u["id"], group_id=gid)
         BILL.invalidate()
         try:
-            created = self._create(name="narrow", allowed_models=["demo-*"]).json()
+            created = self._create(name="narrow", allowed_models=["kg-*"]).json()
             h = {"Authorization": f"Bearer {created['key']}"}
             r = self.client.post("/v1/chat/completions",
                                  json={"model": "grok-4.5", "messages": [{"role": "user", "content": "hi"}]},
                                  headers=h)
             self.assertEqual(r.status_code, 403, r.text)
-            # demo-* 内的模型不应被这道白名单拦(未知模型走到路由才 404)
+            # kg-* 内的模型不应被这道白名单拦(未知模型走到路由才 404)
             r = self.client.post("/v1/chat/completions",
-                                 json={"model": "demo-nope", "messages": [{"role": "user", "content": "hi"}]},
+                                 json={"model": "kg-nope", "messages": [{"role": "user", "content": "hi"}]},
                                  headers=h)
             self.assertNotEqual(r.status_code, 403, r.text)
-            # /v1/models 与网关口径一致:只剩 demo-*
+            # /v1/models 与网关口径一致:只剩 kg-*
             ids = [m["id"] for m in self.client.get("/v1/models", headers=h).json()["data"]]
-            self.assertTrue(all(m.startswith("demo-") for m in ids), ids[:5])
+            self.assertTrue(all(m.startswith("kg-") for m in ids), ids[:5])
         finally:
             DB.update_user(u["id"], group_id=old)
             BILL.invalidate()
 
     def test_gateway_403_when_ip_not_allowed(self):
-        gid = DB.create_group(name="kc-all2", supported_models=["*"], rpm_limit=0)
-        u = DB.get_user_by_email("owner@example.com")
+        gid = DB.create_group(name="kc-all2", supported_models=["*"], concurrency_limit=0)
+        u = DB.get_user_by_email("owner@gmail.com")
         old = u["group_id"]
         DB.update_user(u["id"], group_id=gid)
         BILL.invalidate()
@@ -330,6 +329,10 @@ class KeyControlApiTest(unittest.TestCase):
             r = self.client.post("/v1/chat/completions",
                                  json={"model": "kg", "messages": [{"role": "user", "content": "hi"}]},
                                  headers=dict(h, **{"X-Forwarded-For": "203.0.113.7, 10.0.0.1"}))
+            self.assertEqual(r.status_code, 403, r.text)
+            r = self.client.post("/v1/chat/completions",
+                                 json={"model": "kg", "messages": [{"role": "user", "content": "hi"}]},
+                                 headers=dict(h, **{"X-Forwarded-For": "198.51.100.9, 203.0.113.7"}))
             self.assertNotEqual(r.status_code, 403, r.text)
         finally:
             DB.update_user(u["id"], group_id=old)
@@ -338,10 +341,10 @@ class KeyControlApiTest(unittest.TestCase):
     def test_record_usage_sets_last_used_and_used_quota(self):
         created = self._create(name="settle").json()
         kid = created["id"]
-        u = DB.get_user_by_email("owner@example.com")
+        u = DB.get_user_by_email("owner@gmail.com")
         group = {"id": u["group_id"], "billing_policy": "free",
                  "rate_multiplier": 1.0, "supported_models": ["*"]}
-        BILL.record_usage(dict(u, _api_key_id=kid), group, "kg", "demo-test",
+        BILL.record_usage(dict(u, _api_key_id=kid), group, "kg", "kg-test",
                           upstream_usage={"prompt_tokens": 10,
                                           "completion_tokens": 5},
                           duration_ms=100, request_id="kc-req-1")
@@ -361,11 +364,11 @@ class OverviewTest(unittest.TestCase):
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
         cls.client.post("/api/register", json={
-            "email": "ov@example.com", "password": "secret123"})
+            "email": "ov@gmail.com", "password": "secret123"})
         cls.tok = cls.client.post("/api/login", json={
-            "email": "ov@example.com", "password": "secret123"}).json()["token"]
+            "email": "ov@gmail.com", "password": "secret123"}).json()["token"]
         cls.h = {"Authorization": f"Bearer {cls.tok}"}
-        cls.uid = DB.get_user_by_email("ov@example.com")["id"]
+        cls.uid = DB.get_user_by_email("ov@gmail.com")["id"]
 
     def _get(self):
         r = self.client.get("/api/overview", headers=self.h)
@@ -432,7 +435,7 @@ class OverviewTest(unittest.TestCase):
 
     def test_e_quota_policy_adds_usage_block(self):
         """quota 组才带日/周/月额度块;balance 与 free 组不带。"""
-        u = DB.get_user_by_email("ov@example.com")
+        u = DB.get_user_by_email("ov@gmail.com")
         old = u["group_id"]
         gid = DB.create_group(name="ov-quota", supported_models=["*"],
                               billing_policy="quota", daily_limit=100,
@@ -528,9 +531,9 @@ class ProfileTest(unittest.TestCase):
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
         cls.client.post("/api/register", json={
-            "email": "pf@example.com", "password": "secret123"})
+            "email": "pf@gmail.com", "password": "secret123"})
         cls.tok = cls.client.post("/api/login", json={
-            "email": "pf@example.com", "password": "secret123"}).json()["token"]
+            "email": "pf@gmail.com", "password": "secret123"}).json()["token"]
         cls.h = {"Authorization": f"Bearer {cls.tok}"}
 
     def _me(self):
@@ -542,7 +545,7 @@ class ProfileTest(unittest.TestCase):
     def test_a_me_exposes_profile_fields(self):
         me = self._me()
         for f in ("display_name", "avatar", "balance", "total_spent",
-                  "rpm_limit", "email_verified_at"):
+                  "concurrency_limit", "email_verified_at"):
             self.assertIn(f, me)
         self.assertEqual(me["display_name"], "")
         self.assertEqual(me["avatar"], "")
@@ -600,9 +603,9 @@ class ProfileTest(unittest.TestCase):
     def test_h_profile_is_per_user(self):
         """改自己的资料不能影响别人 —— PATCH /me 用的是 JWT 里的 uid。"""
         self.client.post("/api/register", json={
-            "email": "pf2@example.com", "password": "secret123"})
+            "email": "pf2@gmail.com", "password": "secret123"})
         tok2 = self.client.post("/api/login", json={
-            "email": "pf2@example.com", "password": "secret123"}).json()["token"]
+            "email": "pf2@gmail.com", "password": "secret123"}).json()["token"]
         h2 = {"Authorization": f"Bearer {tok2}"}
         self._patch(display_name="我")
         self.client.patch("/api/me", json={"display_name": "他"}, headers=h2)

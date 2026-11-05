@@ -16,7 +16,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "totp.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -79,14 +78,14 @@ class TotpFlowTest(unittest.TestCase):
         portal_state.rebind(fresh)
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com", "password": "secret123"})
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com", "password": "secret123"})
         cls.admin_h = {"Authorization": "Bearer " + r.json()["token"]}
         cls._seq = 0
 
     def setUp(self):
         throttle.reset_all()
         type(self)._seq += 1
-        self.email = f"t{self._seq}@example.com"
+        self.email = f"t{self._seq}@gmail.com"
         r = self.client.post("/api/register", json={"email": self.email, "password": "secret123"})
         self.uid = r.json()["user_id"]
         self.h = {"Authorization": "Bearer " + r.json()["token"]}
@@ -202,7 +201,7 @@ class TotpFlowTest(unittest.TestCase):
         r = self.client.post(f"/api/admin/users/{self.uid}/2fa/disable", headers=self.admin_h)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertFalse(self.client.get("/api/me", headers=self.h).json()["totp_enabled"])
-        admin_id = self._db().get_user_by_email("root@example.com")["id"]
+        admin_id = self._db().get_user_by_email("root@gmail.com")["id"]
         self.assertEqual(self.client.post(f"/api/admin/users/{admin_id}/2fa/disable",
                                           headers=self.admin_h).status_code, 400)
         self.assertEqual(self.client.post(f"/api/admin/users/{self.uid}/2fa/disable",

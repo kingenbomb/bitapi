@@ -50,10 +50,12 @@ JWT_TTL = env_int("JWT_TTL", 7 * 24 * 3600)             # 会话有效期(秒)
 DEFAULT_GROUP = env("DEFAULT_GROUP", "free")            # 新用户默认套餐组名
 AUTH_CACHE_TTL = env_int("AUTH_CACHE_TTL", 10)          # key→user/group 缓存秒数
 REQUIRE_INVITE = env_bool("REQUIRE_INVITE", True)       # 强制邀请码注册
-# 密钥 IP 白名单的取值来源:反代部署(常态)必须信任 X-Forwarded-For,
-# 否则拿到的永远是 nginx 的 127.0.0.1。直接暴露公网时改成 false,
-# 否则客户端可以自己伪造该头绕过白名单。
-TRUST_PROXY_HEADERS = env_bool("TRUST_PROXY_HEADERS", True)
+COMMUNITY_REGISTRATION_ONLY = env_bool("COMMUNITY_REGISTRATION_ONLY", False)
+COMMUNITY_MIN_LEVEL = env_int("COMMUNITY_MIN_LEVEL", 3)
+if not 0 <= COMMUNITY_MIN_LEVEL <= 6:
+    raise ValueError("BITAPI_COMMUNITY_MIN_LEVEL must be an integer from 0 to 6")
+# 默认取直连 IP；仅在源站只允许可信反代访问、且反代覆盖 XFF 时显式开启。
+TRUST_PROXY_HEADERS = env_bool("TRUST_PROXY_HEADERS", False)
 
 # 登录/注册/找回密码的限速(进程内滑动窗口,见 core/throttle.py)。0 = 不限。
 # 登录只记失败:同一 IP 在窗口内连续失败 N 次、或同一邮箱被试 M 次,就 429。
@@ -64,12 +66,12 @@ AUTH_LOGIN_WINDOW = env_int("AUTH_LOGIN_WINDOW", 600)
 # 注册按 IP 计成功次数:正常人一小时注册不了 5 个号,脚本一分钟就能注册 500 个来刷赠额与签到。
 AUTH_REGISTER_PER_IP = env_int("AUTH_REGISTER_PER_IP", 5)
 AUTH_REGISTER_WINDOW = env_int("AUTH_REGISTER_WINDOW", 3600)
-AUTH_REGISTER_MAIL_PER_IP = env_int("AUTH_REGISTER_MAIL_PER_IP", 10)
-AUTH_REGISTER_MAIL_PER_EMAIL = env_int("AUTH_REGISTER_MAIL_PER_EMAIL", 3)
 # 找回密码按邮箱与 IP 各计一道:邮箱那道防拿别人邮箱刷验证邮件,IP 那道防扫号。
 AUTH_RESET_PER_EMAIL = env_int("AUTH_RESET_PER_EMAIL", 3)
 AUTH_RESET_PER_IP = env_int("AUTH_RESET_PER_IP", 10)
 AUTH_RESET_WINDOW = env_int("AUTH_RESET_WINDOW", 3600)
+AUTH_REGISTER_MAIL_PER_IP = env_int("AUTH_REGISTER_MAIL_PER_IP", 10)
+AUTH_REGISTER_MAIL_PER_EMAIL = env_int("AUTH_REGISTER_MAIL_PER_EMAIL", 3)
 
 
 def _default_db_path():
@@ -77,12 +79,17 @@ def _default_db_path():
     new = os.path.join(_HERE, "bitapi.db")
     legacy = os.path.join(_HERE, "poolgate.db")
     if not os.path.exists(new) and os.path.exists(legacy):
+        import warnings
+        warnings.warn(f"BITAPI_DB 未配置，正在使用旧数据库 {legacy}；请显式设置数据库路径。", RuntimeWarning)
         return legacy
     return new
 
 
 # 存储
-DB_PATH = env("DB", _default_db_path())
+DB_PATH = env("DB") or _default_db_path()
+GEN_MAX_N = max(1, env_int("GEN_MAX_N", 4))
+MAX_REQUEST_BYTES = max(1, env_int("MAX_REQUEST_BYTES", 12 * 1024 * 1024))
+MAX_AUDIO_BYTES = max(1, env_int("MAX_AUDIO_BYTES", 26 * 1024 * 1024))
 
 # 备份。库文件是用户/密钥/余额/订单/号池的唯一副本,默认每天一份、留 7 份,
 # 放在库文件旁的 backups/(见 core/backup.py)。0 = 关闭自动备份,管理台仍可手动做。
@@ -94,55 +101,34 @@ BACKUP_DIR = env("BACKUP_DIR", "")   # 留空 = <库所在目录>/backups
 MIN_BALANCE = env_float("MIN_BALANCE", 0.05)      # 余额低于此切号
 REFRESH_MARGIN = env_int("REFRESH_MARGIN", 600)   # token 提前多少秒刷
 SEND_TIMEOUT = env_int("TIMEOUT", 120)
+# 流式「首字超时」：上游首帧迟迟不来(Bedrock 长尾 p99 能到分钟级)时,
+# 不等满 SEND_TIMEOUT 就掐掉换号重试,把客户端等待从几分钟压到 FIRST_TOKEN_TIMEOUT。
+# STREAM_TOTAL_TIMEOUT 只约束开始输出前的跨号等待，持续输出不受总时长截断。
+FIRST_TOKEN_TIMEOUT = max(5, env_int("FIRST_TOKEN_TIMEOUT", 60))
+STREAM_TOTAL_TIMEOUT = max(10, env_int("STREAM_TOTAL_TIMEOUT", 90))
+STREAM_IDLE_TIMEOUT = max(5, env_int("STREAM_IDLE_TIMEOUT", SEND_TIMEOUT))
+
+# GPT OAuth follows sub2api: no separate first-output/header deadline by default.
+GPT_FIRST_OUTPUT_TIMEOUT = max(0, env_int("GPT_FIRST_OUTPUT_TIMEOUT", 0))
+GPT_HIGH_EFFORT_FIRST_OUTPUT_TIMEOUT = max(0, env_int("GPT_HIGH_EFFORT_FIRST_OUTPUT_TIMEOUT", 0))
+GPT_RESPONSE_HEADER_TIMEOUT = max(0, env_int("GPT_RESPONSE_HEADER_TIMEOUT", 0))
+GPT_STREAM_IDLE_TIMEOUT = max(5, env_int("GPT_STREAM_IDLE_TIMEOUT", 180))
+GPT_TIMEOUT_PENALTY_ENABLED = env_bool("GPT_TIMEOUT_PENALTY_ENABLED", False)
+GPT_TIMEOUT_THRESHOLD = max(1, env_int("GPT_TIMEOUT_THRESHOLD", 3))
+GPT_TIMEOUT_WINDOW = max(1, env_int("GPT_TIMEOUT_WINDOW", 600))
+GPT_TIMEOUT_PAUSE = max(1, env_int("GPT_TIMEOUT_PAUSE", 300))
+GPT_CAPACITY_RETRIES = max(0, min(3, env_int("GPT_CAPACITY_RETRIES", 3)))
+GPT_MAX_ACCOUNT_SWITCHES = max(0, env_int("GPT_MAX_ACCOUNT_SWITCHES", 10))
+GPT_ACCOUNT_WAIT_TIMEOUT = max(0, env_int("GPT_ACCOUNT_WAIT_TIMEOUT", 30))
+GPT_ACCOUNT_MAX_WAITING = max(0, env_int("GPT_ACCOUNT_MAX_WAITING", 100))
 
 # 巡检
 SCAN_INTERVAL = env_int("SCAN_INTERVAL", 1800)    # 巡检周期(秒)
 SCAN_CONCURRENCY = env_int("SCAN_CONCURRENCY", 50)  # 巡检并发上限
-
-# ---- grok 渠道 ----
-# 对外暴露哪些模型。只列号池真的有额度的那些 —— 实测过:同号 grok-4.6 返回 200,
-# 而 grok-code-fast-1 一律 402 spending-limit。把没额度的模型挂在 /v1/models 上,
-# 用户每次调都必然失败,而失败会被记成账号级问题。
-GROK_MODELS = env("GROK_MODELS", "grok-4.6,grok-4.5")
-# 对外名 → 上游名的前缀(留空表示同名)。
-GROK_MODEL_PREFIX = env("GROK_MODEL_PREFIX", "")
-GROK_BASE_URL = env("GROK_BASE_URL", "https://cli-chat-proxy.grok.com/v1")
-GROK_TOKEN_ENDPOINT = env("GROK_TOKEN_ENDPOINT", "https://auth.x.ai/oauth2/token")
-GROK_CLIENT_ID = env("GROK_CLIENT_ID", "b1a00492-073a-47ea-816f-4c329264a828")
-# token 实测 6 小时(expires_in=21600)。提前一小时刷,留足重试余量。
-GROK_REFRESH_MARGIN = max(300, env_int("GROK_REFRESH_MARGIN", 3600))
-GROK_TIMEOUT = max(10, env_int("GROK_TIMEOUT", 300))
-
-# ---- openai 渠道(ChatGPT 订阅号,走 Codex 那条 Responses 端点)----
-# 只列订阅额度认得的模型。Codex 家族以外的名字(如 gpt-4o)拿订阅号调会被上游拒。
-OPENAI_MODELS = env("OPENAI_MODELS", "gpt-5.4,gpt-5.4-mini,gpt-5.3-codex")
-# 上游根地址。真实路径是在它后面拼 /responses,留成可配是为了换镜像时不必改代码。
-OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://chatgpt.com/backend-api/codex")
-OPENAI_TOKEN_ENDPOINT = env("OPENAI_TOKEN_ENDPOINT", "https://auth.openai.com/oauth/token")
-# Codex CLI 的公开 client id。订阅号的 refresh 流程只认它,换不了。
-OPENAI_CLIENT_ID = env("OPENAI_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
-# access_token 实测很短命(几小时)。提前半小时刷,比等到快过期再刷安全 —— 巡检是
-# 半小时一轮,提前量小于巡检周期就等于「这一轮不刷,下一轮已经过期了」。
-OPENAI_REFRESH_MARGIN = max(300, env_int("OPENAI_REFRESH_MARGIN", 1800))
-OPENAI_TIMEOUT = max(10, env_int("OPENAI_TIMEOUT", 300))
-# 上游按 User-Agent / version 头认 CLI 版本,太旧会被拒。跟着上游走。
-OPENAI_CLI_VERSION = env("OPENAI_CLI_VERSION", "0.125.0")
-
-# ---- claude 渠道(Anthropic 订阅号)----
-CLAUDE_MODELS = env("CLAUDE_MODELS",
-                    "claude-opus-4-8,claude-sonnet-5,claude-sonnet-4-6,claude-haiku-4-5")
-CLAUDE_BASE_URL = env("CLAUDE_BASE_URL", "https://api.anthropic.com")
-CLAUDE_TOKEN_ENDPOINT = env("CLAUDE_TOKEN_ENDPOINT",
-                            "https://platform.claude.com/v1/oauth/token")
-# Claude Code 的公开 client id(公共 PKCE 客户端,没有 client secret)。
-CLAUDE_CLIENT_ID = env("CLAUDE_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
-CLAUDE_REFRESH_MARGIN = max(300, env_int("CLAUDE_REFRESH_MARGIN", 1800))
-CLAUDE_TIMEOUT = max(10, env_int("CLAUDE_TIMEOUT", 300))
-# 订阅号只认 Claude Code 这个客户端。版本号会随上游轮换,过期表现为 403。
-CLAUDE_CLI_VERSION = env("CLAUDE_CLI_VERSION", "2.1.161")
-
-# MagicPatterns 的 reasoningContent 是上游真实思考流；Anthropic 客户端可选择接收 thinking SSE。
-ANTHROPIC_EXPOSE_REASONING = env_bool("ANTHROPIC_EXPOSE_REASONING", True)
+# 模型状态巡检:每小时把在营渠道的模型实测一遍(生成类按号池推定,不烧额度)
+MODEL_STATUS_INTERVAL = max(300, env_int("MODEL_STATUS_INTERVAL", 3600))
+# 状态条"偏慢"阈值:实测通过但首字(无首字按总耗时)超过它,标黄
+MODEL_STATUS_SLOW_MS = env_int("MODEL_STATUS_SLOW_MS", 10000)
 
 # 注册赠额(美元)。0 = 不送。开了强制邀请码之后,能注册进来的都是拿到码的人,
 # 所以这笔钱按「每个成功注册的账号」发,不再单独区分是哪种码换来的。
@@ -155,6 +141,18 @@ SIGNUP_BONUS = env_float("SIGNUP_BONUS", 0)
 # 金额按 0.0001 美元一档抽取，既能显示小额也不会留下浮点长尾。
 CHECKIN_MIN = env_float("CHECKIN_MIN", 0.01)
 CHECKIN_MAX = env_float("CHECKIN_MAX", 0.10)
+
+# GPT/Codex 原生 OAuth 号池：凭据只进 accounts 表，bit-api 负责续期与协议转换。
+GPT_BASE_URL = env("GPT_BASE_URL", "https://chatgpt.com/backend-api/codex")
+GPT_TOKEN_URL = env("GPT_TOKEN_URL", "https://auth.openai.com/oauth/token")
+GPT_CLIENT_VERSION = env("GPT_CLIENT_VERSION", "0.166.0")
+# 模型清单可覆盖；价格沿用既有 kg-gpt-5.6-* 种子，实际可用性以账号套餐为准。
+GPT_MODELS = env("GPT_MODELS", "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna")
+GPT_WEB_IMAGE_UPSTREAM_MODEL = env("GPT_WEB_IMAGE_UPSTREAM_MODEL", "gpt-5-5")
+
+# 上游返回的真实思考流是否透出给 Anthropic 客户端的 thinking SSE。
+# 各家字段名不同(统一由 adapter 的 reasoning 通道归一),开关只管透不透。
+ANTHROPIC_EXPOSE_REASONING = env_bool("ANTHROPIC_EXPOSE_REASONING", True)
 
 # 渠道路由:JSON,{"渠道名": {"priority": 0, "weight": 1}}。同一模型挂多个渠道时,
 # priority 高的先试、失败降档,同档按 weight 分流。这只是部署默认值,管理台「渠道」页
@@ -177,6 +175,9 @@ CHANNEL_ROUTING = _routing_default()
 # 模型广场、/v1/* 路由三处同时消失),但号池与管理面板照旧 —— 号还在,随时能上回来。
 # 这只是部署时的默认值:管理台「站点设置」里的开关存库,优先级更高。
 DISABLED_CHANNELS = env_list("DISABLED_CHANNELS", "")
+
+# 临时邮箱服务 x-api-key。
+TM_KEY = env("TM_KEY", "")
 
 # ---- 计费 ----
 # LiteLLM 价目表(内置项目别名价之后的补充兜底源)。
@@ -219,18 +220,14 @@ SITE_NAME = env("SITE_NAME", "bit-api")     # 邮件标题里的站名
 # 找回密码链接有效期(秒)
 PASSWORD_RESET_TTL = env_int("PASSWORD_RESET_TTL", 1800)
 
-# 社区账号登录(对接一个 Flarum + community-connect 的论坛)。三项都留空即关闭,
-# 登录页不显示「社区账号登录」。client secret 只在服务端换 token,不进站点 settings /
-# 管理端响应。redirect_uri 必须与社区里登记的值逐字一致。
-COMMUNITY_BASE_URL = env("COMMUNITY_BASE_URL", "")
+# 白嫖社区登录(Flarum community-connect)。client secret 只在服务端换 token,
+# 不进站点 settings / 管理端响应。redirect_uri 必须与社区里登记的值逐字一致。
+COMMUNITY_BASE_URL = env("COMMUNITY_BASE_URL", "https://baipiao.org/bbs")
 COMMUNITY_CLIENT_ID = env("COMMUNITY_CLIENT_ID", "")
 COMMUNITY_CLIENT_SECRET = env("COMMUNITY_CLIENT_SECRET", "")
 COMMUNITY_REDIRECT_URI = env(
     "COMMUNITY_REDIRECT_URI",
-    SITE_URL.rstrip("/") + "/oauth/community")
-# community-connect 插件的 REST 命名空间(授权端点是 <社区根>/community-connect,
-# 换 token / 取用户信息的接口在 <社区根>/api/<这个前缀>/ 下)。各站可能改过名。
-COMMUNITY_API_PREFIX = env("COMMUNITY_API_PREFIX", "community-connect")
+    SITE_URL.rstrip("/") + "/oauth/baipiao-community")
 COMMUNITY_HTTP_TIMEOUT = max(1, env_int("COMMUNITY_HTTP_TIMEOUT", 10))
 
 # 易支付(彩虹易支付协议)
@@ -240,6 +237,25 @@ EPAY_KEY = env("EPAY_KEY", "")
 # 美元→人民币换算。**只在下单那一刻用一次**:算出的人民币会冻进 orders.pay_amount_cny,
 # 回调金额比对直接在人民币域做。改这个值不影响在途订单(它们按下单时冻的数执行)。
 EPAY_USD_RATE = env_float("EPAY_USD_RATE", 7.2)
+
+# 白嫖毛支付独立于人民币易支付；社区商户的扣毛比例须设为 1:1。
+BAIPIAO_PID = env("BAIPIAO_PID", "")
+BAIPIAO_KEY = env("BAIPIAO_KEY", "")
+MAO_PER_USD = env_float("MAO_PER_USD", 1.0)
+
+# ---- 共享 Key(用户上传上游 key 换余额奖励)----
+# 用户把自己在某条渠道上的 key 交上来,验活通过、入库当号用,并按把给一次奖励。
+# 奖励走 credit() 记 reason=share_key 的流水,幂等键是「sharekey:<渠道>:<identity>」——
+# 同一把 key 全站只发一次:自己重复交、被别人先交过,都拿不到第二笔。
+# 默认关闭:开了就等于对外开一个「交 key 换余额」的口子,要站长明确点头。
+SHARE_REWARD_ENABLED = env_bool("SHARE_REWARD_ENABLED", False)
+SHARE_REWARD_AMOUNT = env_float("SHARE_REWARD_AMOUNT", 2.0)   # 每把有效 key 的美元奖励
+# 允许共享的渠道(逗号分隔)。留空 = 所有「key 池型对话渠道」都收。
+# 填了之后只收清单里的:换渠道做活动时用得上,也省得用户把别的站点的 key 交进来。
+SHARE_REWARD_CHANNELS = env_list("SHARE_REWARD_CHANNELS", "")
+# 每人可拿奖励的 key 把数上限(0 = 不限)。防的是「一个人把自己那把 key 复制成
+# 一堆花样的字符串来刷奖励」——真正不同的 key 才有意义,但闸门还是留一道。
+SHARE_REWARD_MAX_PER_USER = env_int("SHARE_REWARD_MAX_PER_USER", 0)
 
 # ---- 插件 ----
 # 逗号分隔的插件模块名(plugins 包下)。留空=不启用任何插件。

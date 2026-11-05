@@ -46,6 +46,11 @@ if __name__ == "__main__":
         # 一个在途的生图调用就能把停止拖到分钟级(实测 90s 被 systemd SIGKILL,
         # 改完 timeout_graceful_shutdown 仍有 60s)。uvicorn 已经关完了该关的,
         # 这里直接退,不等线程池。
+        for module_name, attr in (("core.pool_state", "DB"), ("core.portal_state", "USER_DB")):
+            module = sys.modules.get(module_name)
+            db = getattr(module, attr, None) if module else None
+            if db is not None:
+                db._conns.close_all()
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

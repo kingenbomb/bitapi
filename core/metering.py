@@ -4,10 +4,10 @@
 计量层 —— 统一官方正版反代与逆向渠道的用量口径。
 
 设计核心:**上游真实 usage 优先,估算兜底**。同一套 resolve_usage 逻辑对所有渠道生效:
-  - 官方 API 与正版反代(billing_mode=upstream):上游返回标准 usage → 直接采信
-  - 自建中转、逆向接口(billing_mode=estimate):上游无 usage → tiktoken 估算
-  - 图/视频生成(billing_mode=per_request):无 token 概念 → tokens=0,按次计量
-即便声明了 estimate 的渠道意外返回真实 usage,也优先采信(upstream 永远压过 estimate),
+  - 官方正版反代 / inceptionlabs(billing_mode=upstream):上游返回标准 usage → 直接采信
+  - 逆向/自建渠道(billing_mode=estimate):上游无 usage → tiktoken 估算
+  - 图/视频生成 oreate(billing_mode=per_request):无 token 概念 → tokens=0,按次计量
+即便逆向渠道意外返回了真实 usage,也优先采信(upstream 永远压过 estimate),
 所以接入未来任何"带 usage 的官方反代"零改动:声明 billing_mode=upstream 即可,
 甚至不声明(默认 estimate)也能在检测到真 usage 时自动走 upstream 口径。
 
@@ -72,11 +72,56 @@ def _valid_upstream_usage(usage):
     """上游 usage 是否可采信:至少有一个非零的 prompt/completion/total。"""
     if not isinstance(usage, dict):
         return False
-    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+    for k in ("prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens"):
         v = usage.get(k)
         if isinstance(v, (int, float)) and v > 0:
             return True
-    return False
+    return any(value for value in cache_tokens(usage))
+
+
+def cache_write_ttls(usage):
+    """Reported OpenAI write lifetimes; missing/invalid counters stay unknown."""
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    split = details.get("cache_write_tokens_details") if isinstance(details, dict) else None
+    if split is None:
+        split = usage.get("cache_write_tokens_details")
+    if not isinstance(split, dict):
+        return None
+    result = {}
+    for key in ("ttl_30m_tokens", "ttl_12h_tokens"):
+        value = split.get(key)
+        try:
+            count = int(value) if value is not None and not isinstance(value, bool) else None
+            result[key] = count if count is not None and count >= 0 and not (isinstance(value, float) and value != count) else None
+        except (TypeError, ValueError, OverflowError):
+            result[key] = None
+    return result
+
+
+def cache_tokens(usage):
+    """Actual reported cache reads/writes; None means the field was omitted."""
+    if not isinstance(usage, dict):
+        return None, None
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+
+    def reported(*fields):
+        for source, key in fields:
+            if isinstance(source, dict) and source.get(key) is not None:
+                try:
+                    return max(0, int(source[key]))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+        return None
+
+    read = reported((usage, "cache_read_input_tokens"), (details, "cached_tokens"))
+    write = reported((usage, "cache_creation_input_tokens"), (details, "cache_write_tokens"),
+                     (usage, "cache_write_tokens"))
+    split = cache_write_ttls(usage)
+    if write is None and split is not None and all(value is not None for value in split.values()):
+        write = sum(split.values())
+    return read, write
 
 
 def estimate_usage(request_messages, output_text):
@@ -90,7 +135,7 @@ def estimate_usage(request_messages, output_text):
     return {"prompt_tokens": it, "completion_tokens": ot, "total_tokens": it + ot}
 
 
-def resolve_usage(billing_mode, upstream_usage, request_messages, output_text):
+def resolve_usage(billing_mode, upstream_usage, request_messages, output_text, *, estimated_usage=None):
     """归一化一次请求的用量。返回 (input_tokens, output_tokens, source)。
 
     参数:
@@ -98,15 +143,23 @@ def resolve_usage(billing_mode, upstream_usage, request_messages, output_text):
       upstream_usage  : 上游返回的 usage dict(可能为 None/空)
       request_messages: 入站 OpenAI messages(用于估算 input)
       output_text     : 归并后的模型输出文本(用于估算 output)
+      estimated_usage : 本站按图片尺寸等显式估算的用量，与上游实测用量区分
     """
     # 1) 上游真实 usage 永远优先(无论声明什么 mode)
-    if _valid_upstream_usage(upstream_usage):
-        it = int(upstream_usage.get("prompt_tokens") or 0)
-        ot = int(upstream_usage.get("completion_tokens") or 0)
+    measured = _valid_upstream_usage(upstream_usage)
+    usage = upstream_usage if measured else estimated_usage
+    if _valid_upstream_usage(usage):
+        it = int(usage.get("prompt_tokens", usage.get("input_tokens")) or 0)
+        ot = int(usage.get("completion_tokens", usage.get("output_tokens")) or 0)
+        # Native Anthropic excludes cached tokens from input_tokens. Responses
+        # identifies its inclusive count with input_tokens_details instead.
+        if "prompt_tokens" not in usage and "input_tokens_details" not in usage:
+            read, write = cache_tokens(usage)
+            it += (read or 0) + (write or 0)
         if not it and not ot:
             # 只给了 total_tokens:全记到 output(无法拆分)
-            ot = int(upstream_usage.get("total_tokens") or 0)
-        return it, ot, SRC_UPSTREAM
+            ot = int(usage.get("total_tokens") or 0)
+        return it, ot, SRC_UPSTREAM if measured else SRC_ESTIMATE
 
     # 2) 生成类:按次,不计 token
     if billing_mode == BILL_PER_REQUEST:

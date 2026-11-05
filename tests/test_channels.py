@@ -18,7 +18,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "ch.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -100,13 +99,15 @@ class ChannelsTest(unittest.TestCase):
             mod.USER_DB = fresh
             mod.BILLING = billing
         portal_state.rebind(fresh)
+        from core import pricing_catalog
+        pricing_catalog._load_builtin()
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        r = cls.client.post("/api/register", json={"email": "root@example.com",
+        r = cls.client.post("/api/register", json={"email": "root@gmail.com",
                                                    "password": "secret123"})
         assert r.status_code == 200, r.text
         cls.admin_h = {"Authorization": "Bearer " + r.json()["token"]}
-        r = cls.client.post("/api/register", json={"email": "u@example.com",
+        r = cls.client.post("/api/register", json={"email": "u@gmail.com",
                                                    "password": "secret123"})
         cls.user_h = {"Authorization": "Bearer " + r.json()["token"]}
         cls.uid = r.json()["user_id"]
@@ -133,6 +134,10 @@ class ChannelsTest(unittest.TestCase):
                 "models": ["acme-fast", "acme-pro"], "model_map": {"acme-pro": "gpt-9-pro"},
                 "headers": {"X-Org": "team-a"}}
         body.update(over)
+        for model in body["models"]:
+            if model.startswith("acme-"):
+                _db().upsert_pricing(model, billing_mode="free")
+        portal_state.PRICING.invalidate()
         return self.client.post("/api/admin/channels", json=body, headers=self.admin_h)
 
     def _import(self, name="acme", keys=("sk-k1", "sk-k2")):
@@ -141,12 +146,70 @@ class ChannelsTest(unittest.TestCase):
 
     # ---- 校验 ----
 
+    def test_mixed_channel_images_are_listed_without_chat_or_automatic_image_probes(self):
+        from core import model_status
+        self.assertEqual(self._create(models=["acme-fast", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"], model_map={}).status_code, 200)
+        ad = adapter_mod.get_adapter("acme")
+        self.assertEqual(model_status.monitored_models(ad), ["acme-fast"])
+        catalog = self.client.get("/api/models").json()["data"]
+        self.assertFalse(next(row for row in catalog if row["model"] == "gpt-image-2.5-flare")["chat"])
+        self.assertTrue(next(row for row in catalog if row["model"] == "acme-fast")["chat"])
+
+    def test_image_api_uses_existing_key_pool_and_preserves_real_image_usage(self):
+        from core import pricing_catalog
+        previous_catalog = portal_state.PRICING.catalog
+        self.addCleanup(setattr, portal_state.PRICING, "catalog", previous_catalog)
+        portal_state.PRICING.catalog = pricing_catalog.Catalog()
+        previous = pricing_catalog._BUILTIN_ROWS
+        self.addCleanup(setattr, pricing_catalog, "_BUILTIN_ROWS", previous)
+        self.addCleanup(portal_state.PRICING.invalidate)
+        # TestClient is not a lifespan context; load the same price seed as startup.
+        pricing_catalog._load_builtin()
+        portal_state.PRICING.invalidate()
+        self.assertEqual(self._create(models=["acme-fast", "gpt-image-2.5-flare"], model_map={}).status_code, 200)
+        self._import()
+        value = {"created": 1, "data": [{"b64_json": "fixture-pixels"}],
+                 "usage": {"input_tokens": 300, "input_tokens_details": {"cached_tokens": 100}, "output_tokens": 4004, "total_tokens": 4304}}
+        with mock.patch("core.account_runtime.urlopen", return_value=_Json(value)) as upstream, mock.patch.object(server.BILLING, "record_usage", wraps=server.BILLING.record_usage) as bill:
+            response = self.client.post("/v1/images/generations", headers={"Authorization": "Bearer " + self.sk},
+                json={"model": "gpt-image-2.5-flare", "prompt": "cat", "quality": "low", "n": 1, "response_format": "b64_json"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), value)
+        self.assertEqual(upstream.call_args.args[0].full_url, "https://api.acme.test/v1/images/generations")
+        bill.assert_called_once()
+        self.assertEqual(bill.call_args.args[2], "acme")
+        self.assertEqual(bill.call_args.kwargs["upstream_usage"]["completion_tokens"], 4004)
+        self.assertEqual(bill.call_args.kwargs["units"], 1)
+        with _db()._conn() as conn:
+            log = dict(conn.execute("SELECT * FROM usage_logs WHERE user_id=? AND model=? ORDER BY id DESC LIMIT 1",
+                                    (self.uid, "gpt-image-2.5-flare")).fetchone())
+        self.assertAlmostEqual(log["cost"], .121245)
+        self.assertEqual(log["input_tokens"], 200)
+        self.assertEqual(json.loads(log["pricing_snapshot"])["cache_read_tokens"], 100)
+        self.assertEqual(json.loads(log["pricing_snapshot"])["output_price"], 30)
+        self.assertIsNotNone(log["upstream_account_id"])
+
+    def test_image_rejections_are_not_retried_or_billed_and_validate_before_submission(self):
+        self.assertEqual(self._create(models=["gpt-image-2.5-sunburst"], model_map={}).status_code, 200)
+        self._import()
+        headers = {"Authorization": "Bearer " + self.sk}
+        body = {"model": "gpt-image-2.5-sunburst", "prompt": "cat"}
+        with mock.patch("core.account_runtime.urlopen") as upstream, mock.patch.object(server.BILLING, "record_usage") as bill:
+            self.assertEqual(self.client.post("/v1/images/generations", headers=headers, json={**body, "prompt": ""}).status_code, 400)
+            self.assertEqual(self.client.post("/v1/images/generations", headers=headers, json={**body, "stream": True}).status_code, 400)
+            upstream.assert_not_called()
+            upstream.side_effect = TimeoutError("fixture upstream timeout")
+            failed = self.client.post("/v1/images/generations", headers=headers, json=body)
+            self.assertEqual(failed.status_code, 502)
+            self.assertEqual(upstream.call_count, 1)
+            bill.assert_not_called()
+
     def test_validation_rejects_bad_input(self):
         cases = [
             ({"name": "Bad Name"}, "渠道名"),
-            ({"name": "grok"}, "代码里定义"),
+            ({"name": "gpt"}, "代码里定义"),
             # 模型名撞渠道名不行(渠道名本身可作 model 路由);与别的渠道同模型是允许的
-            ({"models": ["acme-x", "grok"]}, "与渠道名冲突"),
+            ({"models": ["acme-x", "gpt"]}, "与渠道名冲突"),
             ({"base_url": "api.acme.test/v1"}, "base_url"),
             ({"base_url": "https://api.acme.test/v1?x=1"}, "base_url"),
             ({"headers": {"Authorization": "Bearer leak"}}, "Authorization"),
@@ -187,15 +250,16 @@ class ChannelsTest(unittest.TestCase):
         self.assertTrue(channels_mod.is_data_channel("acme"))
         models = self.client.get("/v1/models", headers={"Authorization": "Bearer " + self.sk}).json()
         ids = {m["id"]: m["owned_by"] for m in models["data"]}
-        self.assertEqual(ids.get("acme-pro"), "acme")
+        # 数据渠道的模型也要出现在清单里;owned_by 对外是中性品牌名(渠道不外泄)
+        self.assertIn("acme-pro", ids)
+        self.assertEqual(ids.get("acme-pro"), "baipiao")
         listed = {c["name"]: c for c in self.client.get("/api/admin/channels",
                                                           headers=self.admin_h).json()["channels"]}
         self.assertEqual(listed["acme"]["source"], "data")
         self.assertEqual(listed["acme"]["config"]["model_map"], {"acme-pro": "gpt-9-pro"})
         self.assertEqual(listed["acme"]["pool"]["total"], 0)
-        # 代码渠道在目录里要标出来,且模型清单不为空 —— 面板靠这个区分来源
-        self.assertEqual(listed["grok"]["source"], "code")
-        self.assertTrue(listed["grok"]["models"])
+        self.assertEqual(listed["gpt"]["source"], "code")
+        self.assertTrue(listed["gpt"]["streaming"])
 
     def test_update_reloads_registry(self):
         self._create()
@@ -220,15 +284,15 @@ class ChannelsTest(unittest.TestCase):
         self.assertNotIn("acme-pro", adapter_mod.model_to_channel())
 
     def test_code_channels_are_read_only_here(self):
-        self.assertEqual(self.client.delete("/api/admin/channels/grok", headers=self.admin_h).status_code, 404)
-        r = self.client.patch("/api/admin/channels/grok", json={"base_url": "https://x.test"},
+        self.assertEqual(self.client.delete("/api/admin/channels/gpt", headers=self.admin_h).status_code, 404)
+        r = self.client.patch("/api/admin/channels/gpt", json={"base_url": "https://x.test"},
                               headers=self.admin_h)
         self.assertEqual(r.status_code, 404)
 
     def test_non_admin_forbidden(self):
         for method, path in (("post", "/api/admin/channels"), ("get", "/api/admin/channels"),
-                             ("post", "/api/admin/channels/grok/keys"),
-                             ("post", "/api/admin/channels/grok/test")):
+                             ("post", "/api/admin/channels/gpt/keys"),
+                             ("post", "/api/admin/channels/gpt/test")):
             r = getattr(self.client, method)(path, json={"base_url": "https://x.test", "keys": ["k"]},
                                              headers=self.user_h) if method == "post" \
                 else self.client.get(path, headers=self.user_h)
@@ -272,7 +336,7 @@ class ChannelsTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()["ok"])
         self.assertIn("invalid api key", r.json()["error"])
-        self.assertEqual(pool_state.DB.list_accounts(channel="acme")[0]["status"], "exhausted")
+        self.assertEqual(pool_state.DB.list_accounts(channel="acme")[0]["status"], "cooldown")
         self.assertEqual(self.client.post("/api/admin/channels/acme/test", json={"model": "nope"},
                                           headers=self.admin_h).status_code, 400)
 

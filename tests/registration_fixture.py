@@ -32,11 +32,3 @@ class TestClient(FastAPITestClient):
             from routers import portal
             kwargs["json"] = verified_registration_body(portal.USER_DB, kwargs["json"])
         return super().post(url, **kwargs)
-
-
-def close_test_db(db):
-    """Close all isolated test connections before Windows removes its SQLite file."""
-    with db._conns._lock:
-        for connection in db._conns._live.values():
-            connection.close()
-        db._conns._live.clear()

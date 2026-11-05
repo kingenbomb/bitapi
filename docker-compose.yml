@@ -11,6 +11,13 @@ services:
     container_name: bit-api
     restart: unless-stopped
     env_file: .env
+    read_only: true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      TZ: Asia/Shanghai
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

@@ -1,0 +1,42 @@
+# 保障门禁 —— 元规则二要的那个「不在你机器上的执行器」。
+# 本机钩子可以 --no-verify 绕过,也依赖本机装了什么;这里从干净克隆跑,
+# 抓的是本机永远碰不到的一类:忘记提交的文件、写死的绝对路径、隐式环境变量。
+#
+# 这里跑什么,以仓库根目录的 gates.txt 为准。加检查请同时登记进那份清单。
+name: assurance
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+        # requirements-dev.txt 里 -r requirements.txt,版本全钉死,所以 CI 跟本机
+        # 装的是同一份。curl_cffi 是 core/gpt_transport.py 的硬依赖(直接 import,
+        # 不在 try/except 里),必须装。
+
+      - name: 单元与集成
+        run: python -m pytest tests/ -q
+
+      - name: 死面扫描
+        run: python scripts/check_dead_code.py
+
+      - name: 端到端计费闭环
+        run: python -m pytest tests/e2e -q
+        # 起真 uvicorn 占 127.0.0.1:8123。runner 上端口是独占的,不会撞。

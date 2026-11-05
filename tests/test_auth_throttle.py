@@ -15,7 +15,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "thr.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 os.environ.setdefault("BITAPI_JWT_SECRET", "test-secret")
 
 import config  # noqa: E402
@@ -78,12 +77,12 @@ class ClientIpTest(unittest.TestCase):
             self.headers = headers
             self.client = type("C", (), {"host": host})()
 
-    def test_proxy_headers_trusted_by_default(self):
+    def test_trusted_proxy_uses_last_hop(self):
         saved = config.TRUST_PROXY_HEADERS
         try:
             config.TRUST_PROXY_HEADERS = True
             r = self._Req({"x-forwarded-for": "1.2.3.4, 10.0.0.1"})
-            self.assertEqual(throttle.client_ip(r), "1.2.3.4")
+            self.assertEqual(throttle.client_ip(r), "10.0.0.1")
             self.assertEqual(throttle.client_ip(self._Req({"x-real-ip": "5.6.7.8"})), "5.6.7.8")
             self.assertEqual(throttle.client_ip(self._Req({})), "10.0.0.9")
             config.TRUST_PROXY_HEADERS = False
@@ -112,11 +111,13 @@ class AuthEndpointThrottleTest(unittest.TestCase):
         cls.client = TestClient(server.app)
         # 首个用户免码成为 admin
         r = cls.client.post("/api/register", json={
-            "email": "root@example.com", "password": "secret123"})
+            "email": "root@gmail.com", "password": "secret123"})
         assert r.status_code == 200, r.text
 
     def setUp(self):
         throttle.reset_all()
+        self._proxy_trust = config.TRUST_PROXY_HEADERS
+        config.TRUST_PROXY_HEADERS = True
         self._saved = (throttle.LOGIN_IP.limit, throttle.LOGIN_EMAIL.limit,
                        throttle.REGISTER_IP.limit)
         throttle.LOGIN_IP.limit = 6
@@ -124,6 +125,7 @@ class AuthEndpointThrottleTest(unittest.TestCase):
         throttle.REGISTER_IP.limit = 2
 
     def tearDown(self):
+        config.TRUST_PROXY_HEADERS = self._proxy_trust
         (throttle.LOGIN_IP.limit, throttle.LOGIN_EMAIL.limit,
          throttle.REGISTER_IP.limit) = self._saved
         throttle.reset_all()
@@ -134,37 +136,37 @@ class AuthEndpointThrottleTest(unittest.TestCase):
 
     def test_email_lockout_after_failures_and_reset_on_success(self):
         for _ in range(3):
-            self.assertEqual(self._login("root@example.com", "nope").status_code, 401)
-        r = self._login("root@example.com", "nope")
+            self.assertEqual(self._login("root@gmail.com", "nope").status_code, 401)
+        r = self._login("root@gmail.com", "nope")
         self.assertEqual(r.status_code, 429, r.text)
         self.assertIn("Retry-After", r.headers)
         self.assertEqual(r.json()["detail"]["code"], "AUTH_RATE_LIMITED")
         # 封的是这个邮箱:换个 IP 打同一邮箱照样 429(否则换 IP 就能继续撞)
-        self.assertEqual(self._login("root@example.com", "nope", ip="8.8.8.8").status_code, 429)
+        self.assertEqual(self._login("root@gmail.com", "nope", ip="8.8.8.8").status_code, 429)
         # 对的密码也被挡 —— 锁定期间不给任何反馈差异
-        self.assertEqual(self._login("root@example.com", "secret123").status_code, 429)
-        throttle.LOGIN_EMAIL.reset("root@example.com")
-        ok = self._login("root@example.com", "secret123")
+        self.assertEqual(self._login("root@gmail.com", "secret123").status_code, 429)
+        throttle.LOGIN_EMAIL.reset("root@gmail.com")
+        ok = self._login("root@gmail.com", "secret123")
         self.assertEqual(ok.status_code, 200, ok.text)
         # 成功登录把该邮箱的失败计数清零:之后再错 3 次才会再封
         for _ in range(3):
-            self.assertEqual(self._login("root@example.com", "nope").status_code, 401)
-        self.assertEqual(self._login("root@example.com", "nope").status_code, 429)
+            self.assertEqual(self._login("root@gmail.com", "nope").status_code, 401)
+        self.assertEqual(self._login("root@gmail.com", "nope").status_code, 429)
 
     def test_success_does_not_consume(self):
         for _ in range(10):
-            self.assertEqual(self._login("root@example.com", "secret123").status_code, 200)
+            self.assertEqual(self._login("root@gmail.com", "secret123").status_code, 200)
 
     def test_ip_lockout_counts_unknown_emails_too(self):
         """一个 IP 扫一批不同邮箱:每个邮箱只错一次,邮箱那道拦不住,IP 那道要拦。
         且不存在的邮箱也计数 —— 否则响应差异能枚举出哪些邮箱注册过。"""
         for k in range(6):
-            r = self._login(f"ghost{k}@example.com", "x", ip="7.7.7.7")
+            r = self._login(f"ghost{k}@gmail.com", "x", ip="7.7.7.7")
             self.assertEqual(r.status_code, 401)
-        r = self._login("ghost99@example.com", "x", ip="7.7.7.7")
+        r = self._login("ghost99@gmail.com", "x", ip="7.7.7.7")
         self.assertEqual(r.status_code, 429)
         # 别的 IP 不受影响
-        self.assertEqual(self._login("ghost99@example.com", "x", ip="7.7.7.8").status_code, 401)
+        self.assertEqual(self._login("ghost99@gmail.com", "x", ip="7.7.7.8").status_code, 401)
 
     def test_register_per_ip_counts_successes_only(self):
         h = {"X-Forwarded-For": "6.6.6.6"}
@@ -174,21 +176,21 @@ class AuthEndpointThrottleTest(unittest.TestCase):
             # 被邀请码挡回去的不计数
             for k in range(5):
                 r = self.client.post("/api/register", json={
-                    "email": f"blocked{k}@example.com", "password": "secret123"}, headers=h)
+                    "email": f"blocked{k}@gmail.com", "password": "secret123"}, headers=h)
                 self.assertEqual(r.status_code, 403)
         finally:
             portal_routes.USER_DB.set_setting("require_invite", False)
         for k in range(2):
             r = self.client.post("/api/register", json={
-                "email": f"ok{k}@example.com", "password": "secret123"}, headers=h)
+                "email": f"ok{k}@gmail.com", "password": "secret123"}, headers=h)
             self.assertEqual(r.status_code, 200, r.text)
         r = self.client.post("/api/register", json={
-            "email": "third@example.com", "password": "secret123"}, headers=h)
+            "email": "third@gmail.com", "password": "secret123"}, headers=h)
         self.assertEqual(r.status_code, 429, r.text)
-        self.assertIsNone(portal_routes.USER_DB.get_user_by_email("third@example.com"))
+        self.assertIsNone(portal_routes.USER_DB.get_user_by_email("third@gmail.com"))
         # 换 IP 正常
         r = self.client.post("/api/register", json={
-            "email": "third@example.com", "password": "secret123"},
+            "email": "third@gmail.com", "password": "secret123"},
             headers={"X-Forwarded-For": "6.6.6.7"})
         self.assertEqual(r.status_code, 200, r.text)
 

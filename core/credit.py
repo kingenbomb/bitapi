@@ -13,6 +13,7 @@
 写入成功后 emit("balance.changed")。
 注册邀请奖励在建号事务内复用 UserDB.apply_credit，提交后调用 publish_balance_change。
 """
+import math
 from core.hooks import emit
 
 # 保留原因(约定,非强制):插件可自定义任意 reason 字符串
@@ -34,18 +35,26 @@ def bind(user_db):
     _DB = user_db
 
 
-def credit(user_id, amount, reason, idem_key, meta=None):
+def credit(user_id, amount, reason, idem_key, meta=None, *, transaction=None):
     """记一笔余额变动。同 idem_key 重复调用只生效一次。
 
     返回 (ledger_row, created)。amount 为 0 时仍会记录(便于留痕),
     但不发 balance.changed。
+
+    transaction: 调用方已开启的事务连接。传了就并入那个事务(不自己提交),
+    且**不在这里广播** —— 此刻事务还没提交,回滚后广播就成了假通知。
+    调用方提交成功后须自行调 publish_balance_change()。
     """
+    amount = float(amount)
+    if not math.isfinite(amount):
+        raise ValueError("amount must be finite")
     if _DB is None:
         raise RuntimeError("credit not bound to a UserDB; call credit.bind(db) first")
     if not idem_key:
         raise ValueError("idem_key is required for idempotency")
-    row, created = _DB.apply_credit(user_id, float(amount), reason, idem_key, meta)
-    if created and amount:
+    row, created = _DB.apply_credit(user_id, float(amount), reason, idem_key, meta,
+                                    transaction=transaction)
+    if created and amount and transaction is None:
         publish_balance_change(row)
     return row, created
 
@@ -54,8 +63,3 @@ def publish_balance_change(row):
     """入账提交后广播；注册事务中的邀请奖励也复用此通知。"""
     emit("balance.changed", user_id=row["user_id"], delta=float(row["amount"]),
          reason=row["reason"], balance_after=row.get("balance_after"), ledger=row)
-
-
-def balance_of(user_id):
-    user = _DB.get_user(user_id) if _DB else None
-    return (user or {}).get("balance") or 0.0

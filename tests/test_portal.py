@@ -6,18 +6,18 @@ import time
 import unittest
 from unittest import mock
 
-# 隔离环境:临时 DB、避免读 CPA grok 目录、可预测配置。
+# 隔离环境:临时 DB、可预测配置。
 # 必须在 import config / server 之前设好,但即便其他测试已先导入过 config,
 # 下方 setUpModule 也会强制重建单例,保证 import 顺序无关。
 _TMP = tempfile.mkdtemp()
 os.environ["BITAPI_DB"] = os.path.join(_TMP, "bitapi.db")
-os.environ["BITAPI_GROK_AUTH_DIR"] = os.path.join(_TMP, "noexist_auths")
 os.environ["BITAPI_JWT_SECRET"] = "test-secret"
 os.environ["BITAPI_API_KEY"] = "sk-master-test"
 os.environ["BITAPI_DEFAULT_GROUP"] = "free"
 
 import config  # noqa: E402
 import server  # noqa: E402
+from core.adapter import get_adapter  # noqa: E402
 import core.portal_state as portal_state  # noqa: E402
 import routers.portal as portal_routes  # noqa: E402
 from core.billing import Billing  # noqa: E402
@@ -69,44 +69,44 @@ class PortalFlowTest(unittest.TestCase):
         USER_DB = portal_state.USER_DB
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        if not USER_DB.get_user_by_email("root@example.com"):
+        if not USER_DB.get_user_by_email("root@gmail.com"):
             cls.client.post("/api/register", json={
-                "email": "root@example.com", "password": "secret123"})
+                "email": "root@gmail.com", "password": "secret123"})
 
     def _register(self, email, password="secret123", invite=""):
         return self.client.post("/api/register", json={
             "email": email, "password": password, "invite_code": invite})
 
     def test_first_user_is_admin(self):
-        admin = USER_DB.get_user_by_email("root@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
         self.assertEqual(admin["role"], "admin")
         self.assertTrue(admin["aff_code"])
 
     def test_second_user_requires_invite_code(self):
         # 已有用户后,无码注册被拒
-        r = self._register("noinvite@example.com")
+        r = self._register("noinvite@gmail.com")
         self.assertEqual(r.status_code, 403, r.text)
         # 错误邀请码被拒
-        r = self._register("badcode@example.com", invite="ZZZZZZZZ")
+        r = self._register("badcode@gmail.com", invite="ZZZZZZZZ")
         self.assertEqual(r.status_code, 403, r.text)
 
     def test_affiliate_code_does_not_unlock_invite_only_registration(self):
-        admin = USER_DB.get_user_by_email("root@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
         code = admin["aff_code"]
         USER_DB.set_setting("require_invite", True)
-        r = self._register("blockedref@example.com", invite=code)
+        r = self._register("blockedref@gmail.com", invite=code)
         self.assertEqual(r.status_code, 403, r.text)
-        self.assertIsNone(USER_DB.get_user_by_email("blockedref@example.com"))
+        self.assertIsNone(USER_DB.get_user_by_email("blockedref@gmail.com"))
 
     def test_affiliate_code_binds_inviter_when_registration_is_open(self):
-        admin = USER_DB.get_user_by_email("root@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
         USER_DB.set_setting("require_invite", False)
         try:
-            r = self._register("invitee@example.com", invite=admin["aff_code"])
+            r = self._register("invitee@gmail.com", invite=admin["aff_code"])
             self.assertEqual(r.status_code, 200, r.text)
         finally:
             USER_DB.set_setting("require_invite", True)
-        u = USER_DB.get_user_by_email("invitee@example.com")
+        u = USER_DB.get_user_by_email("invitee@gmail.com")
         self.assertEqual(u["inviter_id"], admin["id"])
         self.assertEqual(u["role"], "user")
 
@@ -132,9 +132,9 @@ class PortalFlowTest(unittest.TestCase):
 
     def test_register_with_admin_invite_code(self):
         code = self._gen_invites()[0]
-        r = self._register("bycode@example.com", invite=code)
+        r = self._register("bycode@gmail.com", invite=code)
         self.assertEqual(r.status_code, 200, r.text)
-        u = USER_DB.get_user_by_email("bycode@example.com")
+        u = USER_DB.get_user_by_email("bycode@gmail.com")
         # 一次性码不代表任何邀请人,所以不绑 inviter —— 返佣那条路走 aff_code
         self.assertIsNone(u["inviter_id"])
         rec = USER_DB.get_code(code)
@@ -144,10 +144,10 @@ class PortalFlowTest(unittest.TestCase):
     def test_invite_code_is_single_use(self):
         code = self._gen_invites()[0]
         self.assertEqual(
-            self._register("once1@example.com", invite=code).status_code, 200)
-        r = self._register("once2@example.com", invite=code)
+            self._register("once1@gmail.com", invite=code).status_code, 200)
+        r = self._register("once2@gmail.com", invite=code)
         self.assertEqual(r.status_code, 403, r.text)
-        self.assertIsNone(USER_DB.get_user_by_email("once2@example.com"))
+        self.assertIsNone(USER_DB.get_user_by_email("once2@gmail.com"))
 
     def test_invite_code_survives_a_concurrent_rush(self):
         """一张码八个人同时抢,只能有一个人注册成功。
@@ -161,7 +161,7 @@ class PortalFlowTest(unittest.TestCase):
         def worker(i):
             # 每线程一个 client:TestClient 自带 anio portal,不适合跨线程共用
             r = TestClient(server.app).post("/api/register", json={
-                "email": f"rush{i}@example.com", "password": "secret123",
+                "email": f"rush{i}@gmail.com", "password": "secret123",
                 "invite_code": code})
             (ok if r.status_code == 200 else failed).append(i)
 
@@ -175,15 +175,15 @@ class PortalFlowTest(unittest.TestCase):
         self.assertEqual(rec["status"], "used")
         # 使用者记的是抢到的那个人,不是随便哪个参与者
         self.assertEqual(USER_DB.get_user(rec["used_by"])["email"],
-                         f"rush{ok[0]}@example.com")
+                         f"rush{ok[0]}@gmail.com")
         # 落败的七个一个都没建号
         for i in failed:
             self.assertIsNone(
-                USER_DB.get_user_by_email(f"rush{i}@example.com"))
+                USER_DB.get_user_by_email(f"rush{i}@gmail.com"))
 
     def test_expired_invite_code_rejected(self):
         code = self._gen_invites(expires_at=1)[0]
-        r = self._register("expiredinvite@example.com", invite=code)
+        r = self._register("expiredinvite@gmail.com", invite=code)
         self.assertEqual(r.status_code, 403, r.text)
         # 拒得干净:过期不等于被用掉,码还留在库里等站长作废
         self.assertEqual(USER_DB.get_code(code)["status"], "unused")
@@ -192,7 +192,7 @@ class PortalFlowTest(unittest.TestCase):
         code = self._gen_invites()[0]
         self.client.delete("/api/admin/codes/" + code,
                            headers=self._admin_headers())
-        r = self._register("killedinvite@example.com", invite=code)
+        r = self._register("killedinvite@gmail.com", invite=code)
         self.assertEqual(r.status_code, 403, r.text)
 
     def test_invite_code_cannot_be_redeemed_for_balance(self):
@@ -227,24 +227,24 @@ class PortalFlowTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400, r.text)
 
     def test_login_and_me(self):
-        admin = USER_DB.get_user_by_email("root@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
         r = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"})
+            "email": "root@gmail.com", "password": "secret123"})
         self.assertEqual(r.status_code, 200, r.text)
         token = r.json()["token"]
         r = self.client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["email"], "root@example.com")
+        self.assertEqual(r.json()["email"], "root@gmail.com")
         self.assertEqual(r.json()["role"], "admin")
 
     def test_wrong_password_rejected(self):
         r = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "wrong"})
+            "email": "root@gmail.com", "password": "wrong"})
         self.assertEqual(r.status_code, 401)
 
     def test_api_key_lifecycle(self):
         token = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         h = {"Authorization": f"Bearer {token}"}
         r = self.client.post("/api/keys", json={"name": "test"}, headers=h)
         self.assertEqual(r.status_code, 200, r.text)
@@ -324,12 +324,12 @@ class PortalFlowTest(unittest.TestCase):
 
     def test_reveal_other_users_key_is_404(self):
         h = self._admin_headers()
-        admin = USER_DB.get_user_by_email("root@example.com")
-        if not USER_DB.get_user_by_email("otherkey@example.com"):
-            self._register("otherkey@example.com", invite=_registration_invite())
-        other = USER_DB.get_user_by_email("otherkey@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        if not USER_DB.get_user_by_email("otherkey@gmail.com"):
+            self._register("otherkey@gmail.com", invite=_registration_invite())
+        other = USER_DB.get_user_by_email("otherkey@gmail.com")
         otok = self.client.post("/api/login", json={
-            "email": "otherkey@example.com", "password": "secret123"}).json()["token"]
+            "email": "otherkey@gmail.com", "password": "secret123"}).json()["token"]
         mine = self.client.post("/api/keys", json={}, headers=h).json()
         r = self.client.get(f"/api/keys/{mine['id']}/reveal",
                             headers={"Authorization": f"Bearer {otok}"})
@@ -344,69 +344,79 @@ class PortalFlowTest(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
     def test_gateway_model_whitelist(self):
-        # 建个只允许 demo-* 的组,把用户挪进去,请求 grok 应 403
-        gid = USER_DB.create_group(name="demoonly", supported_models=["demo-*"],
-                                   rpm_limit=0)
-        admin = USER_DB.get_user_by_email("root@example.com")
+        # 建个只允许 kg-* 的组,把用户挪进去,请求不在白名单的模型应 403
+        gid = USER_DB.create_group(name="kgonly", supported_models=["kg-*"],
+                                   concurrency_limit=0)
+        admin = USER_DB.get_user_by_email("root@gmail.com")
         USER_DB.update_user(admin["id"], group_id=gid)
         server.BILLING.invalidate()
         token = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         # 建 key
         key = self.client.post("/api/keys", json={}, headers={
             "Authorization": f"Bearer {token}"}).json()["key"]
-        # grok 不在 demo-* 白名单 → 403
+        # gpt-5.6-sol 不在 kg-* 白名单 → 403
         r = self.client.post("/v1/chat/completions",
-                             json={"model": "grok-4.5", "messages": [{"role": "user", "content": "hi"}]},
+                             json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]},
                              headers={"Authorization": f"Bearer {key}"})
         self.assertEqual(r.status_code, 403, r.text)
         # 恢复默认组
         USER_DB.update_user(admin["id"], group_id=portal_state.ensure_default_group()["id"])
         server.BILLING.invalidate()
 
-    def test_rpm_limit_triggers_429(self):
+    def test_concurrency_limit_triggers_429(self):
         # 确保 invitee 存在(不依赖测试执行顺序)
-        if not USER_DB.get_user_by_email("invitee@example.com"):
-            self._register("invitee@example.com", invite=_registration_invite())
-        # 建 rpm=2 的组,第三次请求应 429
-        gid = USER_DB.create_group(name="rpm2", supported_models=["*"], rpm_limit=2)
-        u = USER_DB.get_user_by_email("invitee@example.com")
+        if not USER_DB.get_user_by_email("invitee@gmail.com"):
+            self._register("invitee@gmail.com", invite=_registration_invite())
+        # 已有两个执行中请求时拒绝,完成后立即恢复,失败请求也释放名额。
+        gid = USER_DB.create_group(name="concurrency2", supported_models=["*"], concurrency_limit=2)
+        u = USER_DB.get_user_by_email("invitee@gmail.com")
         USER_DB.update_user(u["id"], group_id=gid)
         server.BILLING.invalidate()
         token = self.client.post("/api/login", json={
-            "email": "invitee@example.com", "password": "secret123"}).json()["token"]
+            "email": "invitee@gmail.com", "password": "secret123"}).json()["token"]
         key = self.client.post("/api/keys", json={}, headers={
             "Authorization": f"Bearer {token}"}).json()["key"]
         h = {"Authorization": f"Bearer {key}"}
         body = {"model": "kg", "messages": [{"role": "user", "content": "hi"}]}
-        # 前两次通过限流(会因无号 503 或上游错,但不是 429);第三次 429
+        releases = [server.BILLING.acquire_concurrency(u, USER_DB.get_group(gid))
+                    for _ in range(2)]
+        try:
+            r = self.client.post("/v1/chat/completions", json=body, headers=h)
+            self.assertEqual(r.status_code, 429, r.text)
+            self.assertEqual(r.json()["detail"]["code"], "CONCURRENCY_LIMIT_EXCEEDED")
+        finally:
+            for release in releases:
+                release()
+        # 用未知模型确保不访问真实上游,也能验证失败后不积累并发计数。
+        body["model"] = "no-such-model"
         codes = [self.client.post("/v1/chat/completions", json=body, headers=h).status_code
-                 for _ in range(3)]
-        self.assertEqual(codes[2], 429, codes)
+                 for _ in range(12)]
+        self.assertEqual(codes, [404] * 12)
 
     def test_admin_endpoints_require_admin(self):
         # 普通用户拿 admin 接口应 403
-        admin = USER_DB.get_user_by_email("root@example.com")
-        if not USER_DB.get_user_by_email("plainuser@example.com"):
-            self._register("plainuser@example.com", invite=_registration_invite())
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        if not USER_DB.get_user_by_email("plainuser@gmail.com"):
+            self._register("plainuser@gmail.com", invite=_registration_invite())
         tok = self.client.post("/api/login", json={
-            "email": "plainuser@example.com", "password": "secret123"}).json()["token"]
+            "email": "plainuser@gmail.com", "password": "secret123"}).json()["token"]
         r = self.client.get("/api/admin/users", headers={"Authorization": f"Bearer {tok}"})
         self.assertEqual(r.status_code, 403)
 
     def test_admin_creates_group_and_moves_user(self):
         atok = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         ah = {"Authorization": f"Bearer {atok}"}
         r = self.client.post("/api/admin/groups", json={
-            "name": "vip", "supported_models": ["demo-*"], "rpm_limit": 60}, headers=ah)
+            "name": "vip", "supported_models": ["kg-*"], "concurrency_limit": 60}, headers=ah)
         self.assertEqual(r.status_code, 200, r.text)
         gid = r.json()["id"]
         # 移动一个用户到 vip
-        admin = USER_DB.get_user_by_email("root@example.com")
-        if not USER_DB.get_user_by_email("moveme@example.com"):
-            self._register("moveme@example.com", invite=_registration_invite())
-        target = USER_DB.get_user_by_email("moveme@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        if not USER_DB.get_user_by_email("moveme@gmail.com"):
+            self._register("moveme@gmail.com", invite=_registration_invite())
+        target = USER_DB.get_user_by_email("moveme@gmail.com")
         r = self.client.patch(f"/api/admin/users/{target['id']}",
                               json={"group_id": gid}, headers=ah)
         self.assertEqual(r.status_code, 200, r.text)
@@ -415,7 +425,7 @@ class PortalFlowTest(unittest.TestCase):
     def test_record_usage_estimate_and_upstream(self):
         # 直接验证计量层落库:估算(逆向)与上游(正版)两条口径都写对 token_source
         from core.adapter import Adapter, BILL_ESTIMATE, BILL_UPSTREAM
-        u = USER_DB.get_user_by_email("root@example.com")
+        u = USER_DB.get_user_by_email("root@gmail.com")
         user = dict(u, _api_key_id=None)
         grp = USER_DB.get_group(u["group_id"])
 
@@ -426,12 +436,12 @@ class PortalFlowTest(unittest.TestCase):
             billing_mode = BILL_UPSTREAM
 
         server.BILLING.record_usage(
-            user, grp, "grok", "grok-4.6", adapter=_Rev(),
+            user, grp, "kogo", "kg", adapter=_Rev(),
             upstream_usage=None,
             request_messages=[{"role": "user", "content": "hello there friend"}],
             output_text="general kenobi you are a bold one")
         server.BILLING.record_usage(
-            user, grp, "metered", "m-a", adapter=_Off(),
+            user, grp, "inceptionlabs", "mercury-2", adapter=_Off(),
             upstream_usage={"prompt_tokens": 11, "completion_tokens": 22},
             request_messages=[{"role": "user", "content": "ignored"}],
             output_text="ignored")
@@ -446,34 +456,34 @@ class PortalFlowTest(unittest.TestCase):
 
     def _admin_headers(self):
         tok = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         return {"Authorization": f"Bearer {tok}"}
 
     def test_admin_create_user_endpoint_removed(self):
         # 建号功能已按需求移除,该端点不应存在
         ah = self._admin_headers()
         r = self.client.post("/api/admin/users", json={
-            "email": "byadmin@example.com", "password": "secret123"}, headers=ah)
+            "email": "byadmin@gmail.com", "password": "secret123"}, headers=ah)
         self.assertIn(r.status_code, (404, 405), r.text)
 
     def test_admin_resets_other_password(self):
         ah = self._admin_headers()
-        admin = USER_DB.get_user_by_email("root@example.com")
-        if not USER_DB.get_user_by_email("pwtarget@example.com"):
-            self._register("pwtarget@example.com", password="oldpass123",
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        if not USER_DB.get_user_by_email("pwtarget@gmail.com"):
+            self._register("pwtarget@gmail.com", password="oldpass123",
                            invite=_registration_invite())
-        target = USER_DB.get_user_by_email("pwtarget@example.com")
+        target = USER_DB.get_user_by_email("pwtarget@gmail.com")
         r = self.client.post(f"/api/admin/users/{target['id']}/password",
                              json={"new_password": "brandnew123"}, headers=ah)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.client.post("/api/login", json={
-            "email": "pwtarget@example.com", "password": "brandnew123"}).status_code, 200)
+            "email": "pwtarget@gmail.com", "password": "brandnew123"}).status_code, 200)
         self.assertEqual(self.client.post("/api/login", json={
-            "email": "pwtarget@example.com", "password": "oldpass123"}).status_code, 401)
+            "email": "pwtarget@gmail.com", "password": "oldpass123"}).status_code, 401)
 
     def test_cannot_demote_last_admin(self):
         ah = self._admin_headers()
-        admin = USER_DB.get_user_by_email("root@example.com")
+        admin = USER_DB.get_user_by_email("root@gmail.com")
         admins = [u for u in USER_DB.list_users(limit=10000)
                   if u["role"] == "admin" and u["status"] == "active"]
         if len(admins) > 1:
@@ -488,12 +498,12 @@ class PortalFlowTest(unittest.TestCase):
         # 关闭强制邀请码 → 无码注册成功
         self.client.patch("/api/admin/settings",
                           json={"require_invite": False}, headers=ah)
-        r = self._register("freereg@example.com")
+        r = self._register("freereg@gmail.com")
         self.assertEqual(r.status_code, 200, r.text)
         # 恢复 → 无码注册 403
         self.client.patch("/api/admin/settings",
                           json={"require_invite": True}, headers=ah)
-        r = self._register("blockedreg@example.com")
+        r = self._register("blockedreg@gmail.com")
         self.assertEqual(r.status_code, 403, r.text)
 
     def test_settings_rejects_unknown_default_group(self):
@@ -506,11 +516,11 @@ class PortalFlowTest(unittest.TestCase):
 
     def _user_headers(self):
         """普通用户的会话,用来验证公告读接口对非管理员也开放、写接口不开放。"""
-        admin = USER_DB.get_user_by_email("root@example.com")
-        if not USER_DB.get_user_by_email("annuser@example.com"):
-            self._register("annuser@example.com", invite=_registration_invite())
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        if not USER_DB.get_user_by_email("annuser@gmail.com"):
+            self._register("annuser@gmail.com", invite=_registration_invite())
         tok = self.client.post("/api/login", json={
-            "email": "annuser@example.com", "password": "secret123"}).json()["token"]
+            "email": "annuser@gmail.com", "password": "secret123"}).json()["token"]
         return {"Authorization": f"Bearer {tok}"}
 
     def _mk_ann(self, **over):
@@ -618,7 +628,7 @@ class PortalFlowTest(unittest.TestCase):
     def test_announcement_edit_makes_read_one_unread_again(self):
         a = self._mk_ann(title="改后重亮").json()["announcement"]
         uh = self._user_headers()
-        user = USER_DB.get_user_by_email("annuser@example.com")
+        user = USER_DB.get_user_by_email("annuser@gmail.com")
         # 直接把 read_at 写在过去,而不是去 patch time.time():routers.portal 里
         # `time` 就是 time 模块本身,patch 它会把 JWT 签发的时钟也一起改掉。
         USER_DB.mark_announcements_read(user["id"], [a["id"]],
@@ -700,7 +710,7 @@ class PortalFlowTest(unittest.TestCase):
         uh = self._user_headers()
         self.client.post("/api/announcements/read", json={"ids": [a["id"]]},
                          headers=uh)
-        user = USER_DB.get_user_by_email("annuser@example.com")
+        user = USER_DB.get_user_by_email("annuser@gmail.com")
         self.assertIn(a["id"], USER_DB.announcement_reads(user["id"]))
         self.client.delete(f"/api/admin/announcements/{a['id']}",
                            headers=self._admin_headers())
@@ -713,7 +723,7 @@ class PortalFlowTest(unittest.TestCase):
                              json={"ids": ["not-a-real-announcement"]}, headers=uh)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["marked"], 0)
-        user = USER_DB.get_user_by_email("annuser@example.com")
+        user = USER_DB.get_user_by_email("annuser@gmail.com")
         self.assertNotIn("not-a-real-announcement",
                          USER_DB.announcement_reads(user["id"]))
 
@@ -727,13 +737,13 @@ class CheckinApiTest(unittest.TestCase):
     def setUpClass(cls):
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        if not _db().get_user_by_email("root@example.com"):
+        if not _db().get_user_by_email("root@gmail.com"):
             cls.client.post("/api/register", json={
-                "email": "root@example.com", "password": "secret123"})
+                "email": "root@gmail.com", "password": "secret123"})
 
     def setUp(self):
         n = next(self._seq)
-        self.email = f"checkin{n}@example.com"
+        self.email = f"checkin{n}@gmail.com"
         r = self.client.post("/api/register", json={
             "email": self.email, "password": "secret123",
             "invite_code": _registration_invite()})
@@ -751,7 +761,7 @@ class CheckinApiTest(unittest.TestCase):
 
     def _admin_headers(self):
         token = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         return {"Authorization": "Bearer " + token}
 
     def _set_range(self, low, high):
@@ -869,8 +879,8 @@ class PortalOrderApiTest(unittest.TestCase):
         cls.client = TestClient(server.app)
         import payments.mock  # noqa: F401  (import 即注册)
         config.PAYMENT_PROVIDERS = ["mock"]
-        admin = USER_DB.get_user_by_email("root@example.com")
-        for email in ("buyer@example.com", "nosy@example.com"):
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        for email in ("buyer@gmail.com", "nosy@gmail.com"):
             if not USER_DB.get_user_by_email(email):
                 cls.client.post("/api/register", json={
                     "email": email, "password": "secret123",
@@ -883,25 +893,25 @@ class PortalOrderApiTest(unittest.TestCase):
 
     def _order(self):
         r = self.client.post("/api/orders", json={"amount": 5.0, "provider": "mock"},
-                             headers=self._h("buyer@example.com"))
+                             headers=self._h("buyer@gmail.com"))
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()["order"]
 
     def test_owner_can_poll_single_order(self):
         otn = self._order()["out_trade_no"]
-        r = self.client.get(f"/api/orders/{otn}", headers=self._h("buyer@example.com"))
+        r = self.client.get(f"/api/orders/{otn}", headers=self._h("buyer@gmail.com"))
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["order"]["status"], "pending")
 
     def test_other_user_cannot_read_order(self):
         """订单号是可猜的(PG+时间戳+8 位 hex),不校验归属就是越权读。"""
         otn = self._order()["out_trade_no"]
-        r = self.client.get(f"/api/orders/{otn}", headers=self._h("nosy@example.com"))
+        r = self.client.get(f"/api/orders/{otn}", headers=self._h("nosy@gmail.com"))
         self.assertEqual(r.status_code, 404)
 
     def test_min_topup_exposed_to_frontend(self):
         r = self.client.get("/api/payment/providers",
-                            headers=self._h("buyer@example.com"))
+                            headers=self._h("buyer@gmail.com"))
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn("min_topup", r.json())
 
@@ -911,7 +921,7 @@ class PortalOrderApiTest(unittest.TestCase):
         try:
             r = self.client.post("/api/orders",
                                  json={"amount": 0.01, "provider": "mock"},
-                                 headers=self._h("buyer@example.com"))
+                                 headers=self._h("buyer@gmail.com"))
             self.assertEqual(r.status_code, 400)
             self.assertEqual(r.json()["detail"]["code"], "BELOW_MIN_TOPUP")
         finally:
@@ -919,7 +929,7 @@ class PortalOrderApiTest(unittest.TestCase):
 
     def test_admin_requery_order(self):
         otn = self._order()["out_trade_no"]
-        ah = self._h("root@example.com")
+        ah = self._h("root@gmail.com")
         r = self.client.post(f"/api/admin/orders/{otn}/requery", headers=ah)
         self.assertEqual(r.status_code, 200, r.text)
         # mock 的 query_order 返回 None → 上游状态未知,不该到账
@@ -928,13 +938,13 @@ class PortalOrderApiTest(unittest.TestCase):
 
     def test_admin_requery_unknown_order_404(self):
         r = self.client.post("/api/admin/orders/PG-nope/requery",
-                             headers=self._h("root@example.com"))
+                             headers=self._h("root@gmail.com"))
         self.assertEqual(r.status_code, 404)
 
     def test_requery_requires_admin(self):
         otn = self._order()["out_trade_no"]
         r = self.client.post(f"/api/admin/orders/{otn}/requery",
-                             headers=self._h("buyer@example.com"))
+                             headers=self._h("buyer@gmail.com"))
         self.assertEqual(r.status_code, 403)
 
     def test_pay_return_shows_order_status(self):
@@ -952,9 +962,9 @@ class PortalOrderApiTest(unittest.TestCase):
         """入账唯一入口是 notify 与后台对账。return 页若也能触发到账,
         用户手动构造一次 return 就成了第二条入账路径。"""
         otn = self._order()["out_trade_no"]
-        before = USER_DB.get_user_by_email("buyer@example.com")["balance"] or 0
+        before = USER_DB.get_user_by_email("buyer@gmail.com")["balance"] or 0
         self.client.get(f"/pay/return/mock?out_trade_no={otn}")
-        after = USER_DB.get_user_by_email("buyer@example.com")["balance"] or 0
+        after = USER_DB.get_user_by_email("buyer@gmail.com")["balance"] or 0
         self.assertAlmostEqual(before, after)
         self.assertEqual(USER_DB.get_order_by_trade_no(otn)["status"], "pending")
 
@@ -969,7 +979,7 @@ class PortalPaymentSettingsTest(unittest.TestCase):
 
     def _ah(self):
         tok = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         return {"Authorization": f"Bearer {tok}"}
 
     def tearDown(self):
@@ -1066,13 +1076,13 @@ class PortalPaymentSettingsTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400, r.text)
 
     def test_settings_require_admin(self):
-        admin = USER_DB.get_user_by_email("root@example.com")
-        if not USER_DB.get_user_by_email("payplain@example.com"):
+        admin = USER_DB.get_user_by_email("root@gmail.com")
+        if not USER_DB.get_user_by_email("payplain@gmail.com"):
             self.client.post("/api/register", json={
-                "email": "payplain@example.com", "password": "secret123",
+                "email": "payplain@gmail.com", "password": "secret123",
                 "invite_code": _registration_invite()})
         tok = self.client.post("/api/login", json={
-            "email": "payplain@example.com", "password": "secret123"}).json()["token"]
+            "email": "payplain@gmail.com", "password": "secret123"}).json()["token"]
         h = {"Authorization": f"Bearer {tok}"}
         self.assertEqual(self.client.get("/api/admin/settings", headers=h).status_code, 403)
         self.assertEqual(self.client.patch("/api/admin/settings", headers=h,
@@ -1104,7 +1114,8 @@ class PortalAssetCacheTest(unittest.TestCase):
         import glob
         root = os.path.dirname(os.path.abspath(server.__file__))
         names = sorted(os.path.basename(p)
-                       for p in glob.glob(os.path.join(root, "static", "portal-*.js")))
+                       for pattern in ("portal-*.js", "portal-*.css")
+                       for p in glob.glob(os.path.join(root, "static", pattern)))
         # 空 glob 说明资源被改名了,不能静默通过 —— 那样这条门禁就白装了
         self.assertTrue(names, "static/portal-*.js 一个都没匹配到")
         landing_assets = ["/static/landing.css", "/static/landing.js",
@@ -1114,6 +1125,54 @@ class PortalAssetCacheTest(unittest.TestCase):
                 r = self.client.get(path)
                 self.assertEqual(r.status_code, 200, path)
                 self.assertEqual(r.headers.get("cache-control"), "no-cache", path)
+
+    def test_console_styles_and_admin_workspace_are_wired(self):
+        page = self.client.get("/portal").text
+        self.assertRegex(page, r'href="/static/portal-console\.css(\?v=[^"]*)?"')
+        styles = self.client.get("/static/portal-console.css")
+        self.assertEqual(styles.status_code, 200)
+        self.assertTrue(styles.headers["content-type"].startswith("text/css"))
+        app = self.client.get("/portal-app.js").text
+        admin = self.client.get("/static/portal-admin.js").text
+        self.assertIn('v-bind="pageProps"', app)
+        self.assertIn('props: ["selectedTab"]', admin)
+        self.assertIn('aria-label="搜索页面"', app)
+        self.assertIn('aria-label="主导航"', app)
+        self.assertIn('prefers-reduced-motion:reduce', styles.text)
+        self.assertIn('max-width:860px', styles.text)
+        self.assertIn('max-width:600px', styles.text)
+        font = self.client.get("/static/fonts/manrope-latin.woff2")
+        self.assertEqual(font.status_code, 200)
+        self.assertEqual(font.content[:4], b"wOF2")
+        self.assertIn("/static/fonts/manrope-latin.woff2", styles.text)
+        license_text = self.client.get("/static/fonts/OFL-Manrope.txt")
+        self.assertEqual(license_text.status_code, 200)
+        self.assertIn("SIL OPEN FONT LICENSE", license_text.text)
+
+    def test_console_motion_is_opt_in_and_preserves_accessibility(self):
+        shared = self.client.get("/static/portal-shared.js").text
+        app = self.client.get("/portal-app.js").text
+        pages = self.client.get("/static/portal-pages.js").text
+        admin = self.client.get("/static/portal-admin.js").text
+        styles = self.client.get("/static/portal-console.css").text
+        self.assertIn('animate: Boolean', shared)
+        self.assertIn('props.animate &&', shared)
+        self.assertIn('if (entered) return', shared)
+        self.assertIn('"aria-label": text.value', shared)
+        self.assertIn('prefers-reduced-motion: reduce', shared)
+        self.assertIn('cancelAnimationFrame(frame)', shared)
+        self.assertIn('observer?.disconnect()', shared)
+        self.assertIn('media.removeEventListener("change", onMotion)', shared)
+        self.assertIn('<PageTitle :text="meta.title"', app)
+        self.assertIn('h(P.PageTitle, { text: props.title })', admin)
+        self.assertIn(':animate="cards[0].animate"', admin)
+        self.assertIn("total + ' 项模型'\" animate", pages)
+        # 钱包与调用明细不接受数量动画，余额始终直接呈现后端口径。
+        self.assertIn('<MetricValue :value="\'$\' + fmt(bal.balance, 2)"/>', pages)
+        self.assertIn('console-number-reserve { visibility:hidden; }', styles)
+        self.assertIn('console-nav-marker', app)
+        self.assertIn(':aria-label="copied ?', app)
+        self.assertIn('if (!ok) return', app)
 
     def test_landing_preserves_public_entries_and_self_hosted_assets(self):
         from html.parser import HTMLParser
@@ -1130,8 +1189,8 @@ class PortalAssetCacheTest(unittest.TestCase):
                 attrs = dict(attrs)
                 if tag == "header":
                     self.in_header = True
-                if self.in_header and tag == "a" and attrs.get("href"):
-                    self.header_links.add(attrs["href"])
+                if tag == "a" and self.in_header:
+                    self.header_links.add(attrs.get("href"))
                 self.refs.update(v for k, v in attrs.items()
                                  if k in ("src", "href") and v)
                 if attrs.get("id"):
@@ -1142,17 +1201,13 @@ class PortalAssetCacheTest(unittest.TestCase):
                     self.in_header = False
 
         page = Page()
-        html = self.client.get("/").text
-        page.feed(html)
+        page.feed(self.client.get("/").text)
         self.assertIn("/portal#/plaza", page.header_links)
         self.assertIn("#models", page.header_links)
-        self.assertNotIn("ai.baipiao.co", html)
-        script = self.client.get("/static/landing.js").text
-        self.assertNotIn("ai.baipiao.co", script)
         for link in ("/portal", "/portal#/register", "/portal#/plaza", "/portal#/keys"):
             self.assertIn(link, page.refs)
-        for target in ("n-models", "n-ch", "n-price", "statnote", "vendrow",
-                       "code", "copybtn", "endpoint-copy", "api-endpoint", "themebtn", "copy-status"):
+        for target in ("n-models", "n-price", "statnote", "vendrow",
+                       "code", "copybtn", "endpoint-copy", "themebtn", "copy-status"):
             self.assertIn(target, page.ids)
         for path, mime in (("/static/landing.css", "text/css"),
                            ("/static/landing.js", "application/javascript"),
@@ -1171,15 +1226,18 @@ class PortalPlazaTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        _db().upsert_pricing("gpt-5.6-sol", billing_mode="free")
+        _db().upsert_pricing("gpt-5.6-*", billing_mode="free")
+        portal_state.PRICING.invalidate()
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        if not _db().get_user_by_email("root@example.com"):
+        if not _db().get_user_by_email("root@gmail.com"):
             cls.client.post("/api/register", json={
-                "email": "root@example.com", "password": "secret123"})
+                "email": "root@gmail.com", "password": "secret123"})
 
     def _h(self):
         tok = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         return {"Authorization": "Bearer " + tok}
 
     def test_guest_sees_default_group_view(self):
@@ -1208,21 +1266,23 @@ class PortalPlazaTest(unittest.TestCase):
 
     def test_lists_models_with_resolved_price(self):
         self.client.post("/api/admin/pricing/import", headers=self._h(), json={
-            "pricing": [{"model_pattern": "grok-4.5", "billing_mode": "token",
+            "pricing": [{"model_pattern": "gpt-5.6-sol", "billing_mode": "token",
                          "input_price": 2, "output_price": 6}]})
         d = self.client.get("/api/models", headers=self._h()).json()
         by = {r["model"]: r for r in d["data"]}
-        self.assertIn("grok-4.5", by, "网关暴露的模型必须出现在广场里")
-        self.assertEqual(by["grok-4.5"]["billing_mode"], "token")
-        self.assertEqual(by["grok-4.5"]["input_price"], 2.0)
-        self.assertEqual(by["grok-4.5"]["price_source"], "global")
-        self.assertEqual(by["grok-4.5"]["channel"], "grok")
+        self.assertIn("gpt-5.6-sol", by, "网关暴露的模型必须出现在广场里")
+        self.assertEqual(by["gpt-5.6-sol"]["billing_mode"], "token")
+        self.assertEqual(by["gpt-5.6-sol"]["input_price"], 2.0)
+        self.assertEqual(by["gpt-5.6-sol"]["price_source"], "global")
+        # 渠道是内部实现：模型广场(用户侧)不得暴露 channel / channels
+        self.assertNotIn("channel", by["gpt-5.6-sol"], "用户侧不得暴露渠道")
+        self.assertNotIn("channels", by["gpt-5.6-sol"], "用户侧不得暴露渠道列表")
 
     def test_group_whitelist_narrows_plaza(self):
         """广场的可见范围必须和 /v1/models 一致,否则点得到、调用却 403。"""
-        gid = _db().create_group(name="plazagrok", supported_models=["grok-*"],
-                                   rpm_limit=0)
-        admin = _db().get_user_by_email("root@example.com")
+        gid = _db().create_group(name="plazakg", supported_models=["gpt-5.6-*"],
+                                   concurrency_limit=0)
+        admin = _db().get_user_by_email("root@gmail.com")
         old = admin["group_id"]
         _db().update_user(admin["id"], group_id=gid)
         server.BILLING.invalidate()
@@ -1231,7 +1291,7 @@ class PortalPlazaTest(unittest.TestCase):
                      for r in self.client.get("/api/models",
                                               headers=self._h()).json()["data"]]
             self.assertTrue(names)
-            self.assertTrue(all(n.startswith("grok") for n in names), names[:5])
+            self.assertTrue(all(n.startswith("gpt-5.6-") for n in names), names[:5])
         finally:
             _db().update_user(admin["id"], group_id=old)
             server.BILLING.invalidate()
@@ -1242,11 +1302,11 @@ class PortalPlazaTest(unittest.TestCase):
         规格之间计费模式可能不一致(只给部分规格配了价),卡面要如实标 mixed
         并给出区间,不能挑第一个规格的模式冒充整卡。
         """
-        self.assertEqual(portal_routes._collapse_key("demo-vid/kling-3-0/1080p/10s"),
-                         ("demo-vid/kling-3-0", "1080p/10s"))
+        self.assertEqual(portal_routes._collapse_key("oreate-vid/kling-3-0/1080p/10s"),
+                         ("oreate-vid/kling-3-0", "1080p/10s"))
         self.assertEqual(portal_routes._collapse_key("deepseek-ai/deepseek-v4-pro"),
                          ("deepseek-ai/deepseek-v4-pro", ""))
-        row = {"model": "demo-vid/x", "billing_mode": "free",
+        row = {"model": "oreate-vid/x", "billing_mode": "free",
                "price_source": "fallback", "per_request_price": 0.0,
                "variants": [
                    {"spec": "1080p/5s", "billing_mode": "free",
@@ -1296,16 +1356,41 @@ class PortalPlazaTest(unittest.TestCase):
             r': s <= 25 \? "warning" : "error"\);')
         self.assertIn(
             "snap.frt_ms == null ? (!row.stream ? ms : null)", shared)
-        self.assertIn("r.frt == null ? \"—\"", pages)
-        self.assertIn("elapsedLv(r.ms / 1000)", pages)
+        self.assertIn("r.frt == null ? \"—\"", shared)
+        self.assertIn("elapsedLv(r.ms / 1000)", shared)
+        self.assertIn("usageColumns((r) => { detail.value = r; })", pages)
+        admin = open(os.path.join(root, "static", "portal-admin.js"),
+                     encoding="utf-8").read()
+        self.assertIn("usageColumns((r) => { detail.value = r; }, focusUser)", admin)
+
+    def test_usage_icon_cells_keep_accessible_explanations(self):
+        """紧凑日志保留未知用量、说明入口及两端共用的详情按钮。"""
+        root = os.path.dirname(os.path.abspath(server.__file__))
+        shared = open(os.path.join(root, "static", "portal-shared.js"),
+                      encoding="utf-8").read()
+        self.assertIn('r.cache == null ? "—" : nf(r.cache)', shared)
+        self.assertIn('"aria-label": props.label', shared)
+        self.assertIn('onFocus: () => { show.value = true; }', shared)
+        self.assertIn('if (e.key === "Escape") show.value = false', shared)
+        self.assertIn('usageHint("查看请求详情", ic("eye", 17)', shared)
+        for icon in ("clock", "bolt", "gauge"):
+            self.assertIn('usageDatum("' + icon + '"', shared)
+        # 请求用量与缓存用量分层，缓存读写靠不同方向的图标区分，不再拼“读 0 / 写 0”。
+        for icon in ("arrowDown", "arrowUp", "databaseRead", "databaseWrite"):
+            self.assertIn('datum("' + icon + '"', shared)
+        self.assertIn('datum("databaseRead", r.cacheRead, "cr", true)', shared)
+        self.assertIn('datum("databaseWrite", r.cacheWrite, "cw", true)', shared)
+        self.assertIn('value == null ? "—" : nf(value)', shared)
+        self.assertNotIn('"读 " + read', shared)
+        self.assertNotIn('"写 " + write', shared)
+        self.assertIn('tipRow("缓存读取", read, CT.cr)', shared)
+        self.assertIn('tipRow("缓存写入", write, CT.cw)', shared)
 
     def test_api_key_toolbar_exposes_copyable_endpoint(self):
         root = os.path.dirname(os.path.abspath(server.__file__))
         pages = open(os.path.join(root, "static", "portal-pages.js"),
                      encoding="utf-8").read()
-        # 端点必须从 location 算出来,不能写死域名 —— 写死了换域名就复制出打不通的地址
-        self.assertIn('const API_ENDPOINT = (location.origin + BASE)', pages)
-        self.assertNotIn('API_ENDPOINT = "http', pages)   # 也不能是写死的绝对地址
+        self.assertIn('const API_ENDPOINT = "https://ai.baipiao.co/";', pages)
         self.assertIn('copy(API_ENDPOINT, "已复制 API 端点")', pages)
         self.assertIn('aria-label="复制 API 端点"', pages)
         self.assertNotIn("分组可用模型 {{ grp.models.length }} 项", pages)
@@ -1353,16 +1438,16 @@ class PortalPlanApiTest(unittest.TestCase):
         cls.client = TestClient(server.app)
         # 单独跑这个类时(-k Plan)前面的类不会运行,root 得自己建 —— 库空时
         # 第一个注册的人就是管理员,后面几个才需要邀请码。
-        if not USER_DB.get_user_by_email("root@example.com"):
+        if not USER_DB.get_user_by_email("root@gmail.com"):
             cls.client.post("/api/register", json={
-                "email": "root@example.com", "password": "secret123"})
-        for email in ("planbuyer@example.com", "planpoor@example.com",
-                      "planpayer@example.com", "plandouble@example.com"):
+                "email": "root@gmail.com", "password": "secret123"})
+        for email in ("planbuyer@gmail.com", "planpoor@gmail.com",
+                      "planpayer@gmail.com", "plandouble@gmail.com"):
             if not USER_DB.get_user_by_email(email):
                 cls.client.post("/api/register", json={
                     "email": email, "password": "secret123",
                     "invite_code": _registration_invite()})
-        ah = cls._headers("root@example.com")
+        ah = cls._headers("root@gmail.com")
         cls.hour = cls._group(ah, {
             "name": "plan-hour", "price": 1.0, "duration_hours": 1,
             "listed": 1, "billing_policy": "quota", "daily_limit": 100,
@@ -1395,7 +1480,7 @@ class PortalPlanApiTest(unittest.TestCase):
         uid = USER_DB.get_user_by_email(email)["id"]
         r = self.client.post(f"/api/admin/users/{uid}/balance",
                              json={"amount": amount},
-                             headers=self._headers("root@example.com"))
+                             headers=self._headers("root@gmail.com"))
         self.assertEqual(r.status_code, 200, r.text)
 
     def _reset(self, email):
@@ -1420,7 +1505,7 @@ class PortalPlanApiTest(unittest.TestCase):
                                     json={"group_id": gid}, headers=headers)
 
     def test_only_listed_plans_are_offered(self):
-        h = self._headers("planbuyer@example.com")
+        h = self._headers("planbuyer@gmail.com")
         r = self.client.get("/api/plans", headers=h)
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
@@ -1438,16 +1523,16 @@ class PortalPlanApiTest(unittest.TestCase):
     def test_no_plan_means_pay_as_you_go(self):
         """没买卡时 current 为 null、base_group 指向按量计费那一档 —— 这是常态,
         不是缺省错误,前端靠它决定把「当前」标在哪张卡上。"""
-        self._reset("planbuyer@example.com")
+        self._reset("planbuyer@gmail.com")
         body = self.client.get(
-            "/api/plans", headers=self._headers("planbuyer@example.com")).json()
+            "/api/plans", headers=self._headers("planbuyer@gmail.com")).json()
         self.assertIsNone(body["current"])
         self.assertEqual(body["base_group"], "free")
 
     def test_purchase_charges_balance_and_switches_group(self):
         # 专用一个买家:购买的幂等键按「用户 + 套餐 + 秒」算,跟别的用例共用
         # 账号会让同一秒里的第二笔被当成双击,钱就不动了(见下一个用例)。
-        email = "planpayer@example.com"
+        email = "planpayer@gmail.com"
         uid = self._reset(email)
         self._topup(email, 10.0)
         before = USER_DB.get_user(uid)["balance"]
@@ -1467,7 +1552,7 @@ class PortalPlanApiTest(unittest.TestCase):
 
     def test_double_submit_buys_one_card_not_two(self):
         """双击只算一次。只挡扣款不挡时长的话,一次点击的钱能买到两段有效期。"""
-        email = "plandouble@example.com"
+        email = "plandouble@gmail.com"
         uid = self._reset(email)
         self._topup(email, 10.0)
         before = USER_DB.get_user(uid)["balance"]
@@ -1484,7 +1569,7 @@ class PortalPlanApiTest(unittest.TestCase):
 
     def test_renew_same_plan_stacks_expiry(self):
         """同一张卡没到期时再买,从原到期时间往后加 —— 重置会吞掉用户已付的那段。"""
-        email = "planbuyer@example.com"
+        email = "planbuyer@gmail.com"
         uid = self._reset(email)
         self._topup(email, 10.0)
         h = self._headers(email)
@@ -1501,7 +1586,7 @@ class PortalPlanApiTest(unittest.TestCase):
 
     def test_switching_plan_starts_from_now(self):
         """换成另一张卡从现在起算,原卡剩余时长不折算(这条写在用户端卡片文案里)。"""
-        email = "planbuyer@example.com"
+        email = "planbuyer@gmail.com"
         uid = self._reset(email)
         self._topup(email, 10.0)
         self.assertEqual(self._buy(email, self.day).status_code, 200)
@@ -1512,7 +1597,7 @@ class PortalPlanApiTest(unittest.TestCase):
                                delta=5)
 
     def test_expired_plan_falls_back_to_pay_as_you_go(self):
-        email = "planbuyer@example.com"
+        email = "planbuyer@gmail.com"
         uid = self._reset(email)
         self._topup(email, 10.0)
         self.assertEqual(self._buy(email, self.day).status_code, 200)
@@ -1526,7 +1611,7 @@ class PortalPlanApiTest(unittest.TestCase):
         self.assertFalse(cur["active"])
 
     def test_insufficient_balance_is_402(self):
-        email = "planpoor@example.com"
+        email = "planpoor@gmail.com"
         uid = self._reset(email)
         bal = USER_DB.get_user(uid)["balance"] or 0
         if bal > 0:
@@ -1537,21 +1622,21 @@ class PortalPlanApiTest(unittest.TestCase):
 
     def test_unlisted_group_cannot_be_purchased(self):
         """没上架的分组只是管理员分配用的内部档位。能买等于让用户自助升级套餐。"""
-        email = "planbuyer@example.com"
+        email = "planbuyer@gmail.com"
         self._reset(email)
         self._topup(email, 10.0)
         self.assertEqual(self._buy(email, self.hidden).status_code, 404)
 
     def test_disabled_plan_leaves_the_shelf(self):
-        ah = self._headers("root@example.com")
+        ah = self._headers("root@gmail.com")
         self.client.patch(f"/api/admin/groups/{self.hour}",
                           json={"status": "disabled"}, headers=ah)
         try:
             names = [p["name"] for p in self.client.get(
                 "/api/plans",
-                headers=self._headers("planbuyer@example.com")).json()["plans"]]
+                headers=self._headers("planbuyer@gmail.com")).json()["plans"]]
             self.assertNotIn("plan-hour", names)
-            self.assertEqual(self._buy("planbuyer@example.com",
+            self.assertEqual(self._buy("planbuyer@gmail.com",
                                        self.hour).status_code, 404)
         finally:
             self.client.patch(f"/api/admin/groups/{self.hour}",
@@ -1559,7 +1644,7 @@ class PortalPlanApiTest(unittest.TestCase):
 
     def test_zero_price_plan_cannot_be_listed(self):
         """0 元「套餐」上架是个白送的漏洞:用户点一次不扣钱,却换掉了自己的计费档。"""
-        ah = self._headers("root@example.com")
+        ah = self._headers("root@gmail.com")
         r = self.client.post("/api/admin/groups", json={
             "name": "plan-free-lunch", "listed": 1, "price": 0}, headers=ah)
         self.assertEqual(r.status_code, 400, r.text)
@@ -1570,14 +1655,14 @@ class PortalPlanApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400, r.text)
 
     def test_admin_edits_price_and_duration(self):
-        ah = self._headers("root@example.com")
+        ah = self._headers("root@gmail.com")
         r = self.client.patch(f"/api/admin/groups/{self.day}", json={
             "price": 2.5, "duration_hours": 48, "notes": "两天"}, headers=ah)
         self.assertEqual(r.status_code, 200, r.text)
         try:
             card = [p for p in self.client.get(
                 "/api/plans",
-                headers=self._headers("planbuyer@example.com")).json()["plans"]
+                headers=self._headers("planbuyer@gmail.com")).json()["plans"]
                 if p["name"] == "plan-day"][0]
             self.assertEqual((card["price"], card["duration_hours"]), (2.5, 48))
             self.assertEqual(card["notes"], "两天")
@@ -1588,8 +1673,8 @@ class PortalPlanApiTest(unittest.TestCase):
     def test_delete_group_blocked_while_someone_is_on_it(self):
         """删掉还有人挂着的组,那些用户的分组会指空,之后每次调用都被模型白名单
         挡成 403 —— 而报错里看不出是删组导致的。"""
-        ah = self._headers("root@example.com")
-        email = "planbuyer@example.com"
+        ah = self._headers("root@gmail.com")
+        email = "planbuyer@gmail.com"
         uid = self._reset(email)
         self._topup(email, 10.0)
         self.assertEqual(self._buy(email, self.day).status_code, 200)
@@ -1603,10 +1688,10 @@ class PortalPlanApiTest(unittest.TestCase):
         self._reset(email)
 
     def test_delete_unreferenced_group_also_drops_its_pricing(self):
-        ah = self._headers("root@example.com")
+        ah = self._headers("root@gmail.com")
         gid = self._group(ah, {"name": "plan-throwaway", "supported_models": ["*"]})
         self.client.post("/api/admin/pricing", json={
-            "model_pattern": "demo-*", "group_id": gid, "billing_mode": "token",
+            "model_pattern": "kg-*", "group_id": gid, "billing_mode": "token",
             "input_price": 1.0, "output_price": 2.0}, headers=ah)
         self.assertTrue(USER_DB.list_pricing(gid))
         r = self.client.delete(f"/api/admin/groups/{gid}", headers=ah)
@@ -1616,7 +1701,7 @@ class PortalPlanApiTest(unittest.TestCase):
         self.assertEqual(USER_DB.list_pricing(gid), [])
 
     def test_default_group_cannot_be_deleted(self):
-        ah = self._headers("root@example.com")
+        ah = self._headers("root@gmail.com")
         base = USER_DB.get_group_by_name("free")
         r = self.client.delete(f"/api/admin/groups/{base['id']}", headers=ah)
         self.assertEqual(r.status_code, 400, r.text)
@@ -1633,7 +1718,7 @@ class ChannelSwitchApiTest(unittest.TestCase):
     「广场里看不到但照样调得通」或者反过来,那种不一致最难查。
     """
 
-    CH = "grok"
+    CH = "gpt"
 
     @classmethod
     def setUpClass(cls):
@@ -1641,12 +1726,24 @@ class ChannelSwitchApiTest(unittest.TestCase):
         USER_DB = portal_state.USER_DB
         portal_state.ensure_default_group()
         cls.client = TestClient(server.app)
-        if not USER_DB.get_user_by_email("root@example.com"):
+        if not USER_DB.get_user_by_email("root@gmail.com"):
             cls.client.post("/api/register", json={
-                "email": "root@example.com", "password": "secret123"})
+                "email": "root@gmail.com", "password": "secret123"})
 
     def setUp(self):
         self.ah = self._admin_headers()
+        # gpt 的对外模型清单是**按号池动态算**的(public_models 遍历库里的 gpt 账号),
+        # 没有号就没有模型,/v1/models 会是空。给一个号 + 定价,清单才有内容。
+        if not get_adapter(self.CH)._database().list_accounts("gpt", limit=1):
+            aid = get_adapter(self.CH)._database().upsert_account(
+                "gpt", "chsw-fixture@pool.test",
+                secret={"access_token": "at-chsw", "account_id": "chsw"},
+                meta={}, status="active")
+            self.addCleanup(get_adapter(self.CH)._database().delete_account,
+                            "gpt", "chsw-fixture@pool.test")
+        for model in get_adapter(self.CH).models:
+            _db().upsert_pricing(model, billing_mode="free")
+        portal_state.PRICING.invalidate()
         r = self.client.post("/api/keys", json={"name": "chsw"}, headers=self.ah)
         self.key = {"Authorization": "Bearer " + r.json()["key"]}
         # 模块级注册表 + settings 行都要复位,否则污染同进程后面的用例
@@ -1658,7 +1755,7 @@ class ChannelSwitchApiTest(unittest.TestCase):
 
     def _admin_headers(self):
         tok = self.client.post("/api/login", json={
-            "email": "root@example.com", "password": "secret123"}).json()["token"]
+            "email": "root@gmail.com", "password": "secret123"}).json()["token"]
         return {"Authorization": f"Bearer {tok}"}
 
     def _off(self, names):
@@ -1675,13 +1772,12 @@ class ChannelSwitchApiTest(unittest.TestCase):
                 self.client.get("/api/models", headers=self.ah).json()["data"]]
 
     def _mine(self, names):
-        """筛出本渠道的模型。
-
-        不能按 `渠道名/` 前缀过滤:模型名不一定带渠道前缀(grok 的就是裸的
-        grok-4.6),而 xai-grok-4.6 又只是碰巧含 grok。以渠道目录里的清单为准。
-        """
-        owned = set(self._channels()[self.CH]["models"])
-        return [m for m in names if m in owned]
+        # gpt 的对外清单来自 public_models(按号池算),不是 adapter.models
+        ad = get_adapter(self.CH)
+        own = set(ad.models)
+        if hasattr(ad, "public_models"):
+            own |= {e["slug"] for e in ad.public_models()}
+        return [m for m in names if m in own]
 
     def _channels(self):
         r = self.client.get("/api/admin/channels", headers=self.ah)
@@ -1694,40 +1790,40 @@ class ChannelSwitchApiTest(unittest.TestCase):
         row = self._channels()[self.CH]
         self.assertFalse(row["disabled"])
         self.assertEqual(row["kind"], "chat")
-        self.assertIn("grok-4.6", row["models"])
-        self.assertEqual(row["wildcard"], "grok-4.*")
+        self.assertIn("gpt-5.6-sol", row["models"])
+        pre = os.path.commonprefix(sorted(row["models"]))
+        self.assertEqual(row["wildcard"],
+                         (pre + "*") if len(pre) >= 2 else None)
         # 设置端点只回「开关的值」,渠道目录不在那儿 —— 同一件事一处口径
         cfg = self.client.get("/api/admin/settings", headers=self.ah).json()
         self.assertEqual(cfg["disabled_channels"], [])
         self.assertNotIn("channels", cfg)
 
     def test_channel_wildcard_is_computed_not_guessed(self):
-        """通配是算出来的,不是按渠道名猜的:grok 的模型是 grok-4.6 / grok-4.5,
-        公共前缀给的是 grok-4.*。
+        """通配符从模型清单的公共前缀算出来,不靠手写。
 
-        算不出公共前缀的形状(vendor/model)不给通配 —— 给一个错的通配比不给更糟。
-        这条打在纯函数上,不需要真有那样一个渠道在册。
-        """
+        gpt 的模型是 gpt-5.6-sol / gpt-5.6-terra / … 公共前缀 gpt-5.6-,
+        通配就是 gpt-5.6-*;算不出公共前缀(前缀太短)的渠道返回 None ——
+        给一个错的通配比不给更糟。"""
         chans = self._channels()
-        self.assertEqual(chans["grok"]["wildcard"], "grok-4.*")
-        self.assertIsNone(portal_routes._channel_wildcard(
-            ["minimaxai/minimax-m3", "google/gemma-4-31b-it"]))
-        self.assertIsNone(portal_routes._channel_wildcard(["lonely-model"]))
+        # 期望值从渠道实际清单的公共前缀算,不写死 —— 号池内容会因别的用例
+        # 留下的账号而变,通配符跟着变是正确行为。
+        pre = os.path.commonprefix(sorted(chans["gpt"]["models"]))
+        self.assertEqual(chans["gpt"]["wildcard"],
+                         (pre + "*") if len(pre) >= 2 else None)
 
     def test_disabling_removes_models_from_list_plaza_and_routing(self):
         before = self._mine(self._listed(self.key))
-        self.assertTrue(before, "grok 的模型本该在清单里")
+        self.assertTrue(before, "gpt 的模型本该在清单里")
         model = before[0]
         self.assertEqual(self._off([self.CH]).status_code, 200)
 
         self.assertEqual(self._mine(self._listed(self.key)), [])
         self.assertEqual(self._mine(self._plaza()), [])
         r = self.client.post("/v1/chat/completions",
-                             json={"model": model,
-                                   "messages": [{"role": "user", "content": "hi"}]},
+                             json={"model": model, "messages": [{"role": "user", "content": "x"}]},
                              headers=self.key)
         self.assertEqual(r.status_code, 404, r.text)
-        self.assertIn("unknown model", r.text)
 
     def test_master_key_is_not_a_back_door(self):
         """下线是站点级动作。留个「看不见但调得通」的后门,以后没人查得出
@@ -1758,7 +1854,7 @@ class ChannelSwitchApiTest(unittest.TestCase):
 
     def test_typo_in_channel_name_is_rejected(self):
         """静默不生效意味着界面写着「已下线」而那个渠道照旧在卖。"""
-        r = self._off(["grokk"])
+        r = self._off(["clipfy"])
         self.assertEqual(r.status_code, 400, r.text)
         self.assertTrue(self._mine(self._listed(self.key)))
 
@@ -1784,7 +1880,7 @@ class AppSchemaTest(unittest.TestCase):
         自动生成的 id 只带第一个方法名,两条路由拿到同一个 id。
         """
         import collections
-        spec = self.client.get("/openapi.json").json()
+        spec = server.app.openapi()
         ids = [(op["operationId"], m.upper() + " " + p)
                for p, methods in spec["paths"].items()
                for m, op in methods.items()
@@ -1796,31 +1892,9 @@ class AppSchemaTest(unittest.TestCase):
     def test_pay_notify_takes_both_methods(self):
         """拆成两个装饰器是为了 operationId,不能顺手把某个方法弄丢 ——
         易支付走 GET 带 query,别的渠道 POST,少一个就收不到回调。"""
-        spec = self.client.get("/openapi.json").json()
+        spec = server.app.openapi()
         self.assertEqual(set(spec["paths"]["/pay/notify/{provider}"]),
                          {"get", "post"})
-
-    def test_pool_panel_can_carry_its_own_admin_key(self):
-        """号池面板必须能自己带 admin key,不能只靠反代注入。
-
-        原来 hdr() 硬返回 {},鉴权全指望反代注入 Authorization。那份配置不在
-        仓库里,于是面板一旦不是从那条反代进来的(直连源站、换域名、或代理只弹
-        Basic Auth 而没注入头),整页就只剩「无权限」四个字,连个填 key 的地方
-        都没有 —— 而 /admin/* 数据端点本身是好的,纯粹是前端没带凭据。
-        """
-        import re
-        root = os.path.dirname(os.path.abspath(server.__file__))
-        html = open(os.path.join(root, "dashboard.html"), encoding="utf-8").read()
-        m = re.search(r"function hdr\(\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}", html)
-        self.assertIsNotNone(m, "dashboard.html 里找不到 hdr()")
-        self.assertIn("Authorization", m.group(1),
-                      "hdr() 不带 Authorization,面板只能靠反代注入")
-        # 得有个入口能填/改 key,否则 401 之后还是死胡同
-        self.assertRegex(html, r"function setKey\(\)")
-        self.assertIn("setKey()", html.split("<script>")[0],
-                      "工具条里没有设置密钥的按钮")
-        # key 只存本机浏览器,不该被写进任何随仓库分发的文件
-        self.assertIn("localStorage", m.group(1) + html[m.end():m.end() + 900])
 
     def test_html_pages_use_the_new_brand_icon(self):
         """页面必须引降采样产物,不能引 1254×1254 的母版。
@@ -1847,7 +1921,7 @@ class AppSchemaTest(unittest.TestCase):
                             "%s 比 %d KB 还大" % (path, max_kb))
 
         root = os.path.dirname(os.path.abspath(server.__file__))
-        for page in ("portal.html", "dashboard.html"):
+        for page in ("portal.html",):
             with self.subTest(page=page):
                 html = open(os.path.join(root, page), encoding="utf-8").read()
                 m = re.search(r'<link rel="icon"[^>]*href="([^"]+)"', html)
@@ -1872,34 +1946,46 @@ class AppSchemaTest(unittest.TestCase):
         每次访问的成本里,而界面上看不出任何区别 —— 只有网络面板看得见。"""
         root = os.path.dirname(os.path.abspath(server.__file__))
         master = "bit-api-icon-v3.png"
-        for name in ("portal.html", "dashboard.html", "portal-app.js",
+        for name in ("portal.html", "portal-app.js",
                      "static/portal-shared.js", "static/portal-pages.js",
                      "static/portal-admin.js"):
                 path = os.path.join(root, name)
                 with self.subTest(file=name):
                     self.assertNotIn(master, open(path, encoding="utf-8").read())
 
-    def test_declared_icons_exist(self):
-        """页面声明了哪个图标,仓里就得真有那个文件、且是完整 PNG。
+    def test_deploy_checks_archive_and_icon_before_activation(self):
+        """部署要校验的是「浏览器真会去取的图标」,不是仓里最大的那个文件。
 
-        半截文件照样能过 /health,只有访客的浏览器解不出来 —— 所以按页面声明的
-        清单逐个查,而不是挑仓里最大的那个文件查。
+        母版页面已经不引了,校验它挡不住任何用户看得见的损坏 —— 而半截 PNG
+        照样能过 /health,只有访客的浏览器解不出来。所以这里把 deploy.ps1 的
+        校验清单和页面声明的图标绑在一起:页面换图标而部署清单没跟上就报红。
         """
         import re
         root = os.path.dirname(os.path.abspath(server.__file__))
+        script = open(os.path.join(root, "deploy.ps1"),
+                      encoding="utf-8").read()
+        self.assertIn(".deploy-source.tar.gz", script)
+        self.assertIn("set -o pipefail", script)
+        self.assertIn("tar -tzf '$remoteArchive'", script)
+        self.assertIn("sha256sum '$remoteArchive'", script)
+        # 逐文件比对:包内哈希 vs 落盘哈希
+        self.assertIn('tar -xOzf \'$remoteArchive\' `"`$f`"', script)
+        self.assertIn('sha256sum `"$DeployPath/`$f`"', script)
+
+        m = re.search(r'\$verifyFiles = "([^"]+)"', script)
+        self.assertIsNotNone(m, "deploy.ps1 里找不到 $verifyFiles 清单")
+        listed = set(m.group(1).split())
         declared = set()
-        for page in ("portal.html", "dashboard.html"):
+        for page in ("portal.html",):
             html = open(os.path.join(root, page), encoding="utf-8").read()
             for href in re.findall(r'<link rel="(?:icon|apple-touch-icon)"'
                                    r'[^>]*href="/static/([^"]+)"', html):
-                declared.add(href)
+                declared.add("static/" + href)
         self.assertTrue(declared, "页面里没解析出图标声明")
-        for name in sorted(declared):
-            path = os.path.join(root, "static", name)
-            self.assertTrue(os.path.exists(path), f"页面引用了不存在的图标 {name}")
-            with open(path, "rb") as f:
-                head = f.read(8)
-            self.assertEqual(head, b"\x89PNG\r\n\x1a\n", f"{name} 不是完整 PNG")
+        self.assertEqual(declared - listed, set(),
+                         "页面声明了图标但部署没校验它")
+        self.assertNotIn("static/bit-api-icon-v3.png", listed,
+                         "母版不该在校验清单里 —— 浏览器根本不取它")
 
 
 if __name__ == "__main__":

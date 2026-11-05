@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 
 _IMPORT_TMP = tempfile.mkdtemp(prefix="bitapi-registration-import-")
 os.environ.setdefault("BITAPI_DB", str(Path(_IMPORT_TMP) / "import.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", str(Path(_IMPORT_TMP) / "no-auths"))
 
 import config
 import server
@@ -30,8 +29,6 @@ class RegistrationTest(unittest.TestCase):
         self.patches = []
         for mod in (state, server, portal):
             for name, value in (("USER_DB", self.db), ("BILLING", Billing(self.db))):
-                if mod is server and name == "USER_DB":
-                    continue
                 patch = mock.patch.object(mod, name, value)
                 patch.start()
                 self.patches.append(patch)
@@ -64,19 +61,19 @@ class RegistrationTest(unittest.TestCase):
         self.tmp.cleanup()
         throttle.reset_all()
 
-    def send_code(self, email="alice@example.com"):
+    def send_code(self, email="2892672257@qq.com"):
         return self.client.post("/api/register/code", json={"email": email})
 
-    def register(self, email="alice@example.com", code="012345", invite=""):
+    def register(self, email="2892672257@qq.com", code="012345", invite=""):
         return self.client.post("/api/register", json={"email": email, "password": "secret123",
                                                        "verification_code": code, "invite_code": invite})
 
-    def proof(self, email="alice@example.com"):
+    def proof(self, email="2892672257@qq.com"):
         with self.db._conn() as conn:
             return conn.execute("SELECT * FROM registration_codes WHERE email=?", (email,)).fetchone()
 
-    def test_regular_email_requires_delivered_code_and_creates_verified_accounts(self):
-        for email in ("alice@example.com", "fixturemember@gmail.com"):
+    def test_qq_and_gmail_require_delivered_code_and_create_verified_accounts(self):
+        for email in ("2892672257@qq.com", "fixturemember@gmail.com"):
             sent = self.send_code(email)
             self.assertEqual(sent.status_code, 200, sent.text)
             self.assertEqual(sent.json()["expires_in"], 900)
@@ -98,6 +95,14 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(self.register("fixturemember@gmail.com").status_code, 400)
         self.assertEqual(self.db.count_users(), 0)
 
+    def test_rejects_other_domains_and_aliases_before_sending_or_creating(self):
+        for email in ("alias@qq.com", "123456+tag@qq.com", "member+tag@gmail.com",
+                      "mem.ber@gmail.com", "member@googlemail.com", "member@example.com"):
+            with self.subTest(email=email):
+                self.assertEqual(self.send_code(email).status_code, 400)
+                self.assertEqual(self.register(email).status_code, 400)
+        self.sent.assert_not_called()
+        self.assertEqual(self.db.count_users(), 0)
 
     def test_mail_configuration_or_delivery_failure_cannot_issue_a_usable_code(self):
         self.db.delete_setting("smtp_host")
@@ -153,12 +158,9 @@ class RegistrationTest(unittest.TestCase):
         self.send_code()
 
         def submit(_):
-            client = TestClient(server.app)
-            try:
-                return client.post("/api/register", json={"email": "alice@example.com", "password": "secret123",
+            with TestClient(server.app) as client:
+                return client.post("/api/register", json={"email": "2892672257@qq.com", "password": "secret123",
                                                           "verification_code": "012345"}).status_code
-            finally:
-                client.close()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
             results = list(workers.map(submit, range(4)))
@@ -179,10 +181,20 @@ class RegistrationTest(unittest.TestCase):
         finally:
             limiter.limit = previous
 
+    def test_cumulative_tokens_include_all_users_old_logs_and_cache(self):
+        self.send_code()
+        registered = self.register().json()
+        uid = registered["user_id"]
+        other = self.db.create_user("legacy@example.com", "fixture", "OTHER")
+        old = self.db.add_usage(user_id=other, input_tokens=100, output_tokens=50,
+                                pricing_snapshot={"total_ctx": 300})
+        self.db.add_usage(user_id=uid, input_tokens=10, output_tokens=20)
+        with self.db._conn() as conn:
+            conn.execute("UPDATE usage_logs SET created_at=? WHERE id=?", (int(time.time()) - 100 * 86400, old))
+        headers = {"Authorization": "Bearer " + registered["token"]}
+        for days in (7, 90):
+            response = self.client.get("/api/admin/stats", params={"days": days}, headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["total_usage"]["tokens"], 380)
+            self.assertEqual(response.json()["windows"]["month"]["usage"]["tokens"], 30)
 
-
-    def test_self_hosted_email_domains_and_aliases_remain_supported(self):
-        for email in ("member@company.example.com", "member+team@gmail.com"):
-            with self.subTest(email=email):
-                self.assertEqual(self.send_code(email).status_code, 200)
-                self.assertEqual(self.register(email).status_code, 200)

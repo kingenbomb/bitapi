@@ -19,7 +19,6 @@ from unittest import mock
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "oc.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 from adapters.openai_compat import OpenAICompatAdapter, UpstreamError  # noqa: E402
 from core.pool import classify_failure  # noqa: E402
@@ -57,6 +56,36 @@ def _adapter(**over):
               headers={"X-Org": "team-a"}, source="data")
     kw.update(over)
     return OpenAICompatAdapter(**kw)
+
+
+class ImageCompatTest(unittest.TestCase):
+    def test_mixed_models_and_mapped_image_ids_use_image_api(self):
+        ad = _adapter(models=["acme-fast", "image-alias"], model_map={"image-alias": "gpt-image-2.5-flare"}, key_concurrency=1)
+        self.assertTrue(ad.supports_chat("acme-fast"))
+        self.assertTrue(ad.supports_images("image-alias"))
+        self.assertFalse(ad.supports_chat("image-alias"))
+        self.assertFalse(ad.supports_images("not-listed"))
+        payload = {"created": 1, "data": [{"b64_json": "fixture-pixels"}], "usage": {"output_tokens": 4004}}
+        with mock.patch("core.account_runtime.urlopen", return_value=_resp(payload)) as send:
+            result = ad.images({"id": 1, "secret": {"api_key": "fixture-key"}}, {"model": "image-alias", "prompt": "cat", "quality": "low", "n": 2})
+        self.assertEqual(result, payload)
+        request = send.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.acme.test/v1/images/generations")
+        self.assertEqual(json.loads(request.data)["model"], "gpt-image-2.5-flare")
+        self.assertEqual(json.loads(request.data)["quality"], "low")
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("X-org"), "team-a")
+        slot = ad._gate.acquire(1, 1, timeout=.01)
+        ad._gate.release(slot)
+
+    def test_empty_image_response_is_not_success_and_releases_slot(self):
+        ad = _adapter(models=["gpt-image-2.5-sunburst"], key_concurrency=1)
+        with mock.patch("core.account_runtime.urlopen", return_value=_resp({"data": []})):
+            with self.assertRaises(UpstreamError) as caught:
+                ad.images({"id": 1, "secret": {"api_key": "fixture-key"}}, {"model": "gpt-image-2.5-sunburst", "prompt": "cat"})
+        self.assertEqual(caught.exception.code, 502)
+        slot = ad._gate.acquire(1, 1, timeout=.01)
+        ad._gate.release(slot)
 
 
 class ConfigTest(unittest.TestCase):

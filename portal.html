@@ -10,15 +10,7 @@
      挂母版等于每次打开都下 946 KB。产物由 scripts/make_icons.py 生成。 -->
 <link rel="icon" type="image/png" sizes="32x32" href="/static/bit-api-icon-32.png">
 <link rel="apple-touch-icon" href="/static/bit-api-icon-180.png">
-<script>
-  /* 首屏渲染前定主题,避免深色用户看到白闪。取值与 portal-shared.js 的 dark ref 同键。 */
-  (function () {
-    try {
-      var t = localStorage.getItem("bitapi_theme");
-      if (t === "dark") document.documentElement.classList.add("dark");
-    } catch (e) {}
-  })();
-</script>
+<script src="/static/theme-init.js"></script>
 <style>
   html,body { margin:0; height:100%; }
   #app { height:100%; }
@@ -110,6 +102,44 @@
     transition:color .15s,opacity .15s,text-decoration-color .15s; }
   .dtl:hover { opacity:1 !important; color:#a8613c;
     text-decoration-style:solid; text-decoration-color:#a8613c; }
+  /* 日志：数值优先，说明由同一组可聚焦/可点击的 tooltip 承载。 */
+  .usage-table .n-data-table-td { padding:8px 10px; }
+  .usage-table .n-data-table-th { white-space:nowrap; }
+  .usage-hint { display:inline-flex; align-items:center; max-width:100%;
+    min-height:28px; padding:2px 4px; margin:0; border:0; border-radius:6px;
+    background:transparent; color:inherit; font:inherit; text-align:left;
+    cursor:help; vertical-align:middle; }
+  .usage-hint:hover, .usage-hint:focus-visible { background:rgba(127,127,127,.08); }
+  .usage-hint:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
+  .usage-hint:active { background:rgba(127,127,127,.14); }
+  .usage-hint-content { display:flex; align-items:center; gap:6px; min-width:0;
+    width:100%; }
+  .usage-identity { min-width:0; font-size:12px; font-weight:550; }
+  .usage-ellipsis { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .usage-model { display:flex; align-items:center; gap:4px; min-width:0; }
+  .usage-model > .usage-identity { flex:1; }
+  .usage-icon { width:28px; flex:0 0 28px; justify-content:center; }
+  .usage-icon .usage-hint-content { justify-content:center; }
+  .usage-secondary { color:var(--n-th-text-color); }
+  .usage-action { cursor:pointer; }
+  .usage-date, .usage-datum, .usage-cost { font-family:var(--mono);
+    font-variant-numeric:tabular-nums; white-space:nowrap; font-size:12px; }
+  .usage-date { color:var(--n-th-text-color); }
+  .usage-metrics { display:flex; flex-direction:column; gap:3px; }
+  .usage-datum { display:inline-flex; align-items:center; gap:6px; line-height:18px; }
+  .usage-cost { font-weight:600; background:rgba(127,127,127,.07);
+    padding:3px 6px; border-radius:6px; }
+  .usage-tip { display:flex; flex-direction:column; gap:4px; font-size:12px;
+    max-width:min(320px,calc(100vw - 40px)); overflow-wrap:anywhere; }
+  .usage-tip-note { font-size:11px; opacity:.72; margin-top:2px; }
+  .usage-drawer .n-drawer-body-content-wrapper { overflow-wrap:anywhere; }
+  @media (pointer:coarse) {
+    .usage-hint { min-height:44px; }
+    .usage-icon { min-width:44px; flex-basis:44px; }
+  }
+  @media (max-width:860px) {
+    .usage-pagination { max-width:100%; overflow-x:auto; padding:4px 0; }
+  }
   /* 用 100vh 而非 100%:中间隔着 n-config-provider 那层无高度的 div,
      百分比高度传不下来,登录卡会贴顶。 */
   .authwrap { display:grid; place-items:center; min-height:100vh;
@@ -185,45 +215,19 @@
       max-width:calc(100vw - 34px); }
     .authwrap { padding:20px 14px; }
   }
-  /* Token 榜和邀请奖励共用现有控制台主题。 */
-  .rank-page { display:grid; gap:14px; }
-  .rank-toolbar { display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; }
-  .rank-toolbar :is(.n-radio-button,.n-button), .invite-settings .n-input-number,
-  .invite-settings .n-button { min-height:44px; }
-  .invite-settings .n-input__input-el { height:42px; }
-  .rank-summary { background:rgba(127,127,127,.06); margin-bottom:14px; }
-  .rank-total { font-size:clamp(30px,5vw,42px); font-weight:700; line-height:1.4;
-    overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
-  .rank-total > span { font-size:13px; font-weight:500; opacity:.65; margin-left:10px; }
-  .rank-note { font-size:12px; line-height:1.7; opacity:.7; overflow-wrap:anywhere; }
-  .rank-identity { display:flex; align-items:center; gap:10px; }
-  .rank-number { min-width:25px; font-variant-numeric:tabular-nums; font-weight:650; }
-  .rank-number.is-leading, .rank-me { color:#a8613c; }
-  html.dark .rank-number.is-leading, html.dark .rank-me { color:#e4a880; }
-  .rank-user { min-width:0; overflow-wrap:anywhere; }
-  .rank-me { margin-left:8px; font-size:11px; }
-  .rank-tokens { display:flex; flex-direction:column; gap:3px; font-variant-numeric:tabular-nums; }
-  .rank-tokens strong { font-size:15px; }
-  .rank-tokens > span { font-size:11px; opacity:.7; overflow-wrap:anywhere; }
-  .rank-current td { background:rgba(168,97,60,.08)!important; }
-  .rank-table .n-pagination-item { min-width:44px; min-height:44px; }
-  .rank-table .n-pagination { flex-wrap:wrap; row-gap:8px; }
-  .invite-preview { background:rgba(127,127,127,.06); border-radius:10px; padding:16px; margin-top:16px; }
-  .invite-heading { margin:0 0 8px; font-size:15px; }
-  .invite-cost { font-variant-numeric:tabular-nums; }
-  .invite-stat { display:flex; flex-wrap:wrap; align-items:baseline; gap:12px; }
-  .registration-code .n-input, .registration-code .n-button { min-height:44px; }
-  .registration-code .n-input__input-el { height:42px; }
 </style>
+<link rel="stylesheet" href="/static/portal-console.css?v=token-trend-2">
 </head>
 <body>
 <div id="app"></div>
 <!-- /portal 从根路径提供,资源必须写绝对路径:相对路径会被解析成 /portal/... 而 404。 -->
 <script src="/static/vue.global.prod.js"></script>
 <script src="/static/naive-ui.prod.js"></script>
-<script src="/static/portal-shared.js"></script>
-<script src="/static/portal-pages.js"></script>
-<script src="/static/portal-admin.js"></script>
-<script src="/portal-app.js"></script>
+<script src="/static/portal-shared.js?v=token-trend-2"></script>
+<script src="/static/portal-pages.js?v=dashboard-clean-1"></script>
+<script src="/static/portal-admin.js?v=cache-ttl-3"></script>
+<script src="/static/portal-gpt.js?v=gpt-reset-direct-2"></script>
+<script src="/static/portal-pool.js?v=pool-reset-direct-2"></script>
+<script src="/portal-app.js?v=pool-live-metrics-2"></script>
 </body>
 </html>

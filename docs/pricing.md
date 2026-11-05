@@ -13,12 +13,18 @@ bit-api 用**结对单价制**：直接填真实美元单价，不用倍率制�
 2. model_pricing 表 · 分组专属 · prefix* 通配（多个匹配时取最长前缀）
 3. model_pricing 表 · 全局(group_id 为空) · 精确名 → prefix*
 4. LiteLLM 价目表（定时拉取的本地 JSON，官方模型自动有价）
-5. 兜底：免费（cost = 0）
+5. 缺价：在调用上游前返回 400
 ```
 
-最后一条是刻意的：**缺价时按免费计，绝不因为没配价而拒绝请求**。宁可漏收一次，不可让用户看到 500。
+路由、查价与记账统一使用模型的规范名称，兼容大小写和 `[1M]` 展示后缀。
+**缺价不能隐式免费**：须补齐价格，免费模型也须显式配置 `billing_mode=free`。
+缺价模型不在模型广场展示。
 
 配好之后在管理控制台的「定价列表」能看到所有条目及其生效范围。
+
+`gpt-image-2-web` 未单独配置价格时引用同分组 `gpt-image-2.5-flare` 的价格；
+修改 Flare 定价也会影响 Web 生图。Web 返回的 Token 用量由实际图片尺寸估算，
+账单标注“估算”，快照保留参考模型与尺寸，不会显示为上游实测用量。
 
 ## 三种计费模式
 
@@ -35,6 +41,22 @@ actual_cost = cost × group.rate_multiplier
 `rate_multiplier` 只做折扣（VIP 组 0.8 之类）。`usage_logs` 同时存 `cost`（原价）和 `actual_cost`（折后），所以调整倍率后历史账仍能解释。
 
 ## 长上下文阶梯价
+
+缓存读写按上游实际报告值分别计费。支持 OpenAI Chat 的
+`prompt_tokens_details.cached_tokens/cache_write_tokens`、Responses 的
+`input_tokens_details.cached_tokens/cache_write_tokens`，以及 Anthropic 的
+`cache_read_input_tokens/cache_creation_input_tokens`。OpenAI 总输入包含缓存，
+结算先扣除缓存部分再分别计价；转为 Anthropic 响应时同样只把普通输入放进 `input_tokens`。
+未上报的缓存量记为 `null`，日志显示 `—`；明确上报的 `0` 保留为 `0`。
+旧记录中无法区分来源的写入 `0` 显示为未知，不再从首次缓存命中推算写入，也不据此补扣历史费用。
+
+OpenAI `cache_write_tokens_details.ttl_30m_tokens/ttl_12h_tokens` 在 Chat、Responses、
+Anthropic 兼容入口与流式响应间保留。30 分钟按配置的缓存写价，12 小时按该价的 2 倍；
+长上下文和分组定价先选出实际生效的基础写价，再计算时长档，最后乘分组倍率。
+这对应官方 1.25× / 2.5× 普通输入价的比例，但不会覆盖本站已有的自定义单价。
+无分档、分档不完整或超过写入合计时，只按实际写入合计和基础写价结算；不根据请求 TTL 猜计量。
+只有完整分档且未提供合计时，才从两个上游计数相加取得写入合计。
+`cache_usage_version=3` 快照冻结分档有效性、各档 token、未分档余额与两档实际单价，日志可复算；历史账不重计。
 
 部分模型的单价随请求总量跳档：**总 token 超过阈值，本次请求的全部 token 都换用贵的那套单价**（不是分段累进，不像个税）。
 
@@ -62,7 +84,7 @@ total_ctx = input_tokens + cache_write_tokens + cache_read_tokens   # 不含 out
 
 ## 一键导入内置阶梯价
 
-`data/pricing_seed.json` 附了 11 条真实的阶梯定价（grok-4.5/4.6、gpt-5.6 系列、minimax-m3、gemini-3.1 等），来自生产环境实测。管理控制台「定价列表」里点「导入内置阶梯价」即可。
+`data/pricing_seed.json` 附了 11 条真实的阶梯定价（gpt-5.6 系列、minimax-m3、gemini-3.1 等），来自生产环境实测。管理控制台「定价列表」里点「导入内置阶梯价」即可。
 
 也可以用 API：
 
@@ -123,7 +145,7 @@ BITAPI_PRICING_REFRESH=86400                      # 刷新间隔（秒），0=�
 |---|---|---|
 | `balance` | `balance <= 0` → 402 | 扣 `users.balance`（走 credit_ledger） |
 | `quota` | 日/周/月用量超限 → 429 | 只记日志，不扣钱 |
-| `free` | 只查 RPM | 只记日志，不扣钱 |
+| `free` | 只查并发上限 | 只记日志，不扣钱 |
 
 `balance` 策略**允许透支**：本次请求可以把余额扣成负数，保证进行中的请求能完成；下一次请求由预检拦住。这是刻意的取舍 —— 见 README 的「关键设计决策」。
 

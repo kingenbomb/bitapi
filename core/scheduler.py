@@ -15,25 +15,28 @@ import time
 
 from core import db as dbmod
 from core.adapter import CAP_BALANCE, CAP_HEALTH, CAP_REFRESH, all_adapters
-from core.pool import classify_failure, refresh_fields
+from core.pool import apply_refresh, classify_failure
 
 
 def _check_one(db, adapter, acct, margin, min_balance):
     """同步检查单个账号,更新 DB 状态。跑在 to_thread 线程池里。"""
+    from core.account_runtime import network
+    with network(db, acct):
+        return _check_one_with_network(db, adapter, acct, margin, min_balance)
+
+
+def _check_one_with_network(db, adapter, acct, margin, min_balance):
     aid = acct["id"]
+    gpt = getattr(adapter, "name", None) == "gpt"
     try:
         # 1) token 惰性刷新
         if adapter.has(CAP_REFRESH):
             exp = acct.get("token_exp") or 0
             if not acct.get("token") or exp - time.time() < margin:
-                upd = adapter.refresh_token(acct)
-                db.update_account(aid, **refresh_fields(upd, acct))
-                acct["token"] = upd["token"]
-                if upd.get("secret"):
-                    acct["secret"] = upd["secret"]
+                apply_refresh(db, acct, adapter.refresh_token(acct))
 
         # 1.5) 强探活(可选):adapter 声明了 verify_alive 则先校验账号是否仍有效
-        #      (有的上游删号后余额接口仍返回非 None,只有走一次真登录才认得出)。
+        #      (如 Kogo 后台删号后 GraphQL 余额仍返回非 None,只有 NextAuth 登录链能识别)。
         #      放 balance 之前,避免失效账号走完余额检查才暴露。
         if hasattr(adapter, "verify_alive") and not adapter.verify_alive(acct):
             db.set_status(aid, dbmod.ST_DEAD)
@@ -49,8 +52,8 @@ def _check_one(db, adapter, acct, margin, min_balance):
                 return dbmod.ST_COOLDOWN
             exhausted_status = (dbmod.ST_DEAD if getattr(adapter, "exhausted_is_dead", False)
                                 else dbmod.ST_EXHAUSTED)
-            # 门槛按渠道取:计量单位不是美元的渠道(比如按 credits 计价),
-            # 拿全局那个按美元定的门槛判,额度不够的号会一直留在 active 里。
+            # 门槛按渠道取:按 credits 计价的渠道(clipfly)最便宜一次要 2 分,
+            # 拿全局那个按美元定的 0.05 判,额度不够的号会一直留在 active 里。
             floor = getattr(adapter, "min_balance", None)
             if floor is None:
                 floor = min_balance
@@ -64,15 +67,26 @@ def _check_one(db, adapter, acct, margin, min_balance):
             db.set_status(aid, st)
             return st
         else:
+            if gpt and acct["status"] in (dbmod.ST_COOLDOWN, dbmod.ST_UNCHECKED):
+                # A valid local expiry is not proof that revoked credentials work.
+                from core.gpt_runtime import save_usage
+                save_usage(db, acct, adapter.account_usage(acct))
+                db.update_account(aid, status=dbmod.ST_ACTIVE, last_error="", last_check=int(time.time()))
+                return "active"
             db.set_status(aid, dbmod.ST_ACTIVE)
             return "active"
     except Exception as e:
+        if gpt:
+            from core.gpt_request_policy import mark_failure
+            mark_failure(db, aid, e, phase="refresh")
+            return db.get_account(aid)["status"]
         # 巡检里的异常绝大多数是「这次问不到」,不是「这个号废了」,判定口径必须和
         # 网关热路径同一套(core/pool.classify_failure):判不准按 cooldown,下一轮
         # 巡检会纠正;判成 dead 就永久没了 —— dead 不再被巡检、不再被取号、没有
-        # 恢复接口。踩过一次:进程 fd 耗尽(EMFILE),连出站 socket 都开不出来,
-        # 原来这里的 except Exception → dead 把一整轮扫到的号全写成死号,事后抽样
-        # 验证全都还能登录。见 tests/test_scheduler_scan_pool.py。
+        # 恢复接口。2026-09-05 fd 耗尽那次,进程连出站 socket 都开不出来(同样是
+        # EMFILE),原来这里的 except Exception → dead 把一轮扫到的号全写成死号:
+        # kogo 107 个、magicpatterns 104 个、xai 1000 个,两分钟内约 1250 个好号
+        # 集体退场,事后抽样验证全都还能登录。见 tests/test_scheduler_scan_pool.py。
         st = (dbmod.ST_DEAD if classify_failure(e) == "terminal"
               else dbmod.ST_COOLDOWN)
         db.set_status(aid, st)
@@ -96,7 +110,7 @@ async def scan_once(db, concurrency, margin, min_balance, log=print, channel=Non
         ad = adapters.get(channel)
         adapters = {channel: ad} if ad else {}
 
-    # 有外部号源的渠道:先增量同步一次,不进 per-account 巡检
+    # 文件型号池:增量同步一次(mtime 跳过未变、批量入库),不进 per-account 巡检
     for name, adapter in adapters.items():
         if getattr(adapter, "exhausted_is_dead", False):
             exhausted = db.list_accounts(channel=name, status=dbmod.ST_EXHAUSTED,
@@ -122,13 +136,15 @@ async def scan_once(db, concurrency, margin, min_balance, log=print, channel=Non
                 log(f"[scan] {name} scan_pool error: {e}")
 
     for channel, adapter in adapters.items():
-        # 转发型 / 有外部号源的渠道:健康由 sync_pool 与上游自己负责,不逐号网络巡检
+        # proxy 型 / 文件型号池:健康由 sync_pool + 上游引擎负责,不逐号网络巡检
         # (否则万级号 = 万次 set_status,1 核直接打满)
         if getattr(adapter, "proxy", False) or hasattr(adapter, "sync_pool"):
             continue
-        accts = (db.list_accounts(channel=channel, status=dbmod.ST_ACTIVE, schedulable=1)
-                 + db.list_accounts(channel=channel, status=dbmod.ST_UNCHECKED, schedulable=1)
-                 + db.list_accounts(channel=channel, status=dbmod.ST_COOLDOWN, schedulable=1))
+        def load_accounts():
+            return (db.list_accounts(channel=channel, status=dbmod.ST_ACTIVE) +
+                    db.list_accounts(channel=channel, status=dbmod.ST_UNCHECKED) +
+                    db.list_accounts(channel=channel, status=dbmod.ST_COOLDOWN))
+        accts = await asyncio.to_thread(load_accounts)
         for acct in accts:
             tasks.append(guarded(adapter, acct))
 

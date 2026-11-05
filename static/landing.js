@@ -18,9 +18,7 @@
   paintTheme();
   document.getElementById("year").textContent = new Date().getFullYear();
 
-  var ORIGIN = /^https?:$/.test(location.protocol) ? location.origin : "http://127.0.0.1:8080";
-  var ENDPOINT = ORIGIN + "/v1";
-  document.getElementById("api-endpoint").textContent = ENDPOINT;
+  var ORIGIN = /^https?:$/.test(location.protocol) ? location.origin : "https://ai.baipiao.co";
   var MODEL = { chat: "YOUR_MODEL_ID", claude: "YOUR_MODEL_ID" };
   // Model names are quoted separately so a catalog entry cannot break sample syntax.
   var SAMPLES = {
@@ -140,7 +138,7 @@
     copy(pre.textContent, "代码已复制，填入你的密钥即可开始");
   });
   document.getElementById("endpoint-copy").addEventListener("click", function () {
-    copy(ENDPOINT, "API 端点已复制");
+    copy("https://ai.baipiao.co/v1", "API 端点已复制");
   });
 
   // Keep provider identification aligned with static/portal-shared.js.
@@ -150,8 +148,7 @@
     [/gemma/, "Gemma", "gemma-color", 0],
     [/gemini|learnlm/, "Google", "gemini-color", 0],
     [/veo-|nano-banana/, "Google", "google-color", 0],
-    [/grok|\bxai\b/, "xAI", "grok", 1],
-    [/minimax|abab/, "MiniMax", "minimax-color", 0],
+      [/minimax|abab/, "MiniMax", "minimax-color", 0],
     [/deepseek/, "DeepSeek", "deepseek-color", 0],
     [/qwen|qwq/, "Qwen", "qwen-color", 0],
     [/glm|chatglm/, "Zhipu", "zhipu-color", 0],
@@ -162,8 +159,7 @@
     [/seedream|seedance/, "ByteDance", "bytedance-color", 0],
     [/\bwan-/, "Alibaba", "alibaba-color", 0],
     [/pixverse/, "PixVerse", "pixverse-color", 0],
-    [/nvidia|nvcf/, "NVIDIA", "nvidia-color", 0],
-    [/poolside|laguna/, "Poolside", "poolside", 1]
+      [/poolside|laguna/, "Poolside", "poolside", 1]
   ];
   function providerOf(model) {
     var match = PROV.find(function (p) { return p[0].test(String(model || "").toLowerCase()); });
@@ -186,15 +182,14 @@
     var providers = new Map();
     var lowest = null;
     rows.forEach(function (row) {
-      (Array.isArray(row.channels) && row.channels.length ? row.channels : [row.channel])
-        .forEach(function (channel) { if (channel) channels.add(channel); });
+      if (row.channel) channels.add(row.channel);
       if (row.billing_mode === "token" && Number.isFinite(row.input_price) && row.input_price >= 0)
         lowest = lowest === null ? row.input_price : Math.min(lowest, row.input_price);
       var provider = providerOf(row.model);
       if (provider) providers.set(provider.name, provider);
     });
     set("n-models", rows.length);
-    set("n-ch", channels.size);
+    /* 渠道数不再对外展示 */
     set("n-price", lowest === null ? "—" : money(data.policy === "free" ? 0 : lowest * multiplier));
     var note = ["实时目录 · 单价单位：美元 / 1M token。"];
     note.push(data.group ? "按「" + data.group + "」分组口径。" : "按默认分组口径。");

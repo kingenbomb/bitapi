@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """白嫖社区 community-connect 的服务端 OAuth 客户端。"""
+import base64
 import hashlib
 import secrets
 import urllib.parse
@@ -39,30 +40,32 @@ def _url(path):
     return config.COMMUNITY_BASE_URL.rstrip("/") + path
 
 
-def _api_url(path):
-    """插件的 REST 命名空间由 COMMUNITY_API_PREFIX 定(各站可以改过名)。"""
-    return _url("/api/" + config.COMMUNITY_API_PREFIX.strip("/") + path)
-
-
-def authorize_url(state):
+def authorize_url(state, code_verifier):
     _configured()
     query = urllib.parse.urlencode({
         "client_id": config.COMMUNITY_CLIENT_ID,
         "redirect_uri": config.COMMUNITY_REDIRECT_URI,
         "state": state,
+        "response_type": "code",
+        "scope": "openid profile email",
+        "code_challenge": base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode("ascii")).digest()
+        ).rstrip(b"=").decode("ascii"),
+        "code_challenge_method": "S256",
     })
-    return _url("/community-connect") + "?" + query
+    return _url("/connect/authorize") + "?" + query
 
 
-def exchange_code(code):
+def exchange_code(code, code_verifier):
     """授权码只在服务端换短 access token；错误正文不向浏览器透传。"""
     _configured()
     try:
         response = httpx.post(
-            _api_url("/token"),
+            _url("/api/connect/token"),
             data={
                 "grant_type": "authorization_code",
                 "code": code,
+                "code_verifier": code_verifier,
                 "client_id": config.COMMUNITY_CLIENT_ID,
                 "client_secret": config.COMMUNITY_CLIENT_SECRET,
                 "redirect_uri": config.COMMUNITY_REDIRECT_URI,
@@ -83,10 +86,10 @@ def exchange_code(code):
 
 
 def get_userinfo(access_token):
-    """返回已验证且可用的社区资料；稳定身份键只取 userinfo.id。"""
+    """以固定社区 issuer 的 sub 绑定身份；与旧接口 id 相同，保留原绑定。"""
     try:
         response = httpx.get(
-            _api_url("/userinfo"),
+            _url("/api/connect/userinfo"),
             headers={"Authorization": "Bearer " + access_token},
             timeout=config.COMMUNITY_HTTP_TIMEOUT,
             follow_redirects=False)
@@ -99,14 +102,19 @@ def get_userinfo(access_token):
         raise CommunityAuthError("community userinfo request failed") from e
     if not isinstance(payload, dict):
         raise CommunityAuthError("community userinfo response is invalid")
-    subject = str(payload.get("id") or "").strip()
-    username = str(payload.get("username") or "").strip()
+    subject = str(payload.get("sub") or "").strip()
+    username = str(payload.get("preferred_username") or payload.get("username") or "").strip()
     name = str(payload.get("name") or username).strip()
     email = str(payload.get("email") or "").strip().lower()
     if (not subject.isdigit() or int(subject) <= 0 or not username or
             not email or "@" not in email or
             payload.get("email_verified") is not True or
-            payload.get("active") is not True):
+            payload.get("active") is not True or payload.get("silenced") is True or
+            ("id" in payload and str(payload["id"]) != subject)):
         raise CommunityAuthError("community userinfo response is invalid")
+    # 社区页面等级与 trust_level 不同；缺失时仅允许既有账号登录/绑定。
+    level = payload.get("community_level")
+    if type(level) is not int or not 0 <= level <= 6:
+        level = None
     return {"id": subject, "username": username, "name": name,
-            "email": email}
+            "email": email, "community_level": level}

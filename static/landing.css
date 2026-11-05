@@ -15,5 +15,3 @@ html.dark{--paper:#1e221d;--ink:#f5f4ee;--muted:#b1b6ab;--rule:#454b40;color-sch
 .final-cta a:focus-visible{outline-color:#20211f}
 @media(max-width:430px){#n-price{font-size:clamp(22px,6.7vw,29px);letter-spacing:-1px}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{transition:none!important}}
-/* Self-hosted deployments can have long hostnames. */
-.endpoint-card>div{min-width:0}.endpoint-card code{display:block;overflow-wrap:anywhere}

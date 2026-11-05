@@ -12,6 +12,7 @@ core 在关键节点 emit 事件,插件用 @on 挂载。插件异常被捕获并
   code.redeemed     兑换码成功占用并发放后        code, user, inviter
   usage.recorded    一次请求结算完成             log, user, group, cost
   balance.changed   任何 ledger 写入后           user_id, delta, reason, balance_after
+  share.key_accepted 用户共享的 key 验活入库并发奖  user_id, channel, identity, amount
 
 运维事实(告警插件订阅;core 只发不判该不该通知):
   pool.empty        某渠道取不到号               channel, reason
@@ -20,6 +21,8 @@ core 在关键节点 emit 事件,插件用 @on 挂载。插件异常被捕获并
   backup.failed     库备份失败                   error
   mail.failed       SMTP 发信失败                to, error
   auth.throttled    登录/注册/找回触发限速         scope, key, retry_after
+  model.failed      小时级模型巡检发现检测失败      channel, model, error
+  model.recovered   小时级模型巡检中恢复通过        channel, model
 """
 import traceback
 

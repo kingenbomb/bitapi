@@ -4,7 +4,6 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ.setdefault("BITAPI_DB", os.path.join(_TMP, "p.db"))
-os.environ.setdefault("BITAPI_GROK_AUTH_DIR", os.path.join(_TMP, "nx"))
 
 from core.pricing import (MODE_FREE, MODE_PER_REQUEST, MODE_TOKEN,  # noqa: E402
                           TIER_LONG, TIER_OFFICIAL, Pricing)
@@ -24,17 +23,17 @@ class ResolveChainTest(unittest.TestCase):
         self.p = Pricing(self.db, catalog=None, cache_ttl=0)
 
     def test_exact_beats_prefix(self):
-        self.db.upsert_pricing("demo-*", None, input_price=1, output_price=1)
-        self.db.upsert_pricing("demo-sol", None, input_price=9, output_price=9)
-        self.assertEqual(self.p.resolve("demo-sol")["input_price"], 9)
-        self.assertEqual(self.p.resolve("demo-other")["input_price"], 1)
+        self.db.upsert_pricing("fixture-*", None, input_price=1, output_price=1)
+        self.db.upsert_pricing("fixture-sol", None, input_price=9, output_price=9)
+        self.assertEqual(self.p.resolve("fixture-sol")["input_price"], 9)
+        self.assertEqual(self.p.resolve("fixture-other")["input_price"], 1)
 
     def test_longest_prefix_wins(self):
         self.db.upsert_pricing("*", None, input_price=1)
-        self.db.upsert_pricing("demo-*", None, input_price=2)
-        self.db.upsert_pricing("demo-gpt-*", None, input_price=3)
-        self.assertEqual(self.p.resolve("demo-gpt-5")["input_price"], 3)
-        self.assertEqual(self.p.resolve("demo-abc")["input_price"], 2)
+        self.db.upsert_pricing("fixture-*", None, input_price=2)
+        self.db.upsert_pricing("fixture-gpt-*", None, input_price=3)
+        self.assertEqual(self.p.resolve("fixture-gpt-5")["input_price"], 3)
+        self.assertEqual(self.p.resolve("fixture-abc")["input_price"], 2)
         self.assertEqual(self.p.resolve("zzz")["input_price"], 1)
 
     def test_group_overrides_global(self):
@@ -44,7 +43,7 @@ class ResolveChainTest(unittest.TestCase):
         self.assertEqual(self.p.resolve("m1", self.gid)["input_price"], 1)
         self.assertEqual(self.p.resolve("m1", self.gid)["source"], "group")
 
-    def test_catalog_fallback_then_free(self):
+    def test_catalog_fallback_then_reject_missing_price(self):
         class Cat:
             @staticmethod
             def lookup(model):
@@ -56,15 +55,37 @@ class ResolveChainTest(unittest.TestCase):
 
         p = Pricing(self.db, catalog=Cat(), cache_ttl=0)
         self.assertEqual(p.resolve("gpt-x")["source"], "litellm")
-        free = p.resolve("never-heard-of-it")
-        self.assertEqual(free["billing_mode"], MODE_FREE)
-        self.assertEqual(free["source"], "fallback")
+        with self.assertRaisesRegex(ValueError, "pricing not configured"):
+            p.resolve("never-heard-of-it")
+
+    def test_web_image_references_flare_in_the_same_group(self):
+        self.db = _db("web-price-reference.db")
+        self.gid = self.db.create_group(name="web-price-reference", supported_models=["*"])
+        self.p = Pricing(self.db, cache_ttl=0)
+        self.db.upsert_pricing("gpt-image-2.5-flare", None, billing_mode=MODE_TOKEN, input_price=5, output_price=30)
+        self.db.upsert_pricing("gpt-image-2.5-flare", self.gid, billing_mode=MODE_TOKEN, input_price=2, output_price=12)
+        self.assertEqual(self.p.resolve("gpt-image-2-web")["output_price"], 30)
+        priced = self.p.resolve("gpt-image-2-web", self.gid)
+        self.assertEqual(priced["output_price"], 12)
+        self.assertEqual(priced["pricing_model"], "gpt-image-2.5-flare")
+        _, _, snapshot = Pricing.compute(priced, in_tok=10, out_tok=1000)
+        self.assertEqual(snapshot["pricing_model"], "gpt-image-2.5-flare")
+        self.db.upsert_pricing("gpt-image-2.5-flare", self.gid, billing_mode=MODE_TOKEN, output_price=15)
+        self.assertEqual(self.p.resolve("gpt-image-2-web", self.gid)["output_price"], 15)
+
+    def test_explicit_web_image_price_retains_existing_priority(self):
+        self.db = _db("web-price-override.db")
+        self.p = Pricing(self.db, cache_ttl=0)
+        self.db.upsert_pricing("gpt-image-2.5-flare", None, billing_mode=MODE_TOKEN, output_price=30)
+        self.db.upsert_pricing("gpt-image-2-web", None, billing_mode=MODE_PER_REQUEST, per_request_price=0.02)
+        self.assertEqual(self.p.resolve("gpt-image-2-web")["billing_mode"], MODE_PER_REQUEST)
+        self.assertEqual(self.p.resolve("gpt-image-2-web")["per_request_price"], 0.02)
 
 
 class ComputeTest(unittest.TestCase):
     """long_* 参数直接以 dict 形式喂给 compute,与 DB 解耦。"""
 
-    SOL = {  # 长上下文档:输入 ×2 输出 ×1.5,倍数不一致
+    SOL = {  # 虚构阶梯价格：输入 ×2、输出 ×1.5，用于验证独立跳档
         "billing_mode": MODE_TOKEN, "source": "global",
         "input_price": 5, "output_price": 30,
         "cache_read_price": 0.5, "cache_write_price": 6.25,
@@ -159,7 +180,7 @@ class ComputeTest(unittest.TestCase):
 
 
 class SeedDataTest(unittest.TestCase):
-    """内置官网价可直接解析、也可导入管理端。"""
+    """当前内置价格可直接解析、导入管理端，且不含已退役别名。"""
 
     @staticmethod
     def _rows():
@@ -170,34 +191,53 @@ class SeedDataTest(unittest.TestCase):
 
     def test_seed_file_loads_and_prices_correctly(self):
         rows = self._rows()
-        self.assertTrue(rows)
         self.assertEqual(len(rows), len({r["model_pattern"] for r in rows}))
         by_model = {r["model_pattern"]: r for r in rows}
+        required = {"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+                    "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
+        self.assertFalse(required - by_model.keys())
+        self.assertFalse({name for name in by_model if name == "kg" or name.startswith("kg-")})
 
-        # grok-4.6:总上下文超过 199999 后输入/输出/缓存都进长上下文档
-        g = dict({"billing_mode": MODE_TOKEN}, **by_model["grok-4.6"])
-        _, _, s1 = Pricing.compute(g, in_tok=199999, out_tok=10)
+        # GPT 原生名称仍保留长上下文阶梯价格。
+        g = by_model["gpt-5.6-sol"]
+        _, _, s1 = Pricing.compute(g, in_tok=272000, out_tok=10)
         self.assertEqual(s1["tier"], TIER_OFFICIAL)
-        self.assertEqual(s1["input_price"], 2)
-        _, _, s2 = Pricing.compute(g, in_tok=200000, out_tok=10)
+        self.assertEqual(s1["input_price"], 4)
+        _, _, s2 = Pricing.compute(g, in_tok=272001, out_tok=10)
         self.assertEqual(s2["tier"], TIER_LONG)
-        self.assertEqual((s2["input_price"], s2["output_price"]), (4, 12))
-        self.assertEqual(s2["cache_read_price"], 1)
+        self.assertEqual((s2["input_price"], s2["output_price"]), (8, 30))
+        self.assertEqual(s2["cache_read_price"], 0.8)
 
-        # 缓存价两档不同:普通档 0.3,长档 0.6
-        g5 = dict({"billing_mode": MODE_TOKEN}, **by_model["grok-4.5"])
-        _, _, c1 = Pricing.compute(g5, in_tok=1000, cache_read=1000)
-        self.assertEqual(c1["cache_read_price"], 0.3)
-        _, _, c2 = Pricing.compute(g5, in_tok=200000, cache_read=1000)
-        self.assertEqual(c2["cache_read_price"], 0.6)
+        terra = by_model["gpt-5.6-terra"]
+        _, _, s3 = Pricing.compute(terra, in_tok=272001)
+        self.assertEqual(s3["tier"], TIER_LONG)
+        self.assertEqual((s3["input_price"], s3["output_price"]), (4, 18))
+        self.assertEqual((s3["cache_read_price"], s3["cache_write_price"]), (0.4, 5))
 
-        # 都是文本模型,必须按 Token 计费
+        # 保留不同渠道公开型号各自的价格。
+        self.assertEqual(by_model["DeepSeek-V4-Flash"]["input_price"], 0.14)
+        self.assertEqual(by_model["DeepSeek-V4-Flash"]["output_price"], 0.28)
+        self.assertEqual(by_model["deepseek-ai/deepseek-v4.1-flash"]["input_price"], 0.3)
+        self.assertEqual(by_model["deepseek-ai/deepseek-v4.1-flash"]["output_price"], 1.2)
+
+        for name in ("gpt-image-2.5-flare", "gpt-image-2.5-sunburst"):
+            image = by_model[name]
+            self.assertEqual(image["billing_mode"], MODE_TOKEN)
+            self.assertEqual((image["input_price"], image["output_price"], image["cache_read_price"]), (5, 30, 1.25))
+
+        # 这三个都是文本模型，必须按 Token 计费
+        gemma = by_model["google/gemma-4-31b-it"]
+        self.assertEqual(gemma["billing_mode"], MODE_TOKEN)
+        self.assertEqual((gemma["input_price"], gemma["output_price"]), (0.09, 0.34))
+        minimax = by_model["minimaxai/minimax-m3.1-flash"]
+        self.assertEqual(minimax["billing_mode"], MODE_TOKEN)
+        self.assertEqual((minimax["input_price"], minimax["output_price"]), (0.15, 0.6))
+
         for r in rows:
-            self.assertEqual(r["billing_mode"], MODE_TOKEN, r["model_pattern"])
-
-        # 任何一条都不允许价回落成 0,长档不得低于普通档
-        for r in rows:
-            self.assertGreater(r["input_price"] + r["output_price"], 0)
+            if r["billing_mode"] == MODE_PER_REQUEST:
+                self.assertGreater(r["per_request_price"], 0)
+            else:
+                self.assertGreater(r["input_price"] + r["output_price"], 0)
             if r.get("long_threshold"):
                 if r.get("long_input_price") is not None:
                     self.assertGreaterEqual(r["long_input_price"], r["input_price"])
@@ -212,28 +252,42 @@ class SeedDataTest(unittest.TestCase):
                               **{k: v for k, v in r.items() if k != "model_pattern"})
         stored = {r["model_pattern"]: r for r in db.list_pricing(None)}
         self.assertEqual(len(stored), len(rows))
-        g = stored["grok-4.6"]
-        self.assertEqual(g["long_threshold"], 199999)
-        self.assertEqual(g["input_price"], 2)
-        self.assertEqual(g["long_input_price"], 4)
+        for row in rows:
+            for field, value in row.items():
+                with self.subTest(model=row["model_pattern"], field=field):
+                    self.assertEqual(stored[row["model_pattern"]][field], value)
+        sol = stored["gpt-5.6-sol"]
+        self.assertEqual(sol["long_threshold"], 272000)
+        self.assertEqual(sol["input_price"], 4)
+        self.assertEqual(sol["long_input_price"], 8)
+        self.assertEqual(sol["long_cache_write_price"], 10)
         p = Pricing(db, catalog=None, cache_ttl=0)
-        _, _, snap = Pricing.compute(p.resolve("grok-4.6"), in_tok=300000)
+        _, _, snap = Pricing.compute(p.resolve("gpt-5.6-sol"), in_tok=300000)
         self.assertEqual(snap["tier"], TIER_LONG)
-        self.assertEqual(snap["input_price"], 4)
+        self.assertEqual(snap["input_price"], 8)
 
-    def test_builtin_catalog_loads_and_admin_overrides(self):
+    def test_builtin_catalog_prices_current_models_and_honors_overrides(self):
         pricing_catalog._load_builtin()
         db = _db("official-catalog.db")
         p = Pricing(db, catalog=Catalog(), cache_ttl=0)
 
-        g = p.resolve("grok-4.6")
-        self.assertEqual(g["source"], "builtin")
-        self.assertEqual((g["input_price"], g["output_price"]), (2, 6))
+        sol = p.resolve("gpt-5.6-sol")
+        self.assertEqual(sol["source"], "builtin")
+        self.assertEqual((sol["input_price"], sol["output_price"]), (4, 20))
+
+        web = p.resolve("gpt-image-2-web")
+        self.assertEqual(web["source"], "builtin")
+        self.assertEqual(web["pricing_model"], "gpt-image-2.5-flare")
+        self.assertEqual((web["input_price"], web["output_price"]), (5, 30))
+
+        flash = p.resolve("minimaxai/minimax-m3.1-flash")
+        self.assertEqual(flash["source"], "builtin")
+        self.assertEqual((flash["input_price"], flash["output_price"]), (0.15, 0.6))
 
         # 管理员显式设置仍覆盖内置目录价
-        db.upsert_pricing("grok-4.6", None, billing_mode=MODE_TOKEN,
-                          input_price=9.9, output_price=9.9)
-        self.assertEqual(p.resolve("grok-4.6")["input_price"], 9.9)
+        db.upsert_pricing("minimaxai/minimax-m3.1-flash", None, billing_mode=MODE_TOKEN,
+                          input_price=0.2, output_price=0.6)
+        self.assertEqual(p.resolve("minimaxai/minimax-m3.1-flash")["input_price"], 0.2)
 
 
 if __name__ == "__main__":
