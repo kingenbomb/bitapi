@@ -10,8 +10,7 @@
   bit-api-icon-32.png    favicon
   bit-api-icon-180.png   apple-touch-icon,同时给顶栏 brandmark(30 px CSS 到 6× 屏都够)
 
-换母版(v4、改配色)之后跑一遍这个脚本重新生成,别手改产物 ——
-deploy.ps1 会在部署时校验图标哈希,产物和母版对不上时那条校验才有意义。
+换母版(v4、改配色)之后跑一遍这个脚本重新生成,别手改产物。
 
 依赖 Pillow,只此一处用到,所以没进 requirements(运行时和 CI 都不需要它):
     python -m pip install Pillow && python scripts/make_icons.py

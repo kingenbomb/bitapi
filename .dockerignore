@@ -15,8 +15,6 @@ backups/
 tests/
 docs/
 deploy/
-deploy.ps1
-deploy.cmd
 poolgate.db*
 data/*
 !data/pricing_seed.json

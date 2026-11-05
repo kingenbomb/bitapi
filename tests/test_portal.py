@@ -1953,40 +1953,5 @@ class AppSchemaTest(unittest.TestCase):
                 with self.subTest(file=name):
                     self.assertNotIn(master, open(path, encoding="utf-8").read())
 
-    def test_deploy_checks_archive_and_icon_before_activation(self):
-        """部署要校验的是「浏览器真会去取的图标」,不是仓里最大的那个文件。
-
-        母版页面已经不引了,校验它挡不住任何用户看得见的损坏 —— 而半截 PNG
-        照样能过 /health,只有访客的浏览器解不出来。所以这里把 deploy.ps1 的
-        校验清单和页面声明的图标绑在一起:页面换图标而部署清单没跟上就报红。
-        """
-        import re
-        root = os.path.dirname(os.path.abspath(server.__file__))
-        script = open(os.path.join(root, "deploy.ps1"),
-                      encoding="utf-8").read()
-        self.assertIn(".deploy-source.tar.gz", script)
-        self.assertIn("set -o pipefail", script)
-        self.assertIn("tar -tzf '$remoteArchive'", script)
-        self.assertIn("sha256sum '$remoteArchive'", script)
-        # 逐文件比对:包内哈希 vs 落盘哈希
-        self.assertIn('tar -xOzf \'$remoteArchive\' `"`$f`"', script)
-        self.assertIn('sha256sum `"$DeployPath/`$f`"', script)
-
-        m = re.search(r'\$verifyFiles = "([^"]+)"', script)
-        self.assertIsNotNone(m, "deploy.ps1 里找不到 $verifyFiles 清单")
-        listed = set(m.group(1).split())
-        declared = set()
-        for page in ("portal.html",):
-            html = open(os.path.join(root, page), encoding="utf-8").read()
-            for href in re.findall(r'<link rel="(?:icon|apple-touch-icon)"'
-                                   r'[^>]*href="/static/([^"]+)"', html):
-                declared.add("static/" + href)
-        self.assertTrue(declared, "页面里没解析出图标声明")
-        self.assertEqual(declared - listed, set(),
-                         "页面声明了图标但部署没校验它")
-        self.assertNotIn("static/bit-api-icon-v3.png", listed,
-                         "母版不该在校验清单里 —— 浏览器根本不取它")
-
-
 if __name__ == "__main__":
     unittest.main()
