@@ -428,13 +428,13 @@ class PoolApiTest(unittest.TestCase):
             normalize_proxy_url("host:8080:user:1234")
 
     def test_legacy_proxy_form_accepts_compact_credentials_without_format(self):
-        compact = "gate-sg.ipfoxy.io:58688:customer-fixture-cc-US-sessid-1793691991_10000:fixture-password"
+        compact = "proxy.example.test:58688:customer-fixture-cc-US-sessid-1000_10000:fixture-password"
         response = self.client.post("/api/admin/pool/proxies", headers=self.admin,
             json={"name": "Legacy compact fixture", "url": compact})
         self.assertEqual(response.status_code, 200, response.text)
         proxy = next(p for p in response.json()["proxies"] if p["name"] == "Legacy compact fixture")
         self.assertEqual(pool_state.DB.get_pool_proxy(proxy["id"])["url"],
-            "http://customer-fixture-cc-US-sessid-1793691991_10000:fixture-password@gate-sg.ipfoxy.io:58688")
+            "http://customer-fixture-cc-US-sessid-1000_10000:fixture-password@proxy.example.test:58688")
         self.assertNotIn("fixture-password", response.text)
         self.assertEqual(self.client.post("/api/admin/pool/proxies", headers=self.admin,
             json={"name": "Explicit URL fixture", "url": compact, "format": "url"}).status_code, 400)
