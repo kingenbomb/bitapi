@@ -147,6 +147,8 @@ class AdminResetPwReq(BaseModel):
 
 class SettingsReq(BaseModel):
     require_invite: bool | None = None
+    # 总开关:True 时任何入口都不再建号。None = 本次不改。
+    registration_closed: bool | None = None
     default_group: str | None = None
     community_min_level: int | None = Field(default=None, strict=True, ge=0, le=6)
     checkin_min: float | None = None

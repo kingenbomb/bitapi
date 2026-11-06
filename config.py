@@ -50,6 +50,9 @@ JWT_TTL = env_int("JWT_TTL", 7 * 24 * 3600)             # 会话有效期(秒)
 DEFAULT_GROUP = env("DEFAULT_GROUP", "free")            # 新用户默认套餐组名
 AUTH_CACHE_TTL = env_int("AUTH_CACHE_TTL", 10)          # key→user/group 缓存秒数
 REQUIRE_INVITE = env_bool("REQUIRE_INVITE", True)       # 强制邀请码注册
+# 总开关:关掉之后任何入口都不再建新号。它在 require_invite / community 之上 ——
+# 那两个决定「谁能注册」,这个决定「还能不能注册」。
+REGISTRATION_CLOSED = env_bool("REGISTRATION_CLOSED", False)
 COMMUNITY_REGISTRATION_ONLY = env_bool("COMMUNITY_REGISTRATION_ONLY", False)
 COMMUNITY_MIN_LEVEL = env_int("COMMUNITY_MIN_LEVEL", 3)
 if not 0 <= COMMUNITY_MIN_LEVEL <= 6:

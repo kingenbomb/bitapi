@@ -55,7 +55,8 @@
       const cfg = ref({});
       const groups = ref([]);
       const chans = ref([]);
-      const form = reactive({ require_invite: false, default_group: null,
+      const form = reactive({ require_invite: false, registration_closed: false,
+        default_group: null,
         community_min_level: null });
       const levelOptions = Array.from({ length: 7 }, (_, level) => ({
         label: level === 0 ? "Lv0 及以上 · 所有有效等级" : `Lv${level} 及以上`,
@@ -98,6 +99,7 @@
         chans.value = r[2].channels || [];
         backup.value = r[3] || {};
         form.require_invite = !!r[0].require_invite;
+        form.registration_closed = !!r[0].registration_closed;
         form.default_group = r[0].default_group;
         form.community_min_level = r[0].registration_policy.community_min_level;
         pay.payment_providers = (r[0].payment_providers || []).slice();
@@ -168,6 +170,7 @@
       const isDb = (k) => !!(cfg.value.from_db || {})[k];
       const dirty = computed(() => !!cfg.value.defaults &&
         (form.require_invite !== !!cfg.value.require_invite ||
+          form.registration_closed !== !!cfg.value.registration_closed ||
           form.default_group !== cfg.value.default_group || levelDirty.value));
       const payDirty = computed(() => {
         const c = cfg.value;
@@ -301,6 +304,8 @@
         const body = {};
         if (form.require_invite !== !!cfg.value.require_invite)
           body.require_invite = form.require_invite;
+        if (form.registration_closed !== !!cfg.value.registration_closed)
+          body.registration_closed = form.registration_closed;
         if (form.default_group !== cfg.value.default_group)
           body.default_group = form.default_group;
         if (levelDirty.value) body.community_min_level = form.community_min_level;
@@ -311,6 +316,16 @@
             .catch((e) => { msg.error(e.message); return false; })
             .finally(() => { saving.value = false; });
         };
+        if (body.registration_closed === true) {
+          return dlg.warning({
+            title: "关闭注册",
+            content: "保存后任何入口都不再创建新账号：邮箱注册、验证码发送、"
+              + "社区授权注册都会返回「站点已关闭注册」。"
+              + "既有账号登录、绑定社区、找回密码都不受影响，随时能重新打开。",
+            positiveText: "关闭注册", negativeText: "取消",
+            onPositiveClick: apply,
+          });
+        }
         if (!levelDirty.value) return apply();
         dlg.warning({
           title: "调整社区注册门槛",
@@ -423,6 +438,18 @@
   <div class="admin-settings-content">
   <section v-show="section === 'registration'"><n-card size="small" title="注册与默认分组">
     <n-space vertical :size="18">
+      <n-space justify="space-between" align="center">
+        <div>
+          <div style="font-size:13px">关闭注册</div>
+          <n-text depth="3" style="font-size:11.5px">
+            开启后任何入口都不再创建新账号，已有账号不受影响；
+            社区授权注册也会被拦下，只剩登录与绑定</n-text>
+        </div>
+        <n-switch v-model:value="form.registration_closed"/>
+      </n-space>
+      <n-alert v-if="form.registration_closed" type="warning" :bordered="false">
+        注册已关闭：下方的邀请码与社区门槛暂时不生效，重新打开即恢复。
+      </n-alert>
       <n-alert v-if="cfg.registration_policy && cfg.registration_policy.community_only" type="info" :bordered="false">
         仅支持白嫖社区授权注册，无需邀请码。下方门槛只影响社区新账号。
       </n-alert>

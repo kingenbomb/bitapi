@@ -189,6 +189,13 @@
         </div>
       </n-space>
     </n-form>
+    <section v-if="reg && registrationPolicy && registrationPolicy.closed"
+      class="signup-content" aria-label="当前已关闭注册">
+      <h1 class="signup-title">当前已关闭注册</h1>
+      <p class="signup-intro">站点暂时不再接受新账号。已有账号可以正常登录。</p>
+      <n-button class="signup-primary" type="primary" block tag="a" href="#/login">返回登录</n-button>
+      <p class="signup-verification">如需账号，请联系站长。</p>
+    </section>
     <section v-else-if="reg && (!registrationPolicy || registrationPolicy.community_only)"
       class="signup-content" aria-label="社区账号注册">
       <template v-if="registrationPolicy">

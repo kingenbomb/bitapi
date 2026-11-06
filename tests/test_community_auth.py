@@ -208,7 +208,9 @@ class CommunityAuthTest(unittest.TestCase):
                                             json={"community_min_level": level})
                 self.assertEqual(updated.status_code, 200, updated.text)
                 public = self.client.get("/api/registration-policy").json()
-                self.assertEqual(public, {"community_only": True, "community_min_level": level})
+                self.assertEqual(public, {"community_only": True,
+                                          "community_min_level": level,
+                                          "closed": False})
                 settings = self.client.get("/api/admin/settings", headers=headers).json()
                 self.assertEqual(settings["registration_policy"], public)
                 self.assertTrue(settings["from_db"]["community_min_level"])
@@ -286,7 +288,8 @@ class CommunityAuthTest(unittest.TestCase):
 
     def test_email_registration_is_closed_even_with_code_and_invite(self):
         self.assertEqual(self.client.get("/api/registration-policy").json(),
-                         {"community_only": True, "community_min_level": 3})
+                         {"community_only": True, "community_min_level": 3,
+                          "closed": False})
         self.db.create_code("VALID-INVITE", 0, type="invitation")
         with mock.patch("core.mailer.send") as send:
             response = self.client.post("/api/register/code", json={"email": "new@gmail.com"})

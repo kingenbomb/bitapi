@@ -27,11 +27,16 @@ class RegistrationTest(unittest.TestCase):
         self.db = UserDB(str(Path(self.tmp.name) / "test.db"))
         self.old_db = state.USER_DB
         self.patches = []
-        for mod in (state, server, portal):
-            for name, value in (("USER_DB", self.db), ("BILLING", Billing(self.db))):
-                patch = mock.patch.object(mod, name, value)
-                patch.start()
-                self.patches.append(patch)
+        # 只 patch 真实存在的模块属性。server.py 不持有 USER_DB —— 它在每个用到
+        # 的地方现 from core.portal_state import USER_DB,所以改 portal_state 就够,
+        # 对 server 做 patch.object(USER_DB) 会直接 AttributeError。
+        for mod, name in ((state, "USER_DB"), (state, "BILLING"),
+                          (portal, "USER_DB"), (portal, "BILLING"),
+                          (server, "BILLING")):
+            value = self.db if name == "USER_DB" else Billing(self.db)
+            patch = mock.patch.object(mod, name, value)
+            patch.start()
+            self.patches.append(patch)
         for name, value in (("REQUIRE_INVITE", False), ("SIGNUP_BONUS", 0)):
             patch = mock.patch.object(config, name, value)
             patch.start()
@@ -158,9 +163,15 @@ class RegistrationTest(unittest.TestCase):
         self.send_code()
 
         def submit(_):
-            with TestClient(server.app) as client:
-                return client.post("/api/register", json={"email": "2892672257@qq.com", "password": "secret123",
-                                                          "verification_code": "012345"}).status_code
+            # 不用 with:那会跑 lifespan,启动守卫拿默认密钥就拒绝启动(环境变量在
+            # 测试里没改成真密钥)。这里要的是并发打同一个 app,不需要 lifespan。
+            client = TestClient(server.app)
+            try:
+                return client.post("/api/register", json={
+                    "email": "2892672257@qq.com", "password": "secret123",
+                    "verification_code": "012345"}).status_code
+            finally:
+                client.close()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
             results = list(workers.map(submit, range(4)))
@@ -197,4 +208,92 @@ class RegistrationTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["total_usage"]["tokens"], 380)
             self.assertEqual(response.json()["windows"]["month"]["usage"]["tokens"], 30)
+
+
+class ClosedRegistrationTest(unittest.TestCase):
+    """关闭注册:任何入口都不再建号,但老用户该干的事一样不受影响。
+
+    装配自己写一份,不借 RegistrationTest(继承会把它那整套用例再跑一遍)。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="bitapi-closed-reg-")
+        self.db = UserDB(str(Path(self.tmp.name) / "test.db"))
+        self.old_db = state.USER_DB
+        self.patches = []
+        for mod, name in ((state, "USER_DB"), (portal, "USER_DB"),
+                          (state, "BILLING"), (portal, "BILLING"),
+                          (server, "BILLING")):
+            value = self.db if name == "USER_DB" else Billing(self.db)
+            patch = mock.patch.object(mod, name, value)
+            patch.start()
+            self.patches.append(patch)
+        for name, value in (("REQUIRE_INVITE", False), ("SIGNUP_BONUS", 0),
+                            ("REGISTRATION_CLOSED", False)):
+            patch = mock.patch.object(config, name, value)
+            patch.start()
+            self.patches.append(patch)
+        state.rebind(self.db)
+        state.ensure_default_group()
+        self.send_patch = mock.patch.object(mailer, "send")
+        self.sent = self.send_patch.start()
+        self.patches.append(self.send_patch)
+        code_patch = mock.patch.object(auth, "generate_email_code", return_value="012345")
+        code_patch.start()
+        self.patches.append(code_patch)
+        self.client = TestClient(server.app)
+        throttle.reset_all()
+
+    tearDown = RegistrationTest.tearDown
+    send_code = RegistrationTest.send_code
+
+    def close(self):
+        self.db.set_setting("registration_closed", True)
+
+    def test_policy_reports_closed(self):
+        self.close()
+        self.assertTrue(self.client.get("/api/registration-policy").json()["closed"])
+
+    def test_email_code_is_refused_before_any_mail_goes_out(self):
+        # 拦在发码之前:关闭注册还往外发验证码,等于告诉陌生人「你来注册」。
+        self.close()
+        response = self.send_code()
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIn("关闭注册", response.json()["detail"])
+        self.sent.assert_not_called()
+
+    def test_register_endpoint_is_refused(self):
+        self.close()
+        response = self.client.post("/api/register", json={
+            "email": "new@gmail.com", "password": "secret123",
+            "verification_code": "012345"})
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(self.db.count_users(), 0)
+
+    def test_login_of_an_existing_user_still_works(self):
+        # 关注册不该把老用户锁在门外:先造一个关注册前就有的账号,再验证能登录
+        self.close()
+        self.db.create_user("legacy@example.com", auth.hash_password("secret123"),
+                            "LEGACY")
+        login = self.client.post("/api/login", json={
+            "email": "legacy@example.com", "password": "secret123"})
+        self.assertEqual(login.status_code, 200, login.text)
+        self.assertIn("token", login.json())
+
+    def test_setting_round_trips_through_the_admin_endpoint(self):
+        self.close()
+        admin = self.db.create_user("root@example.com", "fixture", "ADMIN")
+        self.db.update_user(admin, role="admin")
+        headers = {"Authorization": "Bearer " + auth.issue_token(admin, role="admin")}
+        got = self.client.get("/api/admin/settings", headers=headers)
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertTrue(got.json()["registration_closed"])
+        opened = self.client.patch("/api/admin/settings",
+                                   json={"registration_closed": False}, headers=headers)
+        self.assertEqual(opened.status_code, 200, opened.text)
+        self.assertFalse(self.client.get("/api/registration-policy").json()["closed"])
+        # 恢复默认走 DELETE,删掉后回落到 config 的默认值(默认是开着的)
+        reset = self.client.delete("/api/admin/settings/registration_closed", headers=headers)
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertIsNone(self.db.get_setting("registration_closed"))
 

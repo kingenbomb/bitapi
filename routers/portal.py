@@ -156,10 +156,30 @@ class EmailVerifyReq(BaseModel):
 @router.get("/registration-policy")
 def registration_policy():
     return {"community_only": config.COMMUNITY_REGISTRATION_ONLY,
-            "community_min_level": S.community_min_level()}
+            "community_min_level": S.community_min_level(),
+            "closed": _registration_closed()}
+
+
+def _registration_closed():
+    """运行时优先:settings.registration_closed 覆盖 config.REGISTRATION_CLOSED。"""
+    v = USER_DB.get_setting("registration_closed")
+    return config.REGISTRATION_CLOSED if v is None else bool(v)
+
+
+def _reject_closed_registration():
+    """站点已关闭注册时拒绝建号。
+
+    只拦「新建账号」,不拦「已有账号登录 / 绑定社区」—— 关注册是把门关小,
+    不是把老用户一起关在门外。
+    """
+    if _registration_closed():
+        raise HTTPException(
+            status_code=403,
+            detail="站点已关闭注册，如需账号请联系站长")
 
 
 def _require_email_registration():
+    _reject_closed_registration()
     if config.COMMUNITY_REGISTRATION_ONLY:
         raise HTTPException(
             status_code=403,
@@ -460,6 +480,10 @@ def community_auth_finish(request: Request,
                 "role": logged_in["role"]}
 
     _registration_email(flow["email"])
+    # 走到这里才是「要新建一个本地账号」,所以关闭注册拦在这里:
+    # 上面的 bind 分支是给老用户绑社区身份用的,不能一起封掉;
+    # 下面的 finish_community_login 命中老账号时已经提前 return 了。
+    _reject_closed_registration()
     group = ensure_default_group()
     created = None
     for _ in range(10):
@@ -1863,10 +1887,12 @@ def admin_get_settings(user=Depends(require_admin)):
     off = set(adapter_mod.disabled_channels())
     return {
         "require_invite": _require_invite(),
+        "registration_closed": _registration_closed(),
         "registration_policy": registration_policy(),
         "default_group": USER_DB.get_setting("default_group", config.DEFAULT_GROUP),
         "defaults": {  # 环境变量里的默认值,便于对比。刻意不含 epay_key。
             "require_invite": config.REQUIRE_INVITE,
+            "registration_closed": config.REGISTRATION_CLOSED,
             "community_min_level": config.COMMUNITY_MIN_LEVEL,
             "default_group": config.DEFAULT_GROUP,
             "payment_providers": config.PAYMENT_PROVIDERS,
@@ -1974,7 +2000,7 @@ def admin_reset_setting(key: str, user=Depends(require_admin)):
     而空串在 present-wins 语义下是「明确设为空」= 停用,不是「恢复默认」。
     """
     if key not in PAY_KEYS and key not in OTHER_SETTING_KEYS and key not in (
-            "require_invite", "default_group"):
+            "require_invite", "registration_closed", "default_group"):
         raise HTTPException(status_code=400, detail=f"unknown setting: {key}")
     if key in ("checkin_min", "checkin_max"):
         low = config.CHECKIN_MIN if key == "checkin_min" else S.checkin_min()
